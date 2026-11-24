@@ -1,0 +1,63 @@
+{
+  "integrations": [],
+  "guardrailRules": [
+    {
+      "id": "gr-cost-ceiling",
+      "name": "Monthly FinOps Spend Ceiling",
+      "description": "Cloud resources estimated above threshold require approval before calling AWS creation APIs.",
+      "category": "FinOps",
+      "severity": "approval",
+      "enabled": true,
+      "threshold": 250,
+      "violations": 0,
+      "updatedAt": "2026-11-24T22:40:57.141619Z"
+    },
+    {
+      "id": "gr-encryption",
+      "name": "Enforce KMS / SSE Encryption at Rest",
+      "description": "Blocks creating unencrypted S3, SQS, RDS, or ElastiCache resources and flags unencrypted AWS resources in live scans.",
+      "category": "Security",
+      "severity": "block",
+      "enabled": true,
+      "threshold": null,
+      "violations": 0,
+      "updatedAt": "2026-11-24T22:40:57.141619Z"
+    },
+    {
+      "id": "gr-public-access",
+      "name": "Block Public Access & Privileged Pods",
+      "description": "Blocks public RDS/S3 provisioning and blocks `privileged: true` pods during real pipeline manifest scans.",
+      "category": "Network",
+      "severity": "block",
+      "enabled": true,
+      "threshold": null,
+      "violations": 0,
+      "updatedAt": "2026-11-24T22:40:57.141619Z"
+    },
+    {
+      "id": "gr-prod-delete-lock",
+      "name": "Production Resource Deletion Lock",
+      "description": "Prevents deleting production cloud resources until unlocked.",
+      "category": "Governance",
+      "severity": "block",
+      "enabled": true,
+      "threshold": null,
+      "violations": 0,
+      "updatedAt": "2026-11-24T22:40:57.141619Z"
+    },
+    {
+      "id": "gr-region-allowlist",
+      "name": "Approved Sovereignty Regions",
+      "description": "Flags or blocks deployments outside approved regions (us-east-1, us-west-2, eu-west-1).",
+      "category": "Compliance",
+      "severity": "warn",
+      "enabled": true,
+      "threshold": null,
+      "violations": 0,
+      "updatedAt": "2026-11-24T22:40:57.141619Z"
+    }
+  ],
+  "approvals": [],
+  "pendingResources": [],
+  "pipelines": []
+}

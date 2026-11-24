@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="800" height="520" viewBox="0 0 800 520" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tesserak-grad" x1="280" y1="120" x2="520" y2="360" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#09090b" />
+      <stop offset="55%" stop-color="#2563eb" />
+      <stop offset="100%" stop-color="#60a5fa" />
+    </linearGradient>
+    <radialGradient id="tesserak-glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.22" />
+      <stop offset="60%" stop-color="#09090b" stop-opacity="0.06" />
+      <stop offset="100%" stop-color="#2563eb" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+
+  <circle cx="400" cy="250" r="210" fill="url(#tesserak-glow)" />
+
+  <ellipse cx="400" cy="250" rx="260" ry="96" transform="rotate(-12 400 250)" stroke="#2563eb" stroke-opacity="0.35" stroke-width="2" stroke-dasharray="8 8" />
+  <ellipse cx="400" cy="250" rx="240" ry="88" transform="rotate(14 400 250)" stroke="#09090b" stroke-opacity="0.22" stroke-width="2" stroke-dasharray="6 10" />
+
+  <g>
+    <circle cx="158" cy="290" r="16" fill="#ffffff" stroke="#09090b" stroke-width="2.5" />
+    <circle cx="158" cy="290" r="5" fill="#2563eb" />
+
+    <circle cx="642" cy="212" r="16" fill="#09090b" stroke="#2563eb" stroke-width="2.5" />
+    <circle cx="642" cy="212" r="5" fill="#ffffff" />
+
+    <circle cx="585" cy="365" r="13" fill="#ffffff" stroke="#3b82f6" stroke-width="2.5" />
+    <circle cx="585" cy="365" r="4" fill="#09090b" />
+
+    <circle cx="218" cy="148" r="13" fill="#09090b" stroke="#60a5fa" stroke-width="2.5" />
+    <circle cx="218" cy="148" r="4" fill="#3b82f6" />
+  </g>
+
+  <g transform="translate(400, 250)">
+    <polygon
+      points="0,-130 112.6,-65 112.6,65 0,130 -112.6,65 -112.6,-65"
+      fill="#ffffff"
+      fill-opacity="0.72"
+      stroke="url(#tesserak-grad)"
+      stroke-width="5.5"
+      stroke-linejoin="round"
+    />
+
+    <g stroke="#2563eb" stroke-opacity="0.55" stroke-width="3" stroke-linecap="round">
+      <line x1="0" y1="-130" x2="0" y2="-66" />
+      <line x1="112.6" y1="-65" x2="57.2" y2="-33" />
+      <line x1="112.6" y1="65" x2="57.2" y2="33" />
+      <line x1="0" y1="130" x2="0" y2="66" />
+      <line x1="-112.6" y1="65" x2="-57.2" y2="33" />
+      <line x1="-112.6" y1="-65" x2="-57.2" y2="-33" />
+    </g>
+
+    <polygon points="0,-66 57.2,-33 0,0 -57.2,-33" fill="#2563eb" fill-opacity="0.24" />
+    <polygon points="0,0 57.2,-33 57.2,33 0,66" fill="#09090b" fill-opacity="0.82" />
+    <polygon points="-57.2,-33 0,0 0,66 -57.2,33" fill="#3b82f6" fill-opacity="0.16" />
+
+    <polygon
+      points="0,-66 57.2,-33 57.2,33 0,66 -57.2,33 -57.2,-33"
+      stroke="#09090b"
+      stroke-width="4"
+      stroke-linejoin="round"
+    />
+    <path
+      d="M-57.2 -33 L0 0 L57.2 -33 M0 0 L0 66"
+      stroke="#60a5fa"
+      stroke-width="3.6"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+
+    <circle cx="0" cy="-130" r="5.5" fill="#09090b" />
+    <circle cx="112.6" cy="-65" r="5.5" fill="#2563eb" />
+    <circle cx="112.6" cy="65" r="5.5" fill="#3b82f6" />
+    <circle cx="0" cy="130" r="5.5" fill="#09090b" />
+    <circle cx="-112.6" cy="65" r="5.5" fill="#2563eb" />
+    <circle cx="-112.6" cy="-65" r="5.5" fill="#3b82f6" />
+    <circle cx="0" cy="0" r="7" fill="#ffffff" stroke="#2563eb" stroke-width="2.5" />
+  </g>
+</svg>
