@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { 
   Box,
   Button,
@@ -14,7 +14,7 @@ interface ConnectorFormProps {
     secretKey: string;
     region: string;
     accountName: string;
-  }) => void;
+  }) => Promise<void> | void;
 }
 
 const ConnectorForm: React.FC<ConnectorFormProps> = ({ onSubmit }) => {
@@ -23,6 +23,8 @@ const ConnectorForm: React.FC<ConnectorFormProps> = ({ onSubmit }) => {
   const [region, setRegion] = useState('us-west-2');
   const [accountName, setAccountName] = useState('');
   const [testing, setTesting] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const submitLockRef = useRef(false);
   const [testStatus, setTestStatus] = useState<'none' | 'success' | 'error'>('none');
   const [errorMessage, setErrorMessage] = useState('');
 
@@ -56,7 +58,11 @@ const ConnectorForm: React.FC<ConnectorFormProps> = ({ onSubmit }) => {
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.detail || 'Connection test failed');
+        const errText =
+          typeof data.detail === 'string'
+            ? data.detail
+            : data.detail?.error_description || data.detail?.message || 'Connection test failed';
+        throw new Error(errText);
       }
 
       setTestStatus('success');
@@ -68,14 +74,25 @@ const ConnectorForm: React.FC<ConnectorFormProps> = ({ onSubmit }) => {
     }
   };
 
-  const handleSubmit = () => {
-    if (testStatus === 'success') {
-      onSubmit({
+  const handleSubmit = async () => {
+    if (testStatus !== 'success' || submitLockRef.current || submitting || testing) {
+      return;
+    }
+    submitLockRef.current = true;
+    setSubmitting(true);
+    setErrorMessage('');
+    try {
+      await onSubmit({
         accessKey,
         secretKey,
         region,
-        accountName: accountName || `AWS Account (${accessKey.substring(0, 8)})`
+        accountName: accountName || `AWS Account (${accessKey.substring(0, 8)})`,
       });
+    } catch (error: any) {
+      setErrorMessage(error?.message || 'Failed to save AWS connection');
+    } finally {
+      submitLockRef.current = false;
+      setSubmitting(false);
     }
   };
 
@@ -137,7 +154,7 @@ const ConnectorForm: React.FC<ConnectorFormProps> = ({ onSubmit }) => {
         <Button
           variant="outlined"
           onClick={handleTest}
-          disabled={testing || !accessKey || !secretKey}
+          disabled={testing || submitting || !accessKey || !secretKey}
         >
           {testing ? <CircularProgress size={24} /> : 'Test Connection'}
         </Button>
@@ -145,9 +162,16 @@ const ConnectorForm: React.FC<ConnectorFormProps> = ({ onSubmit }) => {
         <Button
           variant="contained"
           onClick={handleSubmit}
-          disabled={testStatus !== 'success'}
+          disabled={testStatus !== 'success' || submitting || testing}
         >
-          Submit
+          {submitting ? (
+            <>
+              <CircularProgress size={18} color="inherit" sx={{ mr: 1 }} />
+              Saving...
+            </>
+          ) : (
+            'Submit'
+          )}
         </Button>
       </Box>
     </Box>

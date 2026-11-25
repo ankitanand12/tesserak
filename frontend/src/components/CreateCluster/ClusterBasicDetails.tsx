@@ -13,6 +13,7 @@ import {
   InputAdornment
 } from '@mui/material';
 import SearchIcon from '@mui/icons-material/Search';
+import { useTesserakAuth } from '../../auth/AuthContext';
 import { ClusterConfig } from '../../pages/CreateCluster';
 import { getRegionFullName } from '../../utils/regionMapping';
 
@@ -24,6 +25,7 @@ interface Props {
 interface Account {
   id: string;
   name: string;
+  region?: string;
   status: string;
 }
 
@@ -34,34 +36,37 @@ interface VPC {
 }
 
 const ClusterBasicDetails: React.FC<Props> = ({ config, onChange }) => {
+  const { userEmail: authEmail } = useTesserakAuth();
+  const userEmail = authEmail || localStorage.getItem('currentUser') || '';
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [regions, setRegions] = useState<string[]>([]);
   const [vpcs, setVpcs] = useState<VPC[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Fetch connected accounts
+  // Fetch connected accounts with integration accountName + AWS Account ID
   useEffect(() => {
     const fetchAccounts = async () => {
       try {
         const response = await fetch('http://localhost:8000/api/connections/status', {
           headers: {
-            'x-user-email': localStorage.getItem('currentUser') || '',
-            'Accept': 'application/json'
-          }
+            'x-user-email': userEmail,
+            Accept: 'application/json',
+          },
         });
-        
+
         if (!response.ok) throw new Error('Failed to fetch accounts');
-        
+
         const data = await response.json();
-        const connectedAccounts = data
-          .filter((conn: any) => conn.status === 'connected')
+        const connectedAccounts: Account[] = data
+          .filter((conn: any) => conn.status === 'connected' && conn.accountId)
           .map((conn: any) => ({
             id: conn.accountId,
-            name: conn.name,
-            status: conn.status
+            name: conn.accountName || conn.name || 'AWS Account',
+            region: conn.region,
+            status: conn.status,
           }));
-        
+
         setAccounts(connectedAccounts);
       } catch (error) {
         setError('Failed to fetch connected accounts');
@@ -69,25 +74,25 @@ const ClusterBasicDetails: React.FC<Props> = ({ config, onChange }) => {
       }
     };
 
-    fetchAccounts();
-  }, []);
+    if (userEmail) fetchAccounts();
+  }, [userEmail]);
 
   // Fetch regions when account is selected
   useEffect(() => {
-    if (!config.accountId) return;
+    if (!config.accountId || !userEmail) return;
 
     const fetchRegions = async () => {
       setLoading(true);
       try {
         const response = await fetch(`http://localhost:8000/api/aws/regions/${config.accountId}`, {
           headers: {
-            'x-user-email': localStorage.getItem('currentUser') || '',
-            'Accept': 'application/json'
-          }
+            'x-user-email': userEmail,
+            Accept: 'application/json',
+          },
         });
-        
+
         if (!response.ok) throw new Error('Failed to fetch regions');
-        
+
         const data = await response.json();
         setRegions(data);
       } catch (error) {
@@ -99,11 +104,11 @@ const ClusterBasicDetails: React.FC<Props> = ({ config, onChange }) => {
     };
 
     fetchRegions();
-  }, [config.accountId]);
+  }, [config.accountId, userEmail]);
 
   // Fetch VPCs when region is selected
   useEffect(() => {
-    if (!config.accountId || !config.region) return;
+    if (!config.accountId || !config.region || !userEmail) return;
 
     const fetchVPCs = async () => {
       setLoading(true);
@@ -112,14 +117,14 @@ const ClusterBasicDetails: React.FC<Props> = ({ config, onChange }) => {
           `http://localhost:8000/api/aws/vpcs/${config.accountId}/${config.region}`,
           {
             headers: {
-              'x-user-email': localStorage.getItem('currentUser') || '',
-              'Accept': 'application/json'
-            }
+              'x-user-email': userEmail,
+              Accept: 'application/json',
+            },
           }
         );
-        
+
         if (!response.ok) throw new Error('Failed to fetch VPCs');
-        
+
         const data = await response.json();
         setVpcs(data);
       } catch (error) {
@@ -131,7 +136,7 @@ const ClusterBasicDetails: React.FC<Props> = ({ config, onChange }) => {
     };
 
     fetchVPCs();
-  }, [config.accountId, config.region]);
+  }, [config.accountId, config.region, userEmail]);
 
   const handleChange = (field: keyof ClusterConfig, value: any) => {
     onChange({
@@ -181,11 +186,19 @@ const ClusterBasicDetails: React.FC<Props> = ({ config, onChange }) => {
         <InputLabel>AWS Account</InputLabel>
         <Select
           value={config.accountId}
-          onChange={(e) => handleChange('accountId', e.target.value)}
+          onChange={(e) => {
+            const selected = accounts.find((a) => a.id === e.target.value);
+            onChange({
+              ...config,
+              accountId: e.target.value,
+              accountName: selected?.name || '',
+              region: config.region || selected?.region || '',
+            });
+          }}
           label="AWS Account"
         >
           {accounts.map((account) => (
-            <MenuItem key={account.id} value={account.id}>
+            <MenuItem key={`${account.name}-${account.id}`} value={account.id}>
               {account.name} ({account.id})
             </MenuItem>
           ))}

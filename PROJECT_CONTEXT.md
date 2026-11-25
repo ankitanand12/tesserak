@@ -13,7 +13,7 @@ Use this document to bring any IDE or AI coding assistant completely up to speed
     - **Obsidian Black**: `#09090b` (AppBar, permanent/mobile Sidebar, showcase hero cards, dark execution trace console, modal headers), `#0f172a` (headings/ink).
     - **Crisp White / Light Studio Canvas**: `#ffffff` (card surfaces, dialogs), `#f8fafc` (main workspace canvas).
     - **Electric Blue**: `#2563eb` (primary CTAs, active rings, badges), `#3b82f6` / `#60a5fa` (glows, cube wireframes), `#eff6ff` / `#1d4ed8` (active status pills).
-- **Product Scope (Atmosly-Inspired Internal Developer Platform)**:
+- **Product Scope (Tesserak Internal Developer Platform)**:
   Expanded from AWS EKS Cluster management to a full control plane covering:
   1. **EKS Clusters** (`/` / `/clusters` / `/create-cluster`)
   2. **Integrations Hub** (`/integrations`, `/connectors`)
@@ -43,15 +43,15 @@ technoworld/
 ├── backend/
 │   ├── .env.example                        # Optional AUTH0_DOMAIN / AUTH0_AUDIENCE template
 │   ├── requirements.txt                    # fastapi==0.104.1, uvicorn==0.24.0, boto3==1.29.0, python-dotenv==1.0.0, pydantic==2.4.2
-│   ├── main.py                             # FastAPI entry point, AWS EKS & Connection routes, mounts atmosly_router
-│   ├── connections.py                      # AWS IAM STS connection manager (connections/*.json)
-│   ├── state_manager.py                    # Local/AWS EKS cluster state diff engine (cluster_states/)
+│   ├── main.py                             # FastAPI entry point, AWS EKS & Connection routes, mounts tesserak_router
+│   ├── connections.py                      # AWS IAM STS connection manager (PostgreSQL)
+│   ├── state_manager.py                    # Local/AWS EKS cluster state diff engine (PostgreSQL)
 │   ├── state_management.py                 # AWS EKS state reader
-│   ├── atmosly_router.py                   # APIRouter for Overview, Auth status, Integrations, Cloud Resources, Guardrails, Pipelines
+│   ├── tesserak_router.py                  # APIRouter for Overview, Auth status, Integrations, Cloud Resources, Guardrails, Pipelines
 │   ├── integrations_service.py             # Live credential verifiers (GitHub, GitLab, AWS ECR, AWS Secrets, DockerHub, Cloudflare, GCP)
 │   ├── resources_service.py                # Live AWS discovery, Boto3 provisioning, drift remediation, deletion & compliance audit
 │   ├── pipelines_service.py                # Live `git ls-remote`, cluster context discovery & real `git/docker/kubectl` runner
-│   └── atmosly_data/                       # Per-user JSON persistence (<sanitized_email>.json)
+│   └── db.py                               # PostgreSQL persistence models & encryption helper
 └── frontend/
     ├── .env.example                        # Optional REACT_APP_AUTH0_DOMAIN / CLIENT_ID / AUDIENCE template
     ├── package.json                        # tesserak-frontend, React 19.2, TS 4.9.5, MUI v5.16.14, @auth0/auth0-react 2.30.0
@@ -64,7 +64,7 @@ technoworld/
         ├── auth/
         │   └── AuthContext.tsx             # Bridges @auth0/auth0-react (when env vars set) + Dev SSO/local fallback
         ├── types/
-        │   ├── atmosly.ts                  # TypeScript interfaces for Integrations, Guardrails, Resources, Pipelines, Overview
+        │   ├── platform.ts                 # TypeScript interfaces for Integrations, Guardrails, Resources, Pipelines, Overview
         │   ├── cluster.ts
         │   └── user.ts
         └── components/
@@ -78,7 +78,7 @@ technoworld/
             ├── Connectors/                 # ConnectorForm.tsx, ConnectorList.tsx (AWS IAM credentials)
             └── CreateCluster/              # 3D stepper views (ClusterBasicDetails, Environment, Addons, Preview)
         └── pages/
-            ├── Dashboard.tsx               # Executive header, real Atmosly KPI cards, EKS Health + Table
+            ├── Dashboard.tsx               # Executive header, real platform KPI cards, EKS Health + Table
             ├── CloudResources.tsx          # Live AWS RDS/ElastiCache/S3/SQS inventory, Boto3 provisioner, drift remediation
             ├── Guardrails.tsx              # Policy rule toggles, severity modes, Live AWS Audit tab, Approval Queue
             ├── Pipelines.tsx               # Real Git/K8s pipeline creation (`git ls-remote`), cluster picker, polling terminal logs
@@ -97,42 +97,42 @@ technoworld/
 
 ### Auth & Overview
 - `GET /api/auth/status` — Checks backend `AUTH0_DOMAIN` & `AUTH0_AUDIENCE` env vars (`mode: "auth0" | "local-fallback"`).
-- `GET /api/atmosly/overview` (header `x-user-email`) — Returns real counts from integrations, live AWS discovery, guardrails, approvals, and pipelines.
+- `GET /api/overview` (header `x-user-email`) — Returns real counts from integrations, live AWS discovery, guardrails, approvals, and pipelines.
 
 ### Integrations (`integrations_service.py`)
-- `GET /api/atmosly/integrations` — Merges user's AWS IAM connectors (`connections/`) + verified platform integrations (secrets stripped).
-- `POST /api/atmosly/integrations` — Verifies live credentials before saving:
+- `GET /api/integrations` — Merges user's AWS IAM connectors (`connections/`) + verified platform integrations (secrets stripped).
+- `POST /api/integrations` — Verifies live credentials before saving:
   - `github` -> `GET https://api.github.com/user` (+ `/repos/<owner>/<repo>` if scoped)
   - `gitlab` -> `GET <endpoint>/api/v4/user`
   - `dockerhub` -> `POST https://hub.docker.com/v2/users/login` + repos check
   - `cloudflare` -> `GET https://api.cloudflare.com/client/v4/user/tokens/verify` + `/zones`
   - `gcp` -> Validates SA JSON, signs RS256 JWT with `/usr/bin/openssl`, exchanges real OAuth2 token at `oauth2.googleapis.com/token`
   - `aws-ecr` / `aws-secrets` -> `boto3` `sts.get_caller_identity()` + `ecr.describe_repositories()` / `secretsmanager.list_secrets()` (using explicit keys or active AWS IAM connector)
-- `POST /api/atmosly/integrations/{id}/test` — Re-runs live upstream API/SDK check and updates latency.
-- `DELETE /api/atmosly/integrations/{id}` — Disconnects integration.
+- `POST /api/integrations/{id}/test` — Re-runs live upstream API/SDK check and updates latency.
+- `DELETE /api/integrations/{id}` — Disconnects integration.
 
 ### Cloud Resources (`resources_service.py`)
-- `GET /api/atmosly/resources` — Runs real Boto3 discovery across RDS, ElastiCache, S3 (checks encryption & `PublicAccessBlock`), and SQS for the user's active AWS IAM connection.
-- `POST /api/atmosly/resources` — Checks Guardrails (`gr-encryption`, `gr-public-access`, `gr-region-allowlist`, `gr-cost-ceiling`); requires active AWS IAM connector (`400` if missing). High-cost requests hold the spec in `pendingResources` + Approval Queue; within-ceiling requests execute real AWS creation (`s3`, `sqs`, `elasticache`, `rds`).
-- `POST /api/atmosly/resources/{id}/drift-check` — Applies real S3 encryption + PublicAccessBlock / SQS SSE remediation in AWS.
-- `DELETE /api/atmosly/resources/{id}?environment=...` — Blocks `prod` if `gr-prod-delete-lock` is enabled (`409`); otherwise deletes via Boto3.
+- `GET /api/resources` — Runs real Boto3 discovery across RDS, ElastiCache, S3 (checks encryption & `PublicAccessBlock`), and SQS for the user's active AWS IAM connection.
+- `POST /api/resources` — Checks Guardrails (`gr-encryption`, `gr-public-access`, `gr-region-allowlist`, `gr-cost-ceiling`); requires active AWS IAM connector (`400` if missing). High-cost requests hold the spec in `pendingResources` + Approval Queue; within-ceiling requests execute real AWS creation (`s3`, `sqs`, `elasticache`, `rds`).
+- `POST /api/resources/{id}/drift-check` — Applies real S3 encryption + PublicAccessBlock / SQS SSE remediation in AWS.
+- `DELETE /api/resources/{id}?environment=...` — Blocks `prod` if `gr-prod-delete-lock` is enabled (`409`); otherwise deletes via Boto3.
 
 ### Guardrails (`resources_service.py`)
-- `GET /api/atmosly/guardrails` — Returns configurable rules, pending/past approvals, and runs `run_live_guardrail_audit()` across live AWS EKS, RDS, and S3.
-- `POST /api/atmosly/guardrails/rules` / `PATCH /api/atmosly/guardrails/rules/{id}` — Create rule or toggle `enabled` / `severity` (`block` | `approval` | `warn`).
-- `POST /api/atmosly/approvals/{id}/decision` — `reject` removes pending spec; `approve` executes stored AWS provisioning spec via `execute_aws_provision()`.
+- `GET /api/guardrails` — Returns configurable rules, pending/past approvals, and runs `run_live_guardrail_audit()` across live AWS EKS, RDS, and S3.
+- `POST /api/guardrails/rules` / `PATCH /api/guardrails/rules/{id}` — Create rule or toggle `enabled` / `severity` (`block` | `approval` | `warn`).
+- `POST /api/approvals/{id}/decision` — `reject` removes pending spec; `approve` executes stored AWS provisioning spec via `execute_aws_provision()`.
 
 ### CI/CD Pipelines (`pipelines_service.py`)
-- `GET /api/atmosly/cluster-targets` — Discovers live AWS EKS clusters (`eks:<name>`) + local kubeconfig contexts (`ctx:<context>` via `kubectl config get-contexts -o name`).
-- `GET /api/atmosly/pipelines`
-- `POST /api/atmosly/pipelines` — Validates repository & branch reachability via real `git ls-remote --heads` (`400` on invalid/unreachable repo/branch).
-- `POST /api/atmosly/pipelines/{id}/trigger` — Launches background asyncio task executing:
+- `GET /api/cluster-targets` — Discovers live AWS EKS clusters (`eks:<name>`) + local kubeconfig contexts (`ctx:<context>` via `kubectl config get-contexts -o name`).
+- `GET /api/pipelines`
+- `POST /api/pipelines` — Validates repository & branch reachability via real `git ls-remote --heads` (`400` on invalid/unreachable repo/branch).
+- `POST /api/pipelines/{id}/trigger` — Launches background asyncio task executing:
   1. `git clone --depth 1 --branch <branch>` (injecting verified GitHub/GitLab token if linked, sanitized from logs)
   2. Optional `docker build` (if `dockerfilePath` / `imageTag` provided)
   3. YAML manifest Guardrail inspection (`privileged: true`, `:latest`)
   4. `kubectl apply -n <namespace> -f <manifestPath>` (builds scoped temporary kubeconfig + `aws eks get-token` for `eks:` targets, or `--context` for kubeconfig targets)
   5. `kubectl get deployments,pods,svc -n <namespace> -o wide`
-- `DELETE /api/atmosly/pipelines/{id}`
+- `DELETE /api/pipelines/{id}`
 
 ---
 
@@ -178,6 +178,6 @@ npm run build
 
 1. **Incremental Streaming Logs in Pipelines**: Currently `_execute_pipeline_sync` returns all stages on completion; updating `state["stages"]` after *each* stage completes inside `run_pipeline_async` will stream live per-stage progress during long `docker build` / `kubectl apply` runs.
 2. **Container Registry Push in Pipelines**: Wire verified `aws-ecr` (`aws ecr get-login-password | docker login`) and `dockerhub` integrations directly into the Pipeline modal (`registryIntegrationId`) and execute `docker push` after `docker build`.
-3. **Auth0 Live Tenant + Backend JWT Enforcement**: Once `frontend/.env` (`REACT_APP_AUTH0_DOMAIN`, `REACT_APP_AUTH0_CLIENT_ID`, optional `REACT_APP_AUTH0_AUDIENCE`) and `backend/.env` (`AUTH0_DOMAIN`, `AUTH0_AUDIENCE`) are populated, add FastAPI RS256 JWKS Bearer token verification in `atmosly_router.py` (using `PyJWT` or `auth0-fastapi-api` — note `auth0-fastapi-api` requires Python 3.10+, whereas host currently has Python 3.9.6 so `PyJWT[crypto]` or a pyenv/venv Python 3.10+ works cleanly).
+3. **Auth0 Live Tenant + Backend JWT Enforcement**: Once `frontend/.env` (`REACT_APP_AUTH0_DOMAIN`, `REACT_APP_AUTH0_CLIENT_ID`, optional `REACT_APP_AUTH0_AUDIENCE`) and `backend/.env` (`AUTH0_DOMAIN`, `AUTH0_AUDIENCE`) are populated, add FastAPI RS256 JWKS Bearer token verification in `tesserak_router.py` (using `PyJWT` or `auth0-fastapi-api` — note `auth0-fastapi-api` requires Python 3.10+, whereas host currently has Python 3.9.6 so `PyJWT[crypto]` or a pyenv/venv Python 3.10+ works cleanly).
 4. **Figma Sync / Motion (`uWj0q7V24rFEWWmxqpLQEv`)**: Previous Figma Starter plan hit MCP tool call quota before updating colors from the older blue/purple tokens to Obsidian Black/White/Blue or adding `/figma-use-motion` keyframe animations.
-5. **Refresh `GEMINI.md`**: Update `GEMINI.md` color tokens and component inventory to match the Obsidian Black/White/Blue theme, Auth0 bridge, and real Atmosly modules.
+5. **Refresh `GEMINI.md`**: Update `GEMINI.md` color tokens and component inventory to match the Obsidian Black/White/Blue theme, Auth0 bridge, and real Tesserak platform modules.

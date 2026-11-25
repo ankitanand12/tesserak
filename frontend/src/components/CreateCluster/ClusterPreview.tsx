@@ -39,7 +39,14 @@ const ClusterPreview: React.FC<Props> = ({ config }) => {
       <Paper variant="outlined" sx={{ p: 3 }}>
         <Section title="Basic Details">
           <Field label="Cluster Name" value={config.name} />
-          <Field label="AWS Account" value={config.accountId} />
+          <Field
+            label="AWS Account"
+            value={
+              config.accountName
+                ? `${config.accountName} (${config.accountId})`
+                : config.accountId
+            }
+          />
           <Field label="Region" value={config.region} />
           <Field
             label="VPC"

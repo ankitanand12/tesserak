@@ -15,6 +15,7 @@ import {
 } from '@mui/material';
 import { styled } from '@mui/material/styles';
 import { PhotoCamera } from '@mui/icons-material';
+import { useTesserakAuth } from '../auth/AuthContext';
 import { User } from '../types/user';
 import { compressImage } from '../utils/imageUtils';
 import Perspective3DCard from '../components/Perspective3DCard';
@@ -38,14 +39,42 @@ const countryCodes = [
   { code: '+61', country: '🇦🇺 Australia' },
 ];
 
+const readUsersMap = (): Record<string, Partial<User>> => {
+  try {
+    const raw = JSON.parse(localStorage.getItem('users') || '{}');
+    if (Array.isArray(raw)) {
+      return raw.reduce<Record<string, Partial<User>>>((acc, item) => {
+        if (item?.email) acc[item.email.toLowerCase()] = item;
+        return acc;
+      }, {});
+    }
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+};
+
+const writeUserCache = (email: string, profile: Partial<User>) => {
+  try {
+    const users = readUsersMap();
+    const key = email.toLowerCase();
+    users[key] = { ...users[key], ...profile, email: key };
+    localStorage.setItem('users', JSON.stringify(users));
+  } catch {
+    // Ignore storage quota fallback errors when backend PostgreSQL is primary store
+  }
+};
+
 const Profile: React.FC<ProfileProps> = ({ email }) => {
+  const { sessionUser } = useTesserakAuth();
+  const effectiveEmail = (sessionUser?.email || email || '').toLowerCase();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [formData, setFormData] = useState<Partial<User>>({
-    email,
-    firstName: '',
-    lastName: '',
-    organization: '',
-    avatarUrl: '',
+    email: effectiveEmail,
+    firstName: sessionUser?.firstName || '',
+    lastName: sessionUser?.lastName || '',
+    organization: sessionUser?.organization || '',
+    avatarUrl: sessionUser?.avatarUrl || '',
     mobile: {
       countryCode: '+1',
       number: '',
@@ -54,12 +83,33 @@ const Profile: React.FC<ProfileProps> = ({ email }) => {
   const [isEditing, setIsEditing] = useState(false);
 
   useEffect(() => {
-    const users = JSON.parse(localStorage.getItem('users') || '[]');
-    const currentUser = users.find((user: User) => user.email === email);
-    if (currentUser) {
-      setFormData(currentUser);
+    let active = true;
+    const users = readUsersMap();
+    const cached = users[effectiveEmail];
+    if (cached) {
+      setFormData((prev) => ({ ...prev, ...cached }));
     }
-  }, [email]);
+
+    if (!effectiveEmail) return;
+    fetch('http://localhost:8000/api/profile', {
+      headers: { 'x-user-email': effectiveEmail },
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!active || !data || !data.email) return;
+        setFormData((prev) => ({
+          ...prev,
+          ...data,
+          mobile: data.mobile || prev.mobile || { countryCode: '+1', number: '' },
+        }));
+        writeUserCache(effectiveEmail, data);
+      })
+      .catch(() => null);
+
+    return () => {
+      active = false;
+    };
+  }, [effectiveEmail]);
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const { name, value } = e.target;
@@ -79,13 +129,27 @@ const Profile: React.FC<ProfileProps> = ({ email }) => {
     }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const users = JSON.parse(localStorage.getItem('users') || '[]');
-    const updatedUsers = users.map((user: User) =>
-      user.email === email ? { ...user, ...formData } : user
-    );
-    localStorage.setItem('users', JSON.stringify(updatedUsers));
+    writeUserCache(effectiveEmail, formData);
+    try {
+      await fetch('http://localhost:8000/api/profile', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-email': effectiveEmail,
+        },
+        body: JSON.stringify({
+          firstName: formData.firstName,
+          lastName: formData.lastName,
+          organization: formData.organization,
+          mobile: formData.mobile,
+          avatarUrl: formData.avatarUrl,
+        }),
+      });
+    } catch (err) {
+      console.error('Failed to persist profile to backend:', err);
+    }
     setIsEditing(false);
   };
 
@@ -103,44 +167,22 @@ const Profile: React.FC<ProfileProps> = ({ email }) => {
         ...prev,
         avatarUrl: compressedImage,
       }));
+      writeUserCache(effectiveEmail, { avatarUrl: compressedImage });
 
-      const users: User[] = JSON.parse(localStorage.getItem('users') || '[]');
-      const updatedUsers = users.map((user) =>
-        user.email === email ? { ...user, avatarUrl: compressedImage } : user
-      );
-
-      try {
-        localStorage.setItem('users', JSON.stringify(updatedUsers));
-      } catch (storageError) {
-        console.error('Failed to save to localStorage:', storageError);
-        try {
-          localStorage.removeItem('lastVisited');
-          localStorage.removeItem('preferences');
-          try {
-            localStorage.setItem('users', JSON.stringify(updatedUsers));
-          } catch (finalError) {
-            console.error('Failed to save even after cleanup:', finalError);
-            alert(
-              'Warning: Your profile picture is showing but might not persist after refresh. Try a smaller image.'
-            );
-          }
-        } catch (cleanupError) {
-          console.error('Failed during storage cleanup:', cleanupError);
-          alert(
-            'Warning: Your profile picture is showing but might not persist after refresh. Try a smaller image.'
-          );
-        }
+      const res = await fetch('http://localhost:8000/api/profile', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-email': effectiveEmail,
+        },
+        body: JSON.stringify({ avatarUrl: compressedImage }),
+      });
+      if (!res.ok) {
+        throw new Error('Failed to save profile picture to PostgreSQL');
       }
     } catch (error) {
-      console.error('Failed to process image:', error);
-      alert('Failed to process the image. Please try a different image.');
-
-      const users: User[] = JSON.parse(localStorage.getItem('users') || '[]');
-      const currentUser = users.find((u) => u.email === email);
-      setFormData((prev) => ({
-        ...prev,
-        avatarUrl: currentUser?.avatarUrl || prev.avatarUrl,
-      }));
+      console.error('Failed to process or upload image:', error);
+      alert('Failed to update the profile picture. Please try a different image.');
     }
   };
 

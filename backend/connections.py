@@ -1,10 +1,17 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from pydantic import BaseModel
 from datetime import datetime
+import asyncio
 import boto3
-import os
-import json
-from pathlib import Path
+from botocore.config import Config
+import time
+import uuid
+
+from db import AwsConnectionRecord, DatabaseManager, get_db, normalize_email
+
+STS_BOTO_CONFIG = Config(connect_timeout=4, read_timeout=6, retries={"max_attempts": 1})
+AWS_CLIENT_CONFIG = Config(connect_timeout=5, read_timeout=15, retries={"max_attempts": 1})
+STS_CACHE_TTL_SECONDS = 60.0
 
 class ConnectionBase(BaseModel):
     accessKey: str
@@ -21,117 +28,179 @@ class Connection(ConnectionBase):
     lastUpdated: str
 
 class ConnectionManager:
-    def __init__(self, storage_path: str = "connections"):
-        self.storage_path = Path(storage_path)
-        self.storage_path.mkdir(exist_ok=True)
+    def __init__(self, storage_path: str = "connections", db: Optional[DatabaseManager] = None):
+        self.storage_path = storage_path
+        self.db = db or get_db()
+        self._sts_cache: Dict[Tuple[str, str], Tuple[float, bool, str, Optional[str]]] = {}
+        self._create_lock = asyncio.Lock()
 
-    def _get_connection_path(self, connection_id: str) -> Path:
-        return self.storage_path / f"{connection_id}.json"
+    def _row_to_connection(self, row: AwsConnectionRecord) -> Connection:
+        return Connection(
+            id=row.id,
+            accessKey=row.access_key,
+            secretKey=self.db.decrypt_str(row.secret_key_enc),
+            region=row.region,
+            accountName=row.account_name,
+            type=row.type,
+            status=row.status,
+            createdAt=row.created_at,
+            createdBy=row.user_email,
+            lastUpdated=row.last_updated,
+        )
 
-    async def test_connection(self, connection: ConnectionBase) -> tuple[bool, str, Optional[str]]:
+    def invalidate_cache(self, access_key: Optional[str] = None) -> None:
+        if not access_key:
+            self._sts_cache.clear()
+            return
+        keys_to_drop = [k for k in self._sts_cache if k[0] == access_key]
+        for k in keys_to_drop:
+            self._sts_cache.pop(k, None)
+
+    @staticmethod
+    def _test_sts_sync(access_key: str, secret_key: str, region: Optional[str]) -> str:
+        client = boto3.client(
+            'sts',
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region or 'us-east-1',
+            config=STS_BOTO_CONFIG,
+        )
+        identity = client.get_caller_identity()
+        return identity['Account']
+
+    async def test_connection(
+        self,
+        connection: ConnectionBase,
+        use_cache: bool = False,
+    ) -> tuple[bool, str, Optional[str]]:
+        cache_key = (connection.accessKey, connection.region or 'us-east-1')
+        now_mono = time.monotonic()
+        if use_cache:
+            cached = self._sts_cache.get(cache_key)
+            if cached and cached[0] > now_mono:
+                return cached[1], cached[2], cached[3]
+
         try:
-            # Try to create a boto3 client with the credentials
-            client = boto3.client(
-                'sts',
-                aws_access_key_id=connection.accessKey,
-                aws_secret_access_key=connection.secretKey,
-                region_name=connection.region or 'us-east-1'  # Use us-east-1 as default region
+            account_id = await asyncio.to_thread(
+                self._test_sts_sync,
+                connection.accessKey,
+                connection.secretKey,
+                connection.region,
             )
-            
-            # Try to get caller identity to verify credentials
-            identity = client.get_caller_identity()
-            account_id = identity['Account']
-            return True, "Connection successful", account_id
+            result = (True, "Connection successful", account_id)
+            self._sts_cache[cache_key] = (time.monotonic() + STS_CACHE_TTL_SECONDS, *result)
+            return result
         except Exception as e:
             error_message = str(e)
             if "InvalidClientTokenId" in error_message:
-                return False, "Invalid AWS Access Key ID", None
+                result = (False, "Invalid AWS Access Key ID", None)
             elif "SignatureDoesNotMatch" in error_message:
-                return False, "Invalid AWS Secret Access Key", None
+                result = (False, "Invalid AWS Secret Access Key", None)
             elif "InvalidAccessKeyId" in error_message:
-                return False, "Invalid AWS Access Key ID", None
-            print(f"Connection test failed: {error_message}")
-            return False, f"Connection failed: {error_message}", None
+                result = (False, "Invalid AWS Access Key ID", None)
+            else:
+                print(f"Connection test failed: {error_message}")
+                result = (False, f"Connection failed: {error_message}", None)
+            if use_cache:
+                self._sts_cache[cache_key] = (time.monotonic() + 10.0, *result)
+            return result
+
+    def _upsert_connection_sync(
+        self,
+        connection: ConnectionBase,
+        user_email: str,
+        now: str,
+    ) -> Connection:
+        normalized_email = normalize_email(user_email)
+        normalized_key = connection.accessKey.strip()
+        secret_enc = self.db.encrypt_str(connection.secretKey)
+
+        with self.db.session_scope() as session:
+            existing = (
+                session.query(AwsConnectionRecord)
+                .filter(
+                    AwsConnectionRecord.user_email == normalized_email,
+                    AwsConnectionRecord.type == connection.type,
+                    AwsConnectionRecord.access_key == normalized_key,
+                )
+                .first()
+            )
+            if existing:
+                existing.account_name = connection.accountName
+                existing.secret_key_enc = secret_enc
+                existing.region = connection.region
+                existing.status = "connected"
+                existing.last_updated = now
+                row = existing
+            else:
+                connection_id = f"{connection.type}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
+                row = AwsConnectionRecord(
+                    id=connection_id,
+                    user_email=normalized_email,
+                    account_name=connection.accountName,
+                    access_key=normalized_key,
+                    secret_key_enc=secret_enc,
+                    region=connection.region,
+                    type=connection.type,
+                    status="connected",
+                    created_at=now,
+                    last_updated=now,
+                )
+                session.add(row)
+            session.flush()
+            return self._row_to_connection(row)
+
+    def _list_connections_sync(self, user_email: Optional[str] = None) -> List[Connection]:
+        with self.db.session_scope() as session:
+            query = session.query(AwsConnectionRecord)
+            if user_email is not None:
+                query = query.filter(AwsConnectionRecord.user_email == normalize_email(user_email))
+            rows = query.order_by(AwsConnectionRecord.created_at.desc()).all()
+            return [self._row_to_connection(r) for r in rows]
+
+    def _delete_connection_sync(self, connection_id: str) -> bool:
+        with self.db.session_scope() as session:
+            row = session.get(AwsConnectionRecord, connection_id)
+            if not row:
+                return False
+            self.invalidate_cache(row.access_key)
+            session.delete(row)
+            return True
+
+    def _get_connection_sync(self, connection_id: str) -> Optional[Connection]:
+        with self.db.session_scope() as session:
+            row = session.get(AwsConnectionRecord, connection_id)
+            return self._row_to_connection(row) if row else None
 
     async def create_connection(self, connection: ConnectionBase, user_email: str) -> Connection:
-        # Test the connection first
-        is_valid, message, account_id = await self.test_connection(connection)
+        # Test the connection first without blocking the event loop
+        is_valid, message, _ = await self.test_connection(connection, use_cache=False)
         if not is_valid:
             raise ValueError(message)
 
-        # Generate a unique ID (you might want to use UUID or another method)
-        connection_id = f"{connection.type}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-        
-        # Create the full connection object
         now = datetime.utcnow().isoformat()
-        conn = Connection(
-            id=connection_id,
-            status="connected",
-            createdAt=now,
-            createdBy=user_email,
-            lastUpdated=now,
-            **connection.dict()
-        )
-
-        # Save to file
-        with open(self._get_connection_path(connection_id), 'w') as f:
-            json.dump(conn.dict(), f)
-
-        return conn
+        async with self._create_lock:
+            return await asyncio.to_thread(self._upsert_connection_sync, connection, user_email, now)
 
     async def list_connections(self, user_email: Optional[str] = None) -> List[Connection]:
-        print(f"Debug: Searching for connections in {self.storage_path}")
-        connections = []
-        connection_files = list(self.storage_path.glob("*.json"))
-        print(f"Debug: Found {len(connection_files)} connection files")
-        
-        for file_path in connection_files:
-            print(f"Debug: Reading connection file {file_path}")
-            try:
-                with open(file_path) as f:
-                    data = json.load(f)
-                    if user_email is None or data.get("createdBy") == user_email:
-                        print(f"Debug: Found connection for user {data.get('createdBy')}")
-                        connections.append(Connection(**data))
-            except Exception as e:
-                print(f"Debug: Error reading connection file {file_path}: {str(e)}")
-                
-        print(f"Debug: Returning {len(connections)} connections")
-        return connections
+        return await asyncio.to_thread(self._list_connections_sync, user_email)
 
     async def delete_connection(self, connection_id: str) -> bool:
-        try:
-            file_path = self._get_connection_path(connection_id)
-            print(f"Debug: Attempting to delete connection file {file_path}")
-            if file_path.exists():
-                print(f"Debug: File exists, deleting...")
-                file_path.unlink()
-                print(f"Debug: File deleted successfully")
-                return True
-            print(f"Debug: File does not exist")
-            return False
-        except Exception as e:
-            print(f"Debug: Error deleting connection: {str(e)}")
-            return False
+        return await asyncio.to_thread(self._delete_connection_sync, connection_id)
 
     async def get_connection(self, connection_id: str) -> Optional[Connection]:
-        try:
-            file_path = self._get_connection_path(connection_id)
-            if file_path.exists():
-                with open(file_path) as f:
-                    data = json.load(f)
-                    return Connection(**data)
-            return None
-        except Exception as e:
-            print(f"Error getting connection: {str(e)}")
-            return None
+        return await asyncio.to_thread(self._get_connection_sync, connection_id)
 
     async def get_valid_connection(self, user_email: str) -> Optional[Connection]:
-        """Get the first valid AWS connection for the user."""
+        """Get the newest valid AWS connection for the user."""
         connections = await self.list_connections(user_email)
-        
-        for conn in connections:
-            is_valid, _, _ = await self.test_connection(conn)
+        sorted_conns = sorted(
+            connections,
+            key=lambda x: x.lastUpdated or x.createdAt or "",
+            reverse=True,
+        )
+        for conn in sorted_conns:
+            is_valid, _, _ = await self.test_connection(conn, use_cache=True)
             if is_valid:
                 return conn
         return None
@@ -146,7 +215,8 @@ class ConnectionManager:
             service,
             aws_access_key_id=conn.accessKey,
             aws_secret_access_key=conn.secretKey,
-            region_name=region or conn.region or 'us-east-1'  # Use provided region, connection region, or default
+            region_name=region or conn.region or 'us-east-1',
+            config=AWS_CLIENT_CONFIG,
         )
 
     async def get_active_connection(self, user_email: str) -> Optional[Connection]:

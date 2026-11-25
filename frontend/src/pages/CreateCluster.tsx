@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import {
+  Alert,
   Box,
+  CircularProgress,
   Container,
   Button,
   Typography,
@@ -9,6 +11,8 @@ import {
 } from '@mui/material';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import { useNavigate } from 'react-router-dom';
+import { useTesserakAuth } from '../auth/AuthContext';
+import { invalidateSwrCache } from '../utils/swrCache';
 import ClusterBasicDetails from '../components/CreateCluster/ClusterBasicDetails';
 import ClusterEnvironment from '../components/CreateCluster/ClusterEnvironment';
 import ClusterAddons from '../components/CreateCluster/ClusterAddons';
@@ -20,6 +24,7 @@ const steps = ['Basic Details', 'Environment Setup', 'Add-ons', 'Preview'];
 export interface ClusterConfig {
   name: string;
   accountId: string;
+  accountName?: string;
   region: string;
   vpc: {
     id: string;
@@ -44,10 +49,15 @@ export interface ClusterConfig {
 
 const CreateCluster: React.FC = () => {
   const [activeStep, setActiveStep] = useState(0);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const navigate = useNavigate();
+  const { userEmail: authEmail } = useTesserakAuth();
+  const userEmail = authEmail || localStorage.getItem('currentUser') || '';
   const [config, setConfig] = useState<ClusterConfig>({
     name: '',
     accountId: '',
+    accountName: '',
     region: '',
     vpc: {
       id: '',
@@ -64,56 +74,75 @@ const CreateCluster: React.FC = () => {
   });
 
   const handleNext = () => {
+    setSubmitError(null);
     setActiveStep((prevStep) => prevStep + 1);
   };
 
   const handleBack = () => {
+    setSubmitError(null);
     setActiveStep((prevStep) => prevStep - 1);
   };
 
+  const extractApiError = (detail: any, fallback: string): string => {
+    if (!detail) return fallback;
+    if (typeof detail === 'string') return detail;
+    if (Array.isArray(detail)) {
+      return detail.map((d) => `${(d.loc || []).join('.')}: ${d.msg}`).join('; ') || fallback;
+    }
+    return detail.error_description || detail.message || fallback;
+  };
+
   const handleSubmit = async () => {
-    if (config.vpc.isNew) {
-      try {
+    setSubmitError(null);
+    setSubmitting(true);
+    let payloadConfig = { ...config, vpc: { ...config.vpc } };
+
+    try {
+      if (payloadConfig.vpc.isNew) {
         const vpcResponse = await fetch('http://localhost:8000/api/vpc', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'x-user-email': localStorage.getItem('currentUser') || '',
+            'x-user-email': userEmail,
           },
           body: JSON.stringify({
-            name: `${config.name}-vpc`,
-            cidr: config.vpc.cidr,
-            region: config.region,
-            accountId: config.accountId,
-            availabilityZones: config.environment.availabilityZones,
+            name: `${payloadConfig.name}-vpc`,
+            cidr: payloadConfig.vpc.cidr || '10.0.0.0/16',
+            region: payloadConfig.region,
+            accountId: payloadConfig.accountId,
+            availabilityZones: payloadConfig.environment.availabilityZones,
           }),
         });
 
-        if (!vpcResponse.ok) throw new Error('Failed to create VPC');
-
-        const vpcData = await vpcResponse.json();
-        config.vpc.id = vpcData.vpcId;
-      } catch (error) {
-        console.error('Error creating VPC:', error);
-        return;
+        const vpcData = await vpcResponse.json().catch(() => ({}));
+        if (!vpcResponse.ok) {
+          throw new Error(extractApiError(vpcData.detail, 'Failed to create VPC'));
+        }
+        payloadConfig.vpc.id = vpcData.vpcId;
       }
-    }
 
-    try {
       const response = await fetch('http://localhost:8000/clusters', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-user-email': localStorage.getItem('currentUser') || '',
+          'x-user-email': userEmail,
         },
-        body: JSON.stringify(config),
+        body: JSON.stringify(payloadConfig),
       });
 
-      if (!response.ok) throw new Error('Failed to create cluster');
+      const resData = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(extractApiError(resData.detail, 'Failed to create cluster'));
+      }
 
+      invalidateSwrCache(userEmail, 'clusters');
+      invalidateSwrCache(userEmail, 'overview');
+      invalidateSwrCache(userEmail, 'guardrails');
       navigate('/clusters');
-    } catch (error) {
-      console.error('Error creating cluster:', error);
+    } catch (error: any) {
+      setSubmitError(error?.message || 'Failed to create EKS cluster');
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -216,18 +245,31 @@ const CreateCluster: React.FC = () => {
             flattenOnFocus
             sx={{ p: 3 }}
           >
+            {submitError && (
+              <Alert severity="error" sx={{ mb: 2.5 }} onClose={() => setSubmitError(null)}>
+                {submitError}
+              </Alert>
+            )}
+
             {activeStep === 0 && <ClusterBasicDetails config={config} onChange={setConfig} />}
             {activeStep === 1 && <ClusterEnvironment config={config} onChange={setConfig} />}
             {activeStep === 2 && <ClusterAddons config={config} onChange={setConfig} />}
             {activeStep === 3 && <ClusterPreview config={config} />}
 
             <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2, mt: 4 }}>
-              <Button variant="outlined" onClick={handleBack} disabled={activeStep === 0}>
+              <Button variant="outlined" onClick={handleBack} disabled={activeStep === 0 || submitting}>
                 Back
               </Button>
               {activeStep === steps.length - 1 ? (
-                <Button variant="contained" onClick={handleSubmit}>
-                  Create Cluster
+                <Button variant="contained" onClick={handleSubmit} disabled={submitting}>
+                  {submitting ? (
+                    <>
+                      <CircularProgress size={18} color="inherit" sx={{ mr: 1 }} />
+                      Creating Cluster...
+                    </>
+                  ) : (
+                    'Create Cluster'
+                  )}
                 </Button>
               ) : (
                 <Button variant="contained" onClick={handleNext}>
