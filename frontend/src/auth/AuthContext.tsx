@@ -249,9 +249,11 @@ export const TesserakAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
         clientId={AUTH0_CLIENT_ID}
         authorizationParams={{
           redirect_uri: window.location.origin,
+          scope: 'openid profile email',
           ...(AUTH0_AUDIENCE ? { audience: AUTH0_AUDIENCE } : {}),
         }}
         cacheLocation="localstorage"
+        useRefreshTokens={true}
       >
         <Auth0SdkBridge>{children}</Auth0SdkBridge>
       </Auth0Provider>

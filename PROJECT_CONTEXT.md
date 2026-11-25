@@ -47,7 +47,8 @@ technoworld/
 │   ├── connections.py                      # AWS IAM STS connection manager (connections/*.json)
 │   ├── state_manager.py                    # Local/AWS EKS cluster state diff engine (cluster_states/)
 │   ├── state_management.py                 # AWS EKS state reader
-│   ├── atmosly_router.py                   # APIRouter for Overview, Auth status, Integrations, Cloud Resources, Guardrails, Pipelines
+│   ├── auth0_security.py                   # Reusable Auth0FastAPI JWKS/DPoP validator + hybrid request identity dependency
+│   ├── atmosly_router.py                   # APIRouter for Overview (alerts + recentDeployments), Auth status/me, Integrations, Resources, Guardrails, Pipelines
 │   ├── integrations_service.py             # Live credential verifiers (GitHub, GitLab, AWS ECR, AWS Secrets, DockerHub, Cloudflare, GCP)
 │   ├── resources_service.py                # Live AWS discovery, Boto3 provisioning, drift remediation, deletion & compliance audit
 │   ├── pipelines_service.py                # Live `git ls-remote`, cluster context discovery & real `git/docker/kubectl` runner
@@ -78,7 +79,8 @@ technoworld/
             ├── Connectors/                 # ConnectorForm.tsx, ConnectorList.tsx (AWS IAM credentials)
             └── CreateCluster/              # 3D stepper views (ClusterBasicDetails, Environment, Addons, Preview)
         └── pages/
-            ├── Dashboard.tsx               # Executive header, real Atmosly KPI cards, EKS Health + Table
+            ├── Dashboard.tsx               # Executive Overview (/): KPIs, Live Alerts & Policy Signals, Recent Pipeline Deployments, EKS Fleet Summary
+            ├── Clusters.tsx                # Dedicated AWS EKS Clusters page (/clusters): Fleet KPIs, Health Donut, State Sync & Cluster Table
             ├── CloudResources.tsx          # Live AWS RDS/ElastiCache/S3/SQS inventory, Boto3 provisioner, drift remediation
             ├── Guardrails.tsx              # Policy rule toggles, severity modes, Live AWS Audit tab, Approval Queue
             ├── Pipelines.tsx               # Real Git/K8s pipeline creation (`git ls-remote`), cluster picker, polling terminal logs
@@ -97,7 +99,8 @@ technoworld/
 
 ### Auth & Overview
 - `GET /api/auth/status` — Checks backend `AUTH0_DOMAIN` & `AUTH0_AUDIENCE` env vars (`mode: "auth0" | "local-fallback"`).
-- `GET /api/atmosly/overview` (header `x-user-email`) — Returns real counts from integrations, live AWS discovery, guardrails, approvals, and pipelines.
+- `GET /api/auth/me` — Protected by `Auth0FastAPI.require_auth()` (verifies RS256 JWKS Bearer/DPoP tokens and returns `sub`, `email`, `scope`, `iss`, `aud`).
+- `GET /api/atmosly/overview` — Returns real counts, `alerts` (from pending approvals, failed pipelines/integrations, drifted AWS resources, live guardrail audit failures, and connector warnings), and `recentDeployments` (from real pipeline runs).
 
 ### Integrations (`integrations_service.py`)
 - `GET /api/atmosly/integrations` — Merges user's AWS IAM connectors (`connections/`) + verified platform integrations (secrets stripped).

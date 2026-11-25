@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import {
   Alert,
   Box,
+  Button,
   Chip,
   FormControlLabel,
   Grid,
@@ -12,23 +13,49 @@ import {
   Key as KeyIcon,
   NotificationsActive as NotificationsIcon,
   Security as SecurityIcon,
+  VerifiedUser as VerifiedUserIcon,
 } from '@mui/icons-material';
 import { Perspective3DCard } from '../components/Perspective3DCard';
 import { useTesserakAuth } from '../auth/AuthContext';
+import { API_BASE_URL, buildAuthHeaders } from '../utils/apiClient';
 
 export const Settings: React.FC = () => {
-  const { isAuth0Configured, sessionUser } = useTesserakAuth();
+  const { isAuth0Configured, sessionUser, userEmail, getAccessToken } = useTesserakAuth();
   const [backendAuthStatus, setBackendAuthStatus] = useState<{ mode: string; auth0Configured: boolean } | null>(null);
+  const [jwtVerifyResult, setJwtVerifyResult] = useState<{ ok: boolean; text: string } | null>(null);
   const [autoReconcile, setAutoReconcile] = useState(true);
   const [finopsAlerts, setFinopsAlerts] = useState(true);
   const [ephemeralReap, setEphemeralReap] = useState(true);
 
   useEffect(() => {
-    fetch('http://localhost:8000/api/auth/status')
+    fetch(`${API_BASE_URL}/api/auth/status`)
       .then((r) => r.json())
       .then(setBackendAuthStatus)
       .catch(() => null);
   }, []);
+
+  const handleVerifyJwt = async () => {
+    setJwtVerifyResult(null);
+    try {
+      const headers = await buildAuthHeaders(userEmail || 'demo@tesserak.dev', getAccessToken);
+      const res = await fetch(`${API_BASE_URL}/api/auth/me`, { headers });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setJwtVerifyResult({
+          ok: true,
+          text: `JWKS Verified — sub: ${body.sub} · aud: ${Array.isArray(body.aud) ? body.aud.join(', ') : body.aud}`,
+        });
+      } else {
+        const desc =
+          typeof body.detail === 'object'
+            ? `${body.detail.error}: ${body.detail.error_description}`
+            : body.detail || `HTTP ${res.status}`;
+        setJwtVerifyResult({ ok: false, text: `Rejected (${res.status}): ${desc}` });
+      }
+    } catch {
+      setJwtVerifyResult({ ok: false, text: 'Unable to reach FastAPI /api/auth/me endpoint.' });
+    }
+  };
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
@@ -73,8 +100,24 @@ export const Settings: React.FC = () => {
 
             <Alert severity="info" sx={{ mb: 2 }}>
               Signed in as <strong>{sessionUser?.email}</strong> ({sessionUser?.authProvider || 'local'}).
-              Copy <code>frontend/.env.example</code> to <code>frontend/.env</code> with your Auth0 tenant domain and SPA Client ID to activate Universal Login redirects.
+              Copy <code>frontend/.env.example</code> to <code>frontend/.env</code> and <code>backend/.env.example</code> to <code>backend/.env</code> with your Auth0 tenant domain, SPA Client ID, and API Audience to activate Universal Login + JWKS verification.
             </Alert>
+
+            <Button
+              variant="outlined"
+              size="small"
+              startIcon={<VerifiedUserIcon fontSize="small" />}
+              onClick={handleVerifyJwt}
+              sx={{ borderColor: '#2563eb', color: '#2563eb', fontWeight: 700 }}
+            >
+              Test Backend JWT Guard (/api/auth/me)
+            </Button>
+
+            {jwtVerifyResult && (
+              <Alert severity={jwtVerifyResult.ok ? 'success' : 'warning'} sx={{ mt: 1.5 }}>
+                {jwtVerifyResult.text}
+              </Alert>
+            )}
           </Perspective3DCard>
         </Grid>
 

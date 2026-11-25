@@ -43,6 +43,7 @@ import { TesserakAuthProvider, useTesserakAuth } from './auth/AuthContext';
 import { AuthPage } from './components/Auth/AuthPage';
 import { TesserakLogo } from './components/TesserakLogo';
 import Dashboard from './pages/Dashboard';
+import { Clusters } from './pages/Clusters';
 import CreateCluster from './pages/CreateCluster';
 import Profile from './pages/Profile';
 import { CloudResources } from './pages/CloudResources';
@@ -448,7 +449,7 @@ const AppShell: React.FC = () => {
         <Layout onLogout={logout} currentUser={userEmail} authProviderLabel={providerBadge}>
           <Routes>
             <Route path="/" element={<Dashboard />} />
-            <Route path="/clusters" element={<Dashboard />} />
+            <Route path="/clusters" element={<Clusters />} />
             <Route path="/create-cluster" element={<CreateCluster />} />
             <Route path="/resources" element={<CloudResources />} />
             <Route path="/infrastructure" element={<CloudResources />} />

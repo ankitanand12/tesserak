@@ -155,16 +155,61 @@ export interface PipelineItem {
   recentRuns: PipelineRunSummary[];
 }
 
+export type AlertSource =
+  | 'drifted_resources'
+  | 'guardrail_failures'
+  | 'pending_approvals'
+  | 'failed_pipelines'
+  | 'connection_warnings';
+
+export type AlertSeverity = 'critical' | 'approval' | 'warning';
+
+export interface OverviewAlert {
+  id: string;
+  source: AlertSource;
+  category: string;
+  severity: AlertSeverity;
+  title: string;
+  detail: string;
+  resourceName: string;
+  actionLabel: string;
+  actionPath: string;
+  timestamp: string;
+}
+
+export interface RecentDeployment {
+  id: string;
+  pipelineId: string;
+  pipelineName: string;
+  repositoryUrl: string;
+  branch: string;
+  commitSha: string;
+  targetCluster: string;
+  namespace: string;
+  runNumber: number;
+  status: 'Succeeded' | 'Running' | 'Failed' | 'Ready' | string;
+  durationSec: number;
+  timestamp: string;
+  triggeredBy: string;
+}
+
 export interface PlatformOverview {
   integrationsCount: number;
   connectedIntegrations: number;
   resourcesCount: number;
   driftedResources: number;
   awsConnected: boolean;
+  awsAccountId?: string | null;
+  awsRegion?: string | null;
   enabledGuardrails: number;
   totalGuardrails: number;
   pendingApprovals: number;
   pipelinesCount: number;
   healthyPipelines: number;
+  failedPipelines?: number;
+  runningPipelines?: number;
   complianceScore: number;
+  alertsCount?: number;
+  alerts?: OverviewAlert[];
+  recentDeployments?: RecentDeployment[];
 }

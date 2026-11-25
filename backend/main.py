@@ -398,10 +398,12 @@ async def list_clusters(x_user_email: str = Header(...)):
                 all_states.append(state_data_entry)
         current_time = datetime.utcnow()
 
+        seen_cluster_names = set()
         for state in all_states:
             cluster_name = state.get('name')
             if not cluster_name:
                 continue
+            seen_cluster_names.add(cluster_name)
 
             # Skip clusters deleted more than 7 days ago
             if state.get('deletedAt'):
@@ -422,7 +424,7 @@ async def list_clusters(x_user_email: str = Header(...)):
                 # Compare states
                 try:
                     comparison = state_manager.compare_with_aws_state(x_user_email, cluster_name, aws_state)
-                    state_status = comparison['status']
+                    state_status = 'synced' if comparison['status'] == 'in_sync' else comparison['status']
                 except Exception:
                     state_status = 'unknown'
                 
@@ -462,6 +464,35 @@ async def list_clusters(x_user_email: str = Header(...)):
                         deletedBy=state.get('deletedBy')
                     )
                 )
+
+        # Also include live AWS EKS clusters not yet tracked in local cluster_states
+        for live_name in response.get('clusters', []):
+            if live_name in seen_cluster_names:
+                continue
+            try:
+                cluster_info = eks_client.describe_cluster(name=live_name)['cluster']
+                created_raw = cluster_info.get('createdAt')
+                created_dt = (
+                    created_raw.replace(tzinfo=None)
+                    if hasattr(created_raw, 'tzinfo') and created_raw.tzinfo is not None
+                    else (created_raw or current_time)
+                )
+                clusters.append(
+                    ClusterResponse(
+                        name=cluster_info['name'],
+                        status=cluster_info['status'],
+                        accountId=account_id,
+                        region=cluster_info['arn'].split(':')[3],
+                        version=cluster_info.get('version', 'unknown'),
+                        endpoint=cluster_info.get('endpoint'),
+                        stateStatus='missing_local',
+                        createdAt=created_dt,
+                        deletedAt=None,
+                        deletedBy=None
+                    )
+                )
+            except Exception as live_err:
+                logger.warning(f"Failed describing live EKS cluster {live_name}: {live_err}")
         
         return clusters
     except HTTPException:

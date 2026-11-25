@@ -408,6 +408,7 @@ async def run_live_guardrail_audit(
     user_email: str,
     connection_manager: Any,
     rules: List[Dict[str, Any]],
+    prediscovered: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Audit real AWS EKS clusters, RDS instances, and S3 buckets against active Guardrail rules."""
     conn = await connection_manager.get_valid_connection(user_email)
@@ -447,7 +448,11 @@ async def run_live_guardrail_audit(
         pass
 
     # Scan RDS + S3
-    discovered = await discover_live_aws_resources(user_email, connection_manager, [])
+    discovered = (
+        prediscovered
+        if prediscovered is not None
+        else await discover_live_aws_resources(user_email, connection_manager, [])
+    )
     for res in discovered.get("resources", []):
         if "gr-encryption" in enabled_ids:
             findings.append(
