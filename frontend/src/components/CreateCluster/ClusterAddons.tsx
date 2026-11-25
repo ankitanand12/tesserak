@@ -15,6 +15,7 @@ import {
   SelectChangeEvent
 } from '@mui/material';
 import InfoIcon from '@mui/icons-material/Info';
+import { useTesserakAuth } from '../../auth/AuthContext';
 import { ClusterConfig } from '../../pages/CreateCluster';
 
 interface Props {
@@ -112,99 +113,95 @@ const COMMUNITY_ADDONS: Addon[] = [
 ];
 
 
-// Helper function to get appropriate version for an addon
+// Always select the latest version as default
 const getAppropriateVersion = (versions: AddonVersion[]): string | undefined => {
-  // First try to get the default version
-  const defaultVersion = versions.find(v => v.defaultVersion);
-  if (defaultVersion) {
-    return defaultVersion.version;
-  }
-
-  // If no default version, try to get the latest version
-  const latestVersion = versions.find(v => v.isLatest);
+  const latestVersion = versions.find((v) => v.isLatest);
   if (latestVersion) {
     return latestVersion.version;
   }
 
-  // If neither default nor latest, get the first version
   if (versions.length > 0) {
     return versions[0].version;
+  }
+
+  const defaultVersion = versions.find((v) => v.defaultVersion);
+  if (defaultVersion) {
+    return defaultVersion.version;
   }
 
   return undefined;
 };
 
+const COMMUNITY_FALLBACK_VERSIONS: AddonVersions = COMMUNITY_ADDONS.reduce((acc, addon) => {
+  if (addon.defaultVersion) {
+    acc[addon.id] = [
+      {
+        version: addon.defaultVersion,
+        defaultVersion: true,
+        isLatest: true,
+      },
+    ];
+  }
+  return acc;
+}, {} as AddonVersions);
+
 const ClusterAddons: React.FC<Props> = ({ config, onChange }) => {
-  const [addonVersions, setAddonVersions] = React.useState<AddonVersions>({});
-  const selectedIds = config.addons.map(a => a.id);
+  const { userEmail: authEmail } = useTesserakAuth();
+  const userEmail = authEmail || localStorage.getItem('currentUser') || '';
+  const [addonVersions, setAddonVersions] = React.useState<AddonVersions>(COMMUNITY_FALLBACK_VERSIONS);
+  const selectedIds = config.addons.map((a) => a.id);
 
   React.useEffect(() => {
     const fetchAddonVersions = async () => {
       try {
-        const currentUser = localStorage.getItem('currentUser');
-        if (!currentUser) {
-          console.warn('User not logged in');
+        if (!userEmail || !config.environment.kubernetesVersion) {
           return;
         }
 
-        if (!config.environment.kubernetesVersion) {
-          console.warn('Kubernetes version not set');
-          return;
-        }
-
-        console.log('Fetching addon versions for K8s version:', config.environment.kubernetesVersion);
-
-        const response = await fetch(`http://localhost:8000/api/aws/addon-versions/${config.environment.kubernetesVersion}`, {
-          headers: {
-            'X-User-Email': currentUser,
+        const regionQuery = config.region ? `?region=${encodeURIComponent(config.region)}` : '';
+        const response = await fetch(
+          `http://localhost:8000/api/aws/addon-versions/${config.environment.kubernetesVersion}${regionQuery}`,
+          {
+            headers: {
+              'X-User-Email': userEmail,
+            },
           }
-        });
+        );
 
         if (!response.ok) {
-          const errorText = await response.text();
-          console.error('Failed to fetch versions:', errorText);
-          // For community addons, use default version as fallback
-          setAddonVersions(COMMUNITY_ADDONS.reduce((acc, addon) => {
-            if (addon.defaultVersion) {
-              acc[addon.id] = [{
-                version: addon.defaultVersion,
-                defaultVersion: true,
-                isLatest: true
-              }];
-            }
-            return acc;
-          }, {} as AddonVersions));
+          setAddonVersions(COMMUNITY_FALLBACK_VERSIONS);
           return;
         }
 
-        const versions: AddonVersions = await response.json();
-        console.log('Received addon versions:', versions);
+        const rawVersions: AddonVersions = await response.json();
+        const mergedVersions: AddonVersions = {
+          ...COMMUNITY_FALLBACK_VERSIONS,
+          ...rawVersions,
+        };
+        setAddonVersions(mergedVersions);
 
-        setAddonVersions(versions);
-
-        // Automatically select required addons with their latest versions
+        // Automatically select recommended addons with their LATEST versions
         if (config.addons.length === 0) {
           const requiredAddons = ['vpc-cni', 'kube-proxy', 'coredns'];
           const newAddons = requiredAddons
-            .map(addonId => {
-              const addonInfo = AWS_ADDONS.find(a => a.id === addonId);
-              const addonVersions = versions[addonId] || [];
-              const defaultVersion = addonVersions.find(v => v.defaultVersion)?.version ||
-                                   addonVersions.find(v => v.isLatest)?.version ||
-                                   addonVersions[0]?.version;
-              
-              if (addonInfo && defaultVersion) {
+            .map((addonId) => {
+              const addonInfo = AWS_ADDONS.find((a) => a.id === addonId);
+              const versionsList = mergedVersions[addonId] || [];
+              const latestVer = getAppropriateVersion(versionsList);
+
+              if (addonInfo && latestVer) {
                 return {
                   id: addonId,
                   name: addonInfo.name,
                   type: 'aws' as const,
-                  version: defaultVersion
+                  version: latestVer,
                 };
               }
               return null;
             })
-            .filter((addon): addon is { id: string; name: string; type: 'aws'; version: string } => 
-              addon !== null
+            .filter(
+              (addon): addon is { id: string; name: string; type: 'aws'; version: string } =>
+                addon !== null
             );
 
           if (newAddons.length > 0) {
@@ -220,50 +217,42 @@ const ClusterAddons: React.FC<Props> = ({ config, onChange }) => {
       fetchAddonVersions();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [config.environment.kubernetesVersion, config.addons.length, onChange]);
+  }, [config.environment.kubernetesVersion, config.region, userEmail]);
 
-  const getAvailableVersions = (addon: Addon) => {
+  const getAvailableVersions = (addon: Addon): AddonVersion[] => {
     const versions = addonVersions[addon.id] || [];
-    console.log(`Getting versions for ${addon.id}:`, versions);
-    
-    if (versions.length === 0) {
-      console.log(`No versions found for ${addon.id}`);
+    if (versions.length > 0) return versions;
+    if (addon.type === 'community' && addon.defaultVersion) {
+      return [{ version: addon.defaultVersion, defaultVersion: true, isLatest: true }];
     }
-    
-    return versions;
+    return [];
   };
 
   const handleAddonToggle = (addon: Addon) => {
     const exists = selectedIds.includes(addon.id);
     let newAddons;
-    
+
     if (exists) {
-      newAddons = config.addons.filter(a => a.id !== addon.id);
+      newAddons = config.addons.filter((a) => a.id !== addon.id);
     } else {
-      let version;
-      
-      if (addon.type === 'community' && addon.defaultVersion) {
-        // For community addons, use default version if no API version available
-        version = addon.defaultVersion;
-      } else {
-        const versions = getAvailableVersions(addon);
-        console.log(`Available versions for ${addon.id}:`, versions); // Debug log
-        version = getAppropriateVersion(versions);
-      }
-      
+      const versions = getAvailableVersions(addon);
+      const version = getAppropriateVersion(versions) || addon.defaultVersion;
+
       if (!version) {
-        console.warn(`No version available for addon ${addon.id}`);
         return;
       }
 
-      newAddons = [...config.addons, {
-        id: addon.id,
-        name: addon.name,
-        type: addon.type,
-        version
-      }];
+      newAddons = [
+        ...config.addons,
+        {
+          id: addon.id,
+          name: addon.name,
+          type: addon.type,
+          version,
+        },
+      ];
     }
-    
+
     onChange({ ...config, addons: newAddons });
   };
 

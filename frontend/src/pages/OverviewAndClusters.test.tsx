@@ -2,6 +2,19 @@ import React from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import App from '../App';
 
+jest.mock('@auth0/auth0-react', () => ({
+  Auth0Provider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  useAuth0: () => ({
+    isLoading: false,
+    isAuthenticated: true,
+    user: { email: 'ops@tesserak.dev', given_name: 'Ops', family_name: 'Lead' },
+    error: undefined,
+    loginWithRedirect: jest.fn(),
+    logout: jest.fn(),
+    getAccessTokenSilently: jest.fn().mockResolvedValue('mock-auth0-jwt'),
+  }),
+}));
+
 const mockNavigate = jest.fn();
 let mockPathname = '/';
 
@@ -95,14 +108,16 @@ const sampleClusters = [
 ];
 
 describe('Overview vs Clusters route separation and visibility', () => {
+  let mockFetch: jest.Mock;
+
   beforeEach(() => {
     jest.clearAllMocks();
     localStorage.setItem('currentUser', 'ops@tesserak.dev');
     localStorage.setItem('authProvider', 'local');
 
-    global.fetch = jest.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    mockFetch = jest.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === 'string' ? input : input.toString();
-      if (url.includes('/api/atmosly/overview')) {
+      if (url.includes('/api/overview')) {
         return Promise.resolve({
           ok: true,
           status: 200,
@@ -129,6 +144,7 @@ describe('Overview vs Clusters route separation and visibility', () => {
         json: async () => ({}),
       } as Response);
     }) as jest.Mock;
+    global.fetch = mockFetch;
   });
 
   afterEach(() => {
@@ -170,10 +186,13 @@ describe('Overview vs Clusters route separation and visibility', () => {
     fireEvent.click(syncBtn);
 
     await waitFor(() => {
-      expect(global.fetch).toHaveBeenCalledWith(
-        'http://localhost:8000/clusters/prod-eks-core/sync',
-        expect.objectContaining({ method: 'POST' })
+      const syncCall = mockFetch.mock.calls.find(
+        ([url]) => url === 'http://localhost:8000/clusters/prod-eks-core/sync'
       );
+      expect(syncCall).toBeDefined();
+      expect(syncCall?.[1]?.method).toBe('POST');
+      const headers = new Headers(syncCall?.[1]?.headers);
+      expect(headers.get('Authorization')).toBe('Bearer mock-auth0-jwt');
     });
   });
 });

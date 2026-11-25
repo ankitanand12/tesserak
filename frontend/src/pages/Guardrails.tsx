@@ -34,6 +34,7 @@ import {
   Refresh as RefreshIcon,
   VerifiedUser as VerifiedUserIcon,
 } from '@mui/icons-material';
+import { useTesserakAuth } from '../auth/AuthContext';
 import { Perspective3DCard } from '../components/Perspective3DCard';
 import {
   GuardrailApproval,
@@ -41,13 +42,24 @@ import {
   GuardrailRule,
   GuardrailSeverity,
   GuardrailsSummary,
-} from '../types/atmosly';
+} from '../types/platform';
+import { fetchWithSwr, invalidateSwrCache, readSwrCache } from '../utils/swrCache';
 
 export const Guardrails: React.FC = () => {
-  const [rules, setRules] = useState<GuardrailRule[]>([]);
-  const [approvals, setApprovals] = useState<GuardrailApproval[]>([]);
-  const [audit, setAudit] = useState<GuardrailAudit | null>(null);
-  const [summary, setSummary] = useState<GuardrailsSummary | null>(null);
+  const { userEmail: authEmail } = useTesserakAuth();
+  const userEmail = authEmail || localStorage.getItem('currentUser') || 'demo@tesserak.dev';
+
+  const cachedGuard = readSwrCache<{
+    rules: GuardrailRule[];
+    approvals: GuardrailApproval[];
+    audit: GuardrailAudit | null;
+    summary: GuardrailsSummary | null;
+  }>(userEmail, 'guardrails');
+
+  const [rules, setRules] = useState<GuardrailRule[]>(() => cachedGuard?.rules ?? []);
+  const [approvals, setApprovals] = useState<GuardrailApproval[]>(() => cachedGuard?.approvals ?? []);
+  const [audit, setAudit] = useState<GuardrailAudit | null>(() => cachedGuard?.audit ?? null);
+  const [summary, setSummary] = useState<GuardrailsSummary | null>(() => cachedGuard?.summary ?? null);
   const [tab, setTab] = useState(0);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -58,30 +70,49 @@ export const Guardrails: React.FC = () => {
   const [ruleCategory, setRuleCategory] = useState('Security');
   const [ruleSeverity, setRuleSeverity] = useState<GuardrailSeverity>('block');
 
-  const userEmail = localStorage.getItem('currentUser') || 'demo@tesserak.dev';
-
-  const loadGuardrails = useCallback(async () => {
-    try {
-      const res = await fetch('http://localhost:8000/api/atmosly/guardrails', {
-        headers: { 'x-user-email': userEmail },
-      });
-      if (!res.ok) throw new Error('Unable to load guardrails');
-      const data = await res.json();
-      setRules(data.rules || []);
-      setApprovals(data.approvals || []);
-      setAudit(data.audit || null);
-      setSummary(data.summary || null);
-    } catch (err: any) {
-      setError(err.message || 'Failed to load policy engine');
-    }
-  }, [userEmail]);
+  const loadGuardrails = useCallback(
+    async (force: boolean = false) => {
+      try {
+        const data = await fetchWithSwr(
+          userEmail,
+          'guardrails',
+          async () => {
+            const url = force
+              ? 'http://localhost:8000/api/guardrails?refresh=true'
+              : 'http://localhost:8000/api/guardrails';
+            const res = await fetch(url, {
+              headers: { 'x-user-email': userEmail },
+            });
+            if (!res.ok) throw new Error('Unable to load guardrails');
+            const parsed = await res.json();
+            return {
+              rules: (parsed.rules || []) as GuardrailRule[],
+              approvals: (parsed.approvals || []) as GuardrailApproval[],
+              audit: (parsed.audit || null) as GuardrailAudit | null,
+              summary: (parsed.summary || null) as GuardrailsSummary | null,
+            };
+          },
+          { force, dedupeWindowMs: 5000 }
+        );
+        setRules(data.rules);
+        setApprovals(data.approvals);
+        setAudit(data.audit);
+        setSummary(data.summary);
+      } catch (err: any) {
+        if (!readSwrCache(userEmail, 'guardrails')) {
+          setError(err.message || 'Failed to load policy engine');
+        }
+      }
+    },
+    [userEmail]
+  );
 
   useEffect(() => {
-    loadGuardrails();
+    loadGuardrails(false);
   }, [loadGuardrails]);
 
   const handleToggleRule = async (rule: GuardrailRule) => {
-    const res = await fetch(`http://localhost:8000/api/atmosly/guardrails/rules/${rule.id}`, {
+    const res = await fetch(`http://localhost:8000/api/guardrails/rules/${rule.id}`, {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -91,12 +122,14 @@ export const Guardrails: React.FC = () => {
     });
     if (res.ok) {
       setNotice(`Guardrail "${rule.name}" ${!rule.enabled ? 'enabled' : 'paused'}.`);
-      await loadGuardrails();
+      invalidateSwrCache(userEmail, 'guardrails');
+      invalidateSwrCache(userEmail, 'overview');
+      await loadGuardrails(true);
     }
   };
 
   const handleSeverityChange = async (ruleId: string, severity: GuardrailSeverity) => {
-    const res = await fetch(`http://localhost:8000/api/atmosly/guardrails/rules/${ruleId}`, {
+    const res = await fetch(`http://localhost:8000/api/guardrails/rules/${ruleId}`, {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -105,7 +138,9 @@ export const Guardrails: React.FC = () => {
       body: JSON.stringify({ severity }),
     });
     if (res.ok) {
-      await loadGuardrails();
+      invalidateSwrCache(userEmail, 'guardrails');
+      invalidateSwrCache(userEmail, 'overview');
+      await loadGuardrails(true);
     }
   };
 
@@ -113,7 +148,7 @@ export const Guardrails: React.FC = () => {
     setError('');
     setNotice('');
     try {
-      const res = await fetch(`http://localhost:8000/api/atmosly/approvals/${approvalId}/decision`, {
+      const res = await fetch(`http://localhost:8000/api/approvals/${approvalId}/decision`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -131,7 +166,10 @@ export const Guardrails: React.FC = () => {
           ? 'Approved and created live resource in AWS.'
           : 'Request rejected by Guardrail reviewer.'
       );
-      await loadGuardrails();
+      invalidateSwrCache(userEmail, 'guardrails');
+      invalidateSwrCache(userEmail, 'resources');
+      invalidateSwrCache(userEmail, 'overview');
+      await loadGuardrails(true);
     } catch {
       setError('Failed to submit decision');
     }
@@ -139,7 +177,7 @@ export const Guardrails: React.FC = () => {
 
   const handleCreateRule = async (e: React.FormEvent) => {
     e.preventDefault();
-    const res = await fetch('http://localhost:8000/api/atmosly/guardrails/rules', {
+    const res = await fetch('http://localhost:8000/api/guardrails/rules', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -157,7 +195,9 @@ export const Guardrails: React.FC = () => {
       setRuleName('');
       setRuleDesc('');
       setNotice('Custom Guardrail rule added and active.');
-      await loadGuardrails();
+      invalidateSwrCache(userEmail, 'guardrails');
+      invalidateSwrCache(userEmail, 'overview');
+      await loadGuardrails(true);
     }
   };
 
@@ -195,7 +235,7 @@ export const Guardrails: React.FC = () => {
           <Button
             variant="outlined"
             startIcon={<RefreshIcon />}
-            onClick={loadGuardrails}
+            onClick={() => loadGuardrails(true)}
             sx={{ borderColor: '#09090b', color: '#09090b' }}
           >
             Run Live Scan

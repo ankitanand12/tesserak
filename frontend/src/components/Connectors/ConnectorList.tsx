@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Box,
   CardContent,
@@ -14,6 +14,7 @@ import {
 } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import CloudIcon from '@mui/icons-material/Cloud';
+import { useTesserakAuth } from '../../auth/AuthContext';
 import Perspective3DCard from '../Perspective3DCard';
 
 export interface Connector {
@@ -39,13 +40,23 @@ const ConnectorList: React.FC<ConnectorListProps> = ({
   onStatusUpdate,
 }) => {
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const { userEmail: authEmail } = useTesserakAuth();
+  const userEmail = authEmail || localStorage.getItem('currentUser') || '';
+  const connectorsRef = useRef(connectors);
+  connectorsRef.current = connectors;
+  const onStatusUpdateRef = useRef(onStatusUpdate);
+  onStatusUpdateRef.current = onStatusUpdate;
+  const connectorIdsKey = connectors.map((c) => c.id).join(',');
 
   useEffect(() => {
+    if (!connectorIdsKey || !userEmail) return;
+
+    let cancelled = false;
     const checkStatus = async () => {
       try {
         const response = await fetch('http://localhost:8000/api/connections/status', {
           headers: {
-            'x-user-email': localStorage.getItem('currentUser') || '',
+            'x-user-email': userEmail,
             Accept: 'application/json',
           },
         });
@@ -53,15 +64,18 @@ const ConnectorList: React.FC<ConnectorListProps> = ({
         if (!response.ok) throw new Error('Failed to check connections status');
 
         const statusList = await response.json();
-        const updatedConnectors = connectors.map((conn) => {
+        if (cancelled) return;
+
+        const currentConnectors = connectorsRef.current;
+        const updatedConnectors = currentConnectors.map((conn) => {
           const status = statusList.find(
             (s: { id: string; status: string; accountId?: string }) => s.id === conn.id
           );
           return status ? { ...conn, status: status.status, accountId: status.accountId } : conn;
         });
 
-        if (JSON.stringify(updatedConnectors) !== JSON.stringify(connectors)) {
-          onStatusUpdate?.(updatedConnectors);
+        if (JSON.stringify(updatedConnectors) !== JSON.stringify(currentConnectors)) {
+          onStatusUpdateRef.current?.(updatedConnectors);
         }
       } catch (error) {
         console.error('Error checking connections status:', error);
@@ -70,8 +84,11 @@ const ConnectorList: React.FC<ConnectorListProps> = ({
 
     checkStatus();
     const interval = setInterval(checkStatus, 120000);
-    return () => clearInterval(interval);
-  }, [connectors, onStatusUpdate]);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [connectorIdsKey, userEmail]);
 
   if (connectors.length === 0) {
     return (

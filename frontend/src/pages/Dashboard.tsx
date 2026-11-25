@@ -39,9 +39,10 @@ import type {
   PlatformAlertSeverity,
   PlatformOverview,
   RecentDeploymentItem,
-} from '../types/atmosly';
+} from '../types/platform';
 import type { Cluster } from '../types/cluster';
 import { formatRelativeTime } from '../utils/dateUtils';
+import { fetchWithSwr, invalidateSwrCache, readSwrCache } from '../utils/swrCache';
 
 type AlertFilter = 'all' | PlatformAlertSeverity;
 
@@ -80,37 +81,62 @@ const Dashboard: React.FC = () => {
   const { userEmail: authEmail } = useTesserakAuth();
   const userEmail = authEmail || localStorage.getItem('currentUser') || 'demo@tesserak.dev';
 
-  const [overview, setOverview] = useState<PlatformOverview | null>(null);
-  const [loadingOverview, setLoadingOverview] = useState<boolean>(true);
+  const cachedOverview = readSwrCache<PlatformOverview>(userEmail, 'overview');
+  const [overview, setOverview] = useState<PlatformOverview | null>(
+    () => cachedOverview ?? null
+  );
+  const [loadingOverview, setLoadingOverview] = useState<boolean>(
+    () => cachedOverview === undefined
+  );
   const [alertFilter, setAlertFilter] = useState<AlertFilter>('all');
   const [actionMsg, setActionMsg] = useState('');
   const [actionSeverity, setActionSeverity] = useState<'info' | 'error'>('info');
   const [triggeringId, setTriggeringId] = useState<string | null>(null);
 
-  const loadOverview = useCallback(async () => {
-    try {
-      const res = await fetch('http://localhost:8000/api/atmosly/overview', {
-        headers: { 'x-user-email': userEmail },
-      });
-      if (res.ok) {
-        const data: PlatformOverview = await res.json();
-        setOverview(data);
+  const loadOverview = useCallback(
+    async (force: boolean = false) => {
+      const existing = readSwrCache<PlatformOverview>(userEmail, 'overview');
+      if (existing) {
+        setOverview(existing);
+        setLoadingOverview(false);
       }
-    } catch {
-      // Non-fatal: keep existing view if backend temporarily unavailable
-    } finally {
-      setLoadingOverview(false);
-    }
-  }, [userEmail]);
+
+      try {
+        const data = await fetchWithSwr<PlatformOverview>(
+          userEmail,
+          'overview',
+          async () => {
+            const url = force
+              ? 'http://localhost:8000/api/overview?refresh=true'
+              : 'http://localhost:8000/api/overview';
+            const res = await fetch(url, {
+              headers: { 'x-user-email': userEmail },
+            });
+            if (!res.ok) {
+              throw new Error(`Overview request failed (${res.status})`);
+            }
+            return (await res.json()) as PlatformOverview;
+          },
+          { force, dedupeWindowMs: 4000 }
+        );
+        setOverview(data);
+      } catch {
+        // Non-fatal: keep existing cached view if backend temporarily unavailable
+      } finally {
+        setLoadingOverview(false);
+      }
+    },
+    [userEmail]
+  );
 
   useEffect(() => {
-    loadOverview();
+    loadOverview(false);
   }, [loadOverview]);
 
   // Poll automatically while any pipeline deployment is actively running
   useEffect(() => {
     if (!overview?.activeRunningPipelines) return;
-    const timer = setInterval(loadOverview, 2000);
+    const timer = setInterval(() => loadOverview(true), 2000);
     return () => clearInterval(timer);
   }, [overview?.activeRunningPipelines, loadOverview]);
 
@@ -119,7 +145,7 @@ const Dashboard: React.FC = () => {
     setActionMsg('');
     try {
       const res = await fetch(
-        `http://localhost:8000/api/atmosly/pipelines/${encodeURIComponent(dep.pipelineId)}/trigger`,
+        `http://localhost:8000/api/pipelines/${encodeURIComponent(dep.pipelineId)}/trigger`,
         {
           method: 'POST',
           headers: {
@@ -137,7 +163,9 @@ const Dashboard: React.FC = () => {
       }
       setActionSeverity('info');
       setActionMsg(`Triggered "${dep.pipelineName}" (${dep.branch}) on backend runner.`);
-      await loadOverview();
+      invalidateSwrCache(userEmail, 'overview');
+      invalidateSwrCache(userEmail, 'pipelines');
+      await loadOverview(true);
     } catch {
       setActionSeverity('error');
       setActionMsg(`Unable to reach backend CI/CD runner for "${dep.pipelineName}".`);
@@ -213,7 +241,7 @@ const Dashboard: React.FC = () => {
           onTriggerDeployment={handleTriggerDeployment}
           onRefreshAll={async () => {
             setLoadingOverview(true);
-            await Promise.all([loadOverview(), helpers.refreshClusters()]);
+            await Promise.all([loadOverview(true), helpers.refreshClusters(true)]);
           }}
           onNavigate={navigate}
         />

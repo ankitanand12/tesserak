@@ -20,6 +20,7 @@ import {
   AutocompleteRenderInputParams,
 } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
+import { useTesserakAuth } from '../../auth/AuthContext';
 import { ClusterConfig } from '../../pages/CreateCluster';
 
 interface Props {
@@ -27,13 +28,22 @@ interface Props {
   onChange: (config: ClusterConfig) => void;
 }
 
-const K8S_VERSIONS = ['1.31', '1.32', '1.33'];
+interface EksVersionItem {
+  version: string;
+  status: string;
+  isLatest?: boolean;
+  awsDefault?: boolean;
+}
 
 const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
+  const { userEmail: authEmail } = useTesserakAuth();
+  const userEmail = authEmail || localStorage.getItem('currentUser') || '';
   const [open, setOpen] = useState(false);
   const [availableZones, setAvailableZones] = useState<string[]>([]);
-  const [loading] = useState(false);
-  const [error] = useState<string | null>(null);
+  const [k8sVersions, setK8sVersions] = useState<EksVersionItem[]>([]);
+  const [loadingZones, setLoadingZones] = useState(false);
+  const [loadingVersions, setLoadingVersions] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [isValid, setIsValid] = useState(false);
   const [newTag, setNewTag] = useState({ key: '', value: '' });
 
@@ -57,20 +67,77 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
     setIsValid(isValidConfig);
   }, [config.environment.endpoint, config.environment.kubernetesVersion, config.environment.availabilityZones]);
 
+  // Fetch live AWS EKS Kubernetes versions (latest first) and auto-default to latest
   useEffect(() => {
-    if (!config.accountId || !config.region) return;
+    if (!config.accountId || !userEmail) return;
+    let active = true;
 
-    // For testing, create mock availability zones based on the selected region
-    // Later this will be replaced with actual API call
-    const mockZones = [];
-    if (config.region) {
-      // Create 3 availability zones for the region (a, b, c)
-      for (let letter of ['a', 'b', 'c']) {
-        mockZones.push(`${config.region}${letter}`);
+    const fetchEksVersions = async () => {
+      setLoadingVersions(true);
+      try {
+        const regionQuery = config.region ? `?region=${encodeURIComponent(config.region)}` : '';
+        const res = await fetch(`http://localhost:8000/api/aws/eks-versions${regionQuery}`, {
+          headers: { 'x-user-email': userEmail },
+        });
+        if (!res.ok) throw new Error('Failed to fetch AWS EKS Kubernetes versions');
+        const data = await res.json();
+        if (!active) return;
+        const versions: EksVersionItem[] = Array.isArray(data.versions) ? data.versions : [];
+        setK8sVersions(versions);
+        setError(null);
+
+        const latest = data.latest || versions[0]?.version;
+        if (latest && (!config.environment.kubernetesVersion || !versions.some((v) => v.version === config.environment.kubernetesVersion))) {
+          onChange({
+            ...config,
+            environment: {
+              ...config.environment,
+              kubernetesVersion: latest,
+            },
+          });
+        }
+      } catch (err: any) {
+        if (active) setError(err?.message || 'Unable to fetch supported AWS Kubernetes versions');
+      } finally {
+        if (active) setLoadingVersions(false);
       }
-    }
-    setAvailableZones(mockZones);
-  }, [config.accountId, config.region]);
+    };
+
+    fetchEksVersions();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.accountId, config.region, userEmail]);
+
+  // Fetch real Availability Zones for selected account & region
+  useEffect(() => {
+    if (!config.accountId || !config.region || !userEmail) return;
+    let active = true;
+
+    const fetchZones = async () => {
+      setLoadingZones(true);
+      try {
+        const res = await fetch(
+          `http://localhost:8000/api/aws/zones/${config.accountId}/${config.region}`,
+          { headers: { 'x-user-email': userEmail } }
+        );
+        if (!res.ok) throw new Error('Failed to fetch availability zones');
+        const data = await res.json();
+        if (!active) return;
+        const zoneNames = Array.isArray(data) ? data.map((z: any) => z.name).filter(Boolean) : [];
+        setAvailableZones(zoneNames);
+      } catch {
+        if (active) {
+          setAvailableZones(['a', 'b', 'c'].map((l) => `${config.region}${l}`));
+        }
+      } finally {
+        if (active) setLoadingZones(false);
+      }
+    };
+
+    fetchZones();
+    return () => {
+      active = false;
+    };
+  }, [config.accountId, config.region, userEmail]);
 
   const handleEnvironmentTypeChange = (value: 'Non-Prod' | 'Prod') => {
     onChange({
@@ -174,10 +241,12 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
                   }
                 })}
                 label="Kubernetes Version"
+                disabled={loadingVersions}
               >
-                {K8S_VERSIONS.map((version) => (
-                  <MenuItem key={version} value={version}>
-                    {version}
+                {k8sVersions.map((item) => (
+                  <MenuItem key={item.version} value={item.version}>
+                    {item.version}
+                    {item.isLatest ? ' (Latest)' : item.status === 'EXTENDED_SUPPORT' ? ' (Extended Support)' : ''}
                   </MenuItem>
                 ))}
               </Select>
@@ -203,7 +272,11 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
                     label="Availability Zones"
                     required
                     error={config.environment.availabilityZones.length === 0}
-                    helperText={config.environment.availabilityZones.length === 0 ? "Select at least one availability zone" : ""}
+                    helperText={
+                      config.environment.availabilityZones.length < 2
+                        ? 'Select at least 2 availability zones for AWS EKS'
+                        : ''
+                    }
                     placeholder={config.region ? `Select availability zones for ${config.region}` : "Select a region first"}
                   />
                 )}
@@ -214,8 +287,8 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
                     </Typography>
                   </li>
                 )}
-                loading={loading}
-                disabled={loading || !config.region}
+                loading={loadingZones}
+                disabled={loadingZones || !config.region}
                 noOptionsText={config.region ? "No availability zones found" : "Select a region first"}
               />
             </FormControl>

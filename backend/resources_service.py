@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import asyncio
 import secrets
 import string
+import threading
+import time
 
 import boto3
+from botocore.config import Config
+
+BOTO_CFG = Config(connect_timeout=4, read_timeout=6, retries={"max_attempts": 1})
+DISCOVERY_CACHE_TTL_SECONDS = 30.0
+GUARDRAIL_CACHE_TTL_SECONDS = 20.0
+_DISCOVERY_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_GUARDRAIL_AUDIT_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_thread_local = threading.local()
 
 
 def _utc_now() -> str:
@@ -20,42 +32,41 @@ def _aws_session(conn: Any, region: Optional[str] = None) -> boto3.Session:
     )
 
 
-async def discover_live_aws_resources(
-    user_email: str,
-    connection_manager: Any,
-    pending_resources: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Discover real RDS, ElastiCache, S3, and SQS resources from the user's connected AWS IAM account."""
-    conn = await connection_manager.get_valid_connection(user_email)
-    if not conn:
-        return {
-            "awsConnected": False,
-            "accountId": None,
-            "region": None,
-            "resources": pending_resources,
-            "error": "No valid AWS IAM connection found. Add an AWS IAM connector in Integrations to discover & provision real resources.",
-        }
+def _thread_client(conn: Any, service: str, region: Optional[str] = None):
+    cache = getattr(_thread_local, "clients", None)
+    if cache is None:
+        cache = {}
+        _thread_local.clients = cache
+    resolved_region = region or conn.region or "us-east-1"
+    key = (conn.accessKey, resolved_region, service)
+    client = cache.get(key)
+    if client is None:
+        client = boto3.client(
+            service,
+            aws_access_key_id=conn.accessKey,
+            aws_secret_access_key=conn.secretKey,
+            region_name=resolved_region,
+            config=BOTO_CFG,
+        )
+        cache[key] = client
+    return client
 
-    session = _aws_session(conn)
-    region = conn.region or "us-east-1"
-    now = _utc_now()
-    discovered: List[Dict[str, Any]] = []
-    scan_warnings: List[str] = []
 
+def invalidate_resource_cache(user_email: Optional[str] = None) -> None:
+    if not user_email:
+        _DISCOVERY_CACHE.clear()
+        _GUARDRAIL_AUDIT_CACHE.clear()
+        return
+    clean = user_email.strip().lower()
+    _DISCOVERY_CACHE.pop(clean, None)
+    _GUARDRAIL_AUDIT_CACHE.pop(clean, None)
+
+
+def _scan_rds_sync(conn: Any, region: str, now: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    items: List[Dict[str, Any]] = []
+    warnings: List[str] = []
     try:
-        account_id = session.client("sts").get_caller_identity()["Account"]
-    except Exception as exc:
-        return {
-            "awsConnected": False,
-            "accountId": None,
-            "region": region,
-            "resources": pending_resources,
-            "error": f"AWS STS verification failed: {exc}",
-        }
-
-    # 1. RDS Instances
-    try:
-        rds = session.client("rds")
+        rds = _thread_client(conn, "rds", region)
         for db in rds.describe_db_instances().get("DBInstances", []):
             enc = bool(db.get("StorageEncrypted", False))
             pub = bool(db.get("PubliclyAccessible", False))
@@ -64,7 +75,7 @@ async def discover_live_aws_resources(
                 notes.append("Unencrypted storage detected on AWS")
             if pub:
                 notes.append("PubliclyAccessible=True violates network guardrail")
-            discovered.append(
+            items.append(
                 {
                     "id": f"aws-rds-{db['DBInstanceIdentifier']}",
                     "name": db["DBInstanceIdentifier"],
@@ -85,14 +96,18 @@ async def discover_live_aws_resources(
                 }
             )
     except Exception as exc:
-        scan_warnings.append(f"RDS describe skipped: {exc}")
+        warnings.append(f"RDS describe skipped: {exc}")
+    return items, warnings
 
-    # 2. ElastiCache Clusters
+
+def _scan_elasticache_sync(conn: Any, region: str, now: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    items: List[Dict[str, Any]] = []
+    warnings: List[str] = []
     try:
-        ec = session.client("elasticache")
+        ec = _thread_client(conn, "elasticache", region)
         for cc in ec.describe_cache_clusters().get("CacheClusters", []):
             enc = bool(cc.get("AtRestEncryptionEnabled", False))
-            discovered.append(
+            items.append(
                 {
                     "id": f"aws-ec-{cc['CacheClusterId']}",
                     "name": cc["CacheClusterId"],
@@ -113,99 +128,194 @@ async def discover_live_aws_resources(
                 }
             )
     except Exception as exc:
-        scan_warnings.append(f"ElastiCache describe skipped: {exc}")
+        warnings.append(f"ElastiCache describe skipped: {exc}")
+    return items, warnings
 
-    # 3. S3 Buckets (first 15 in account)
+
+def _inspect_s3_bucket_sync(conn: Any, b: Dict[str, Any], region: str, now: str) -> Dict[str, Any]:
+    s3 = _thread_client(conn, "s3", region)
+    b_name = b["Name"]
+    enc = False
+    pub = True
+    notes: List[str] = []
     try:
-        s3 = session.client("s3")
-        for b in s3.list_buckets().get("Buckets", [])[:15]:
-            b_name = b["Name"]
-            enc = False
-            pub = True
-            notes: List[str] = []
-            try:
-                s3.get_bucket_encryption(Bucket=b_name)
-                enc = True
-            except Exception:
-                notes.append("Bucket default encryption not set")
-            try:
-                pab = s3.get_public_access_block(Bucket=b_name).get("PublicAccessBlockConfiguration", {})
-                if all(
-                    [
-                        pab.get("BlockPublicAcls"),
-                        pab.get("IgnorePublicAcls"),
-                        pab.get("BlockPublicPolicy"),
-                        pab.get("RestrictPublicBuckets"),
-                    ]
-                ):
-                    pub = False
-                else:
-                    notes.append("PublicAccessBlock incomplete")
-            except Exception:
-                notes.append("PublicAccessBlock not configured")
-
-            discovered.append(
-                {
-                    "id": f"aws-s3-{b_name}",
-                    "name": b_name,
-                    "provider": "aws",
-                    "serviceType": "S3 Bucket",
-                    "region": region,
-                    "environment": "prod" if "prod" in b_name.lower() else "staging",
-                    "spec": "S3 Standard Object Store",
-                    "encrypted": enc,
-                    "publicAccess": pub,
-                    "status": "Active",
-                    "driftStatus": "Drifted" if (not enc or pub) else "In Sync",
-                    "guardrailNotes": notes or ["SSE encrypted · Public Access Blocked"],
-                    "createdAt": b.get("CreationDate").isoformat() if b.get("CreationDate") else now,
-                    "lastSyncAt": now,
-                    "arn": f"arn:aws:s3:::{b_name}",
-                    "source": "aws-live",
-                }
-            )
-    except Exception as exc:
-        scan_warnings.append(f"S3 list skipped: {exc}")
-
-    # 4. SQS Queues
+        s3.get_bucket_encryption(Bucket=b_name)
+        enc = True
+    except Exception:
+        notes.append("Bucket default encryption not set")
     try:
-        sqs = session.client("sqs")
-        for q_url in sqs.list_queues().get("QueueUrls", [])[:20]:
-            q_name = q_url.rsplit("/", 1)[-1]
-            attrs = sqs.get_queue_attributes(
-                QueueUrl=q_url,
-                AttributeNames=["KmsMasterKeyId", "SqsManagedSseEnabled", "CreatedTimestamp"],
-            ).get("Attributes", {})
-            enc = bool(attrs.get("KmsMasterKeyId") or attrs.get("SqsManagedSseEnabled") == "true")
-            discovered.append(
-                {
-                    "id": f"aws-sqs-{q_name}",
-                    "name": q_name,
-                    "provider": "aws",
-                    "serviceType": "SQS Standard Queue",
-                    "region": region,
-                    "environment": "prod" if "prod" in q_name.lower() else "staging",
-                    "spec": "AWS SQS Managed Queue",
-                    "encrypted": enc,
-                    "publicAccess": False,
-                    "status": "Active",
-                    "driftStatus": "In Sync" if enc else "Drifted",
-                    "guardrailNotes": ["SSE enabled"] if enc else ["Queue encryption disabled"],
-                    "createdAt": now,
-                    "lastSyncAt": now,
-                    "arn": q_url,
-                    "source": "aws-live",
-                }
-            )
+        pab = s3.get_public_access_block(Bucket=b_name).get("PublicAccessBlockConfiguration", {})
+        if all(
+            [
+                pab.get("BlockPublicAcls"),
+                pab.get("IgnorePublicAcls"),
+                pab.get("BlockPublicPolicy"),
+                pab.get("RestrictPublicBuckets"),
+            ]
+        ):
+            pub = False
+        else:
+            notes.append("PublicAccessBlock incomplete")
+    except Exception:
+        notes.append("PublicAccessBlock not configured")
+
+    return {
+        "id": f"aws-s3-{b_name}",
+        "name": b_name,
+        "provider": "aws",
+        "serviceType": "S3 Bucket",
+        "region": region,
+        "environment": "prod" if "prod" in b_name.lower() else "staging",
+        "spec": "S3 Standard Object Store",
+        "encrypted": enc,
+        "publicAccess": pub,
+        "status": "Active",
+        "driftStatus": "Drifted" if (not enc or pub) else "In Sync",
+        "guardrailNotes": notes or ["SSE encrypted · Public Access Blocked"],
+        "createdAt": b.get("CreationDate").isoformat() if b.get("CreationDate") else now,
+        "lastSyncAt": now,
+        "arn": f"arn:aws:s3:::{b_name}",
+        "source": "aws-live",
+    }
+
+
+def _scan_s3_sync(conn: Any, region: str, now: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    try:
+        s3 = _thread_client(conn, "s3", region)
+        buckets = s3.list_buckets().get("Buckets", [])[:15]
+        if not buckets:
+            return [], []
+        with ThreadPoolExecutor(max_workers=min(8, len(buckets))) as pool:
+            items = list(pool.map(lambda b: _inspect_s3_bucket_sync(conn, b, region, now), buckets))
+        return items, []
     except Exception as exc:
-        scan_warnings.append(f"SQS list skipped: {exc}")
+        return [], [f"S3 list skipped: {exc}"]
+
+
+def _inspect_sqs_queue_sync(conn: Any, q_url: str, region: str, now: str) -> Dict[str, Any]:
+    sqs = _thread_client(conn, "sqs", region)
+    q_name = q_url.rsplit("/", 1)[-1]
+    attrs = sqs.get_queue_attributes(
+        QueueUrl=q_url,
+        AttributeNames=["KmsMasterKeyId", "SqsManagedSseEnabled", "CreatedTimestamp"],
+    ).get("Attributes", {})
+    enc = bool(attrs.get("KmsMasterKeyId") or attrs.get("SqsManagedSseEnabled") == "true")
+    return {
+        "id": f"aws-sqs-{q_name}",
+        "name": q_name,
+        "provider": "aws",
+        "serviceType": "SQS Standard Queue",
+        "region": region,
+        "environment": "prod" if "prod" in q_name.lower() else "staging",
+        "spec": "AWS SQS Managed Queue",
+        "encrypted": enc,
+        "publicAccess": False,
+        "status": "Active",
+        "driftStatus": "In Sync" if enc else "Drifted",
+        "guardrailNotes": ["SSE enabled"] if enc else ["Queue encryption disabled"],
+        "createdAt": now,
+        "lastSyncAt": now,
+        "arn": q_url,
+        "source": "aws-live",
+    }
+
+
+def _scan_sqs_sync(conn: Any, region: str, now: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    try:
+        sqs = _thread_client(conn, "sqs", region)
+        queue_urls = sqs.list_queues().get("QueueUrls", [])[:20]
+        if not queue_urls:
+            return [], []
+        with ThreadPoolExecutor(max_workers=min(8, len(queue_urls))) as pool:
+            items = list(pool.map(lambda q_url: _inspect_sqs_queue_sync(conn, q_url, region, now), queue_urls))
+        return items, []
+    except Exception as exc:
+        return [], [f"SQS list skipped: {exc}"]
+
+
+def _discover_live_aws_resources_sync(conn: Any) -> Dict[str, Any]:
+    region = conn.region or "us-east-1"
+    now = _utc_now()
+    discovered: List[Dict[str, Any]] = []
+    scan_warnings: List[str] = []
+
+    try:
+        sts = _thread_client(conn, "sts", region)
+        account_id = sts.get_caller_identity()["Account"]
+    except Exception as exc:
+        return {
+            "awsConnected": False,
+            "accountId": None,
+            "region": region,
+            "discovered": [],
+            "warnings": [],
+            "error": f"AWS STS verification failed: {exc}",
+        }
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_rds = pool.submit(_scan_rds_sync, conn, region, now)
+        f_ec = pool.submit(_scan_elasticache_sync, conn, region, now)
+        f_s3 = pool.submit(_scan_s3_sync, conn, region, now)
+        f_sqs = pool.submit(_scan_sqs_sync, conn, region, now)
+        for fut in (f_rds, f_ec, f_s3, f_sqs):
+            items, warnings = fut.result()
+            discovered.extend(items)
+            scan_warnings.extend(warnings)
 
     return {
         "awsConnected": True,
         "accountId": account_id,
         "region": region,
-        "resources": pending_resources + discovered,
+        "discovered": discovered,
         "warnings": scan_warnings,
+    }
+
+
+async def discover_live_aws_resources(
+    user_email: str,
+    connection_manager: Any,
+    pending_resources: List[Dict[str, Any]],
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    """Discover real RDS, ElastiCache, S3, and SQS resources from the user's connected AWS IAM account."""
+    conn = await connection_manager.get_valid_connection(user_email)
+    if not conn:
+        return {
+            "awsConnected": False,
+            "accountId": None,
+            "region": None,
+            "resources": pending_resources,
+            "error": "No valid AWS IAM connection found. Add an AWS IAM connector in Integrations to discover & provision real resources.",
+        }
+
+    cache_key = (user_email or "").strip().lower()
+    now_mono = time.monotonic()
+    cached_payload: Optional[Dict[str, Any]] = None
+    if not force_refresh:
+        cached_entry = _DISCOVERY_CACHE.get(cache_key)
+        if cached_entry and cached_entry[0] > now_mono:
+            cached_payload = cached_entry[1]
+
+    if cached_payload is None:
+        cached_payload = await asyncio.to_thread(_discover_live_aws_resources_sync, conn)
+        if cached_payload.get("awsConnected"):
+            _DISCOVERY_CACHE[cache_key] = (time.monotonic() + DISCOVERY_CACHE_TTL_SECONDS, cached_payload)
+
+    if not cached_payload.get("awsConnected"):
+        return {
+            "awsConnected": False,
+            "accountId": None,
+            "region": cached_payload.get("region"),
+            "resources": pending_resources,
+            "error": cached_payload.get("error", "AWS STS verification failed."),
+        }
+
+    return {
+        "awsConnected": True,
+        "accountId": cached_payload.get("accountId"),
+        "region": cached_payload.get("region"),
+        "resources": pending_resources + list(cached_payload.get("discovered", [])),
+        "warnings": list(cached_payload.get("warnings", [])),
     }
 
 
@@ -404,10 +514,36 @@ def execute_aws_delete(conn: Any, resource_id: str) -> str:
     raise ValueError(f"Unknown AWS resource identifier '{resource_id}'.")
 
 
+def _scan_eks_guardrails_sync(conn: Any, enabled_ids: set[str]) -> List[Dict[str, Any]]:
+    findings: List[Dict[str, Any]] = []
+    if "gr-public-access" not in enabled_ids:
+        return findings
+    try:
+        eks = _thread_client(conn, "eks")
+        for cname in eks.list_clusters().get("clusters", []):
+            cluster = eks.describe_cluster(name=cname).get("cluster", {})
+            vpc_cfg = cluster.get("resourcesVpcConfig", {})
+            pub_access = bool(vpc_cfg.get("endpointPublicAccess", True))
+            findings.append(
+                {
+                    "resourceName": cname,
+                    "resourceType": "AWS EKS",
+                    "ruleId": "gr-public-access",
+                    "ruleName": "Block Public API Endpoints",
+                    "status": "FAIL" if pub_access else "PASS",
+                    "detail": "EKS API server endpointPublicAccess=True" if pub_access else "Private API endpoint enforced",
+                }
+            )
+    except Exception:
+        pass
+    return findings
+
+
 async def run_live_guardrail_audit(
     user_email: str,
     connection_manager: Any,
     rules: List[Dict[str, Any]],
+    force_refresh: bool = False,
 ) -> Dict[str, Any]:
     """Audit real AWS EKS clusters, RDS instances, and S3 buckets against active Guardrail rules."""
     conn = await connection_manager.get_valid_connection(user_email)
@@ -421,33 +557,24 @@ async def run_live_guardrail_audit(
             "message": "Connect an AWS IAM account in Integrations to run live compliance scans across EKS, RDS, and S3.",
         }
 
-    session = _aws_session(conn)
-    findings: List[Dict[str, Any]] = []
+    cache_key = (user_email or "").strip().lower()
     enabled_ids = {r["id"] for r in rules if r.get("enabled")}
+    rule_sig = ",".join(sorted(enabled_ids))
+    now_mono = time.monotonic()
+    if not force_refresh:
+        cached = _GUARDRAIL_AUDIT_CACHE.get(cache_key)
+        if cached and cached[0] > now_mono and cached[1].get("_ruleSig") == rule_sig:
+            out = dict(cached[1])
+            out.pop("_ruleSig", None)
+            return out
 
-    # Scan EKS clusters
-    try:
-        eks = session.client("eks")
-        for cname in eks.list_clusters().get("clusters", []):
-            cluster = eks.describe_cluster(name=cname).get("cluster", {})
-            vpc_cfg = cluster.get("resourcesVpcConfig", {})
-            pub_access = bool(vpc_cfg.get("endpointPublicAccess", True))
-            if "gr-public-access" in enabled_ids:
-                findings.append(
-                    {
-                        "resourceName": cname,
-                        "resourceType": "AWS EKS",
-                        "ruleId": "gr-public-access",
-                        "ruleName": "Block Public API Endpoints",
-                        "status": "FAIL" if pub_access else "PASS",
-                        "detail": "EKS API server endpointPublicAccess=True" if pub_access else "Private API endpoint enforced",
-                    }
-                )
-    except Exception:
-        pass
+    eks_findings, discovered = await asyncio.gather(
+        asyncio.to_thread(_scan_eks_guardrails_sync, conn, enabled_ids),
+        discover_live_aws_resources(user_email, connection_manager, [], force_refresh=force_refresh),
+    )
+    findings: List[Dict[str, Any]] = list(eks_findings)
 
     # Scan RDS + S3
-    discovered = await discover_live_aws_resources(user_email, connection_manager, [])
     for res in discovered.get("resources", []):
         if "gr-encryption" in enabled_ids:
             findings.append(
@@ -476,7 +603,7 @@ async def run_live_guardrail_audit(
     passed = sum(1 for f in findings if f["status"] == "PASS")
     score = round((passed / total) * 100) if total > 0 else 100
 
-    return {
+    result = {
         "awsConnected": True,
         "accountId": discovered.get("accountId"),
         "region": discovered.get("region"),
@@ -486,3 +613,8 @@ async def run_live_guardrail_audit(
         "passedCount": passed,
         "message": f"Scanned {total} live AWS checks across account {discovered.get('accountId')}.",
     }
+    _GUARDRAIL_AUDIT_CACHE[cache_key] = (
+        time.monotonic() + GUARDRAIL_CACHE_TTL_SECONDS,
+        {**result, "_ruleSig": rule_sig},
+    )
+    return result

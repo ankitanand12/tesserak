@@ -1,7 +1,13 @@
 connections
+postgresql/
 # misc
 .DS_Store
+.env
 .env.local
+backend/tesserak_data/.session_secret
+backend/tesserak_data/_email_users.json
 .env.development.local
 .env.test.local
 .env.production.local
+postgresql
+*.mp4

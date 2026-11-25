@@ -37,8 +37,10 @@ import {
   SyncProblem as SyncProblemIcon,
 } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
+import { useTesserakAuth } from '../auth/AuthContext';
 import { Perspective3DCard } from '../components/Perspective3DCard';
-import { CloudResource } from '../types/atmosly';
+import { CloudResource } from '../types/platform';
+import { fetchWithSwr, invalidateSwrCache, readSwrCache } from '../utils/swrCache';
 
 const SERVICE_BLUEPRINTS = [
   { label: 'S3 Bucket', defaultCost: 12, nodePlaceholder: 'Standard Object Bucket' },
@@ -49,11 +51,22 @@ const SERVICE_BLUEPRINTS = [
 
 export const CloudResources: React.FC = () => {
   const navigate = useNavigate();
-  const [resources, setResources] = useState<CloudResource[]>([]);
-  const [awsConnected, setAwsConnected] = useState(false);
-  const [accountId, setAccountId] = useState<string | null>(null);
-  const [awsRegion, setAwsRegion] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { userEmail: authEmail } = useTesserakAuth();
+  const userEmail = authEmail || localStorage.getItem('currentUser') || 'demo@tesserak.dev';
+
+  const cachedRes = readSwrCache<{
+    resources: CloudResource[];
+    awsConnected: boolean;
+    accountId: string | null;
+    awsRegion: string | null;
+    error?: string | null;
+  }>(userEmail, 'resources');
+
+  const [resources, setResources] = useState<CloudResource[]>(() => cachedRes?.resources ?? []);
+  const [awsConnected, setAwsConnected] = useState(() => cachedRes?.awsConnected ?? false);
+  const [accountId, setAccountId] = useState<string | null>(() => cachedRes?.accountId ?? null);
+  const [awsRegion, setAwsRegion] = useState<string | null>(() => cachedRes?.awsRegion ?? null);
+  const [loading, setLoading] = useState(() => cachedRes === undefined);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [modalError, setModalError] = useState('');
@@ -69,32 +82,76 @@ export const CloudResources: React.FC = () => {
   const [publicAccess, setPublicAccess] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
-  const userEmail = localStorage.getItem('currentUser') || 'demo@tesserak.dev';
-
-  const fetchResources = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetch('http://localhost:8000/api/atmosly/resources', {
-        headers: { 'x-user-email': userEmail },
-      });
-      if (!res.ok) throw new Error('Failed to load AWS resources');
-      const data = await res.json();
-      setResources(data.resources || []);
-      setAwsConnected(Boolean(data.awsConnected));
-      setAccountId(data.accountId || null);
-      setAwsRegion(data.region || null);
-      if (data.error && data.awsConnected) {
-        setError(data.error);
+  const fetchResources = useCallback(
+    async (force: boolean = false) => {
+      const existing = readSwrCache<{
+        resources: CloudResource[];
+        awsConnected: boolean;
+        accountId: string | null;
+        awsRegion: string | null;
+      }>(userEmail, 'resources');
+      if (existing) {
+        setResources(existing.resources);
+        setAwsConnected(existing.awsConnected);
+        setAccountId(existing.accountId);
+        setAwsRegion(existing.awsRegion);
+        setLoading(false);
+      } else {
+        setLoading(true);
       }
-    } catch (err: any) {
-      setError(err.message || 'Unable to connect to backend API');
-    } finally {
-      setLoading(false);
-    }
-  }, [userEmail]);
+      setError('');
+
+      try {
+        const parsed = await fetchWithSwr(
+          userEmail,
+          'resources',
+          async () => {
+            const url = force
+              ? 'http://localhost:8000/api/resources?refresh=true'
+              : 'http://localhost:8000/api/resources';
+            const res = await fetch(url, {
+              headers: { 'x-user-email': userEmail },
+            });
+            if (!res.ok) {
+              const errData = await res.json().catch(() => ({}));
+              const detail = errData?.detail;
+              const msg =
+                typeof detail === 'string'
+                  ? detail
+                  : detail?.error_description || detail?.message || 'Failed to load AWS resources';
+              throw new Error(msg);
+            }
+            const data = await res.json();
+            return {
+              resources: (data.resources || []) as CloudResource[],
+              awsConnected: Boolean(data.awsConnected),
+              accountId: (data.accountId || null) as string | null,
+              awsRegion: (data.region || null) as string | null,
+              error: (data.error || null) as string | null,
+            };
+          },
+          { force, dedupeWindowMs: 5000 }
+        );
+        setResources(parsed.resources);
+        setAwsConnected(parsed.awsConnected);
+        setAccountId(parsed.accountId);
+        setAwsRegion(parsed.awsRegion);
+        if (parsed.error && parsed.awsConnected) {
+          setError(parsed.error);
+        }
+      } catch (err: any) {
+        if (!existing) {
+          setError(err.message || 'Unable to connect to backend API');
+        }
+      } finally {
+        setLoading(false);
+      }
+    },
+    [userEmail]
+  );
 
   useEffect(() => {
-    fetchResources();
+    fetchResources(false);
   }, [fetchResources]);
 
   const openProvisionModal = (blueprintLabel: string) => {
@@ -112,7 +169,7 @@ export const CloudResources: React.FC = () => {
     setSuccessMsg('');
     setSubmitting(true);
     try {
-      const res = await fetch('http://localhost:8000/api/atmosly/resources', {
+      const res = await fetch('http://localhost:8000/api/resources', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -142,7 +199,10 @@ export const CloudResources: React.FC = () => {
           ? `Resource "${data.name}" queued for Guardrail approval (> threshold). Nothing created in AWS yet.`
           : `Created live AWS resource "${data.name}" (${data.serviceType}).`
       );
-      await fetchResources();
+      invalidateSwrCache(userEmail, 'resources');
+      invalidateSwrCache(userEmail, 'overview');
+      invalidateSwrCache(userEmail, 'guardrails');
+      await fetchResources(true);
     } catch (err: any) {
       setModalError(err.message || 'Provisioning request failed');
     } finally {
@@ -155,7 +215,7 @@ export const CloudResources: React.FC = () => {
     setSuccessMsg('');
     try {
       const res = await fetch(
-        `http://localhost:8000/api/atmosly/resources/${resourceId}/drift-check`,
+        `http://localhost:8000/api/resources/${resourceId}/drift-check`,
         {
           method: 'POST',
           headers: { 'x-user-email': userEmail },
@@ -167,7 +227,10 @@ export const CloudResources: React.FC = () => {
         return;
       }
       setSuccessMsg(data.message || 'AWS resource remediated.');
-      await fetchResources();
+      invalidateSwrCache(userEmail, 'resources');
+      invalidateSwrCache(userEmail, 'overview');
+      invalidateSwrCache(userEmail, 'guardrails');
+      await fetchResources(true);
     } catch {
       setError('Failed to remediate AWS drift');
     }
@@ -178,7 +241,7 @@ export const CloudResources: React.FC = () => {
     setSuccessMsg('');
     try {
       const res = await fetch(
-        `http://localhost:8000/api/atmosly/resources/${encodeURIComponent(resItem.id)}?environment=${encodeURIComponent(resItem.environment)}`,
+        `http://localhost:8000/api/resources/${encodeURIComponent(resItem.id)}?environment=${encodeURIComponent(resItem.environment)}`,
         {
           method: 'DELETE',
           headers: { 'x-user-email': userEmail },
@@ -190,7 +253,10 @@ export const CloudResources: React.FC = () => {
         return;
       }
       setSuccessMsg(data.message || 'Deleted cleanly.');
-      await fetchResources();
+      invalidateSwrCache(userEmail, 'resources');
+      invalidateSwrCache(userEmail, 'overview');
+      invalidateSwrCache(userEmail, 'guardrails');
+      await fetchResources(true);
     } catch {
       setError('Delete request failed');
     }
@@ -235,7 +301,7 @@ export const CloudResources: React.FC = () => {
           <Button
             variant="outlined"
             startIcon={<RefreshIcon />}
-            onClick={fetchResources}
+            onClick={() => fetchResources(true)}
             sx={{ borderColor: '#09090b', color: '#09090b' }}
           >
             Sync AWS

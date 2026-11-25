@@ -27,6 +27,7 @@ import type { ClusterListHelpers } from '../components/ClusterListManager';
 import ClusterTable from '../components/ClusterTable';
 import { Perspective3DCard } from '../components/Perspective3DCard';
 import { Cluster } from '../types/cluster';
+import { invalidateSwrCache } from '../utils/swrCache';
 
 type ClusterFilter = 'all' | 'active' | 'synced' | 'drift' | 'deleted';
 
@@ -55,6 +56,8 @@ export const Clusters: React.FC = () => {
       if (response.ok) {
         setActionSeverity('info');
         setActionMsg(`Deletion initiated for cluster "${clusterName}".`);
+        invalidateSwrCache(userEmail, 'clusters');
+        invalidateSwrCache(userEmail, 'overview');
         await refresh();
       } else {
         const data = await response.json().catch(() => ({}));
@@ -82,6 +85,8 @@ export const Clusters: React.FC = () => {
       if (response.ok) {
         setActionSeverity('info');
         setActionMsg(`Synchronized local state with live AWS EKS state for "${clusterName}".`);
+        invalidateSwrCache(userEmail, 'clusters');
+        invalidateSwrCache(userEmail, 'overview');
         await refresh();
       } else {
         const data = await response.json().catch(() => ({}));
@@ -110,8 +115,8 @@ export const Clusters: React.FC = () => {
           actionSeverity={actionSeverity}
           clearActionMsg={() => setActionMsg('')}
           syncingCluster={syncingCluster}
-          onDeleteCluster={(name) => handleDeleteCluster(name, helpers.refreshClusters)}
-          onSyncCluster={(name) => handleSyncCluster(name, helpers.refreshClusters)}
+          onDeleteCluster={(name) => handleDeleteCluster(name, () => helpers.refreshClusters(true))}
+          onSyncCluster={(name) => handleSyncCluster(name, () => helpers.refreshClusters(true))}
           onNavigate={navigate}
         />
       )}
@@ -244,7 +249,7 @@ const ClustersContent: React.FC<ClustersContentProps> = ({
             variant="outlined"
             startIcon={helpers.loading ? <CircularProgress size={16} /> : <RefreshIcon />}
             disabled={helpers.loading}
-            onClick={() => helpers.refreshClusters()}
+            onClick={() => helpers.refreshClusters(true)}
             sx={{ borderColor: '#09090b', color: '#09090b' }}
           >
             Refresh
@@ -490,6 +495,7 @@ const ClustersContent: React.FC<ClustersContentProps> = ({
           clusters={filteredClusters}
           onDeleteCluster={onDeleteCluster}
           onSyncCluster={onSyncCluster}
+          onSelectCluster={(name) => onNavigate(`/clusters/${encodeURIComponent(name)}`)}
           syncingCluster={syncingCluster}
           emptyMessage={
             clusters.length === 0

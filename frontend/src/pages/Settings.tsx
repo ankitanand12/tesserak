@@ -18,16 +18,30 @@ import { useTesserakAuth } from '../auth/AuthContext';
 
 export const Settings: React.FC = () => {
   const { isAuth0Configured, sessionUser } = useTesserakAuth();
-  const [backendAuthStatus, setBackendAuthStatus] = useState<{ mode: string; auth0Configured: boolean } | null>(null);
+  const [backendAuthStatus, setBackendAuthStatus] = useState<{
+    mode: string;
+    auth0Configured: boolean;
+    database?: string;
+  } | null>(null);
+  const [authStatusError, setAuthStatusError] = useState(false);
   const [autoReconcile, setAutoReconcile] = useState(true);
   const [finopsAlerts, setFinopsAlerts] = useState(true);
   const [ephemeralReap, setEphemeralReap] = useState(true);
 
   useEffect(() => {
     fetch('http://localhost:8000/api/auth/status')
-      .then((r) => r.json())
-      .then(setBackendAuthStatus)
-      .catch(() => null);
+      .then((r) => {
+        if (!r.ok) throw new Error('Backend auth status unavailable');
+        return r.json();
+      })
+      .then((data) => {
+        setBackendAuthStatus(data);
+        setAuthStatusError(false);
+      })
+      .catch(() => {
+        setBackendAuthStatus(null);
+        setAuthStatusError(true);
+      });
   }, []);
 
   return (
@@ -62,13 +76,28 @@ export const Settings: React.FC = () => {
               />
               <Chip
                 label={
-                  backendAuthStatus?.auth0Configured
+                  authStatusError
+                    ? 'Backend Status Unreachable'
+                    : backendAuthStatus === null
+                    ? 'Checking Backend Auth...'
+                    : backendAuthStatus.auth0Configured
                     ? 'Backend JWT Verification Active'
                     : 'Backend: Open Dev Header Mode'
                 }
                 variant="outlined"
-                sx={{ borderColor: '#2563eb', color: '#09090b', fontWeight: 600 }}
+                color={authStatusError ? 'warning' : 'default'}
+                sx={{
+                  borderColor: authStatusError ? '#f59e0b' : '#2563eb',
+                  color: '#09090b',
+                  fontWeight: 600,
+                }}
               />
+              {backendAuthStatus?.database === 'postgresql' && (
+                <Chip
+                  label="PostgreSQL Active"
+                  sx={{ bgcolor: '#ecfdf5', color: '#047857', fontWeight: 700 }}
+                />
+              )}
             </Box>
 
             <Alert severity="info" sx={{ mb: 2 }}>

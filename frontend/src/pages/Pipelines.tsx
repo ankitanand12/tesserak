@@ -30,17 +30,32 @@ import {
   Terminal as TerminalIcon,
 } from '@mui/icons-material';
 import { useLocation } from 'react-router-dom';
+import { useTesserakAuth } from '../auth/AuthContext';
 import { Perspective3DCard } from '../components/Perspective3DCard';
-import { ClusterTarget, IntegrationItem, PipelineItem } from '../types/atmosly';
+import { ClusterTarget, IntegrationItem, PipelineItem } from '../types/platform';
+import { fetchWithSwr, invalidateSwrCache, readSwrCache } from '../utils/swrCache';
 
 export const Pipelines: React.FC = () => {
   const location = useLocation();
   const requestedPipelineId = new URLSearchParams(location.search).get('pipelineId');
-  const [pipelines, setPipelines] = useState<PipelineItem[]>([]);
-  const [clusterTargets, setClusterTargets] = useState<ClusterTarget[]>([]);
-  const [gitIntegrations, setGitIntegrations] = useState<IntegrationItem[]>([]);
+  const { userEmail: authEmail } = useTesserakAuth();
+  const userEmail = authEmail || localStorage.getItem('currentUser') || 'demo@tesserak.dev';
+
+  const cachedPip = readSwrCache<{
+    pipelines: PipelineItem[];
+    clusterTargets: ClusterTarget[];
+    gitIntegrations: IntegrationItem[];
+  }>(userEmail, 'pipelines');
+
+  const [pipelines, setPipelines] = useState<PipelineItem[]>(() => cachedPip?.pipelines ?? []);
+  const [clusterTargets, setClusterTargets] = useState<ClusterTarget[]>(
+    () => cachedPip?.clusterTargets ?? []
+  );
+  const [gitIntegrations, setGitIntegrations] = useState<IntegrationItem[]>(
+    () => cachedPip?.gitIntegrations ?? []
+  );
   const [selectedLogPipelineId, setSelectedLogPipelineId] = useState<string | null>(
-    requestedPipelineId
+    requestedPipelineId || cachedPip?.pipelines?.[0]?.id || null
   );
   const [createOpen, setCreateOpen] = useState(false);
   const [error, setError] = useState('');
@@ -59,43 +74,51 @@ export const Pipelines: React.FC = () => {
   const [imageTag, setImageTag] = useState('');
   const [gitIntegrationId, setGitIntegrationId] = useState('');
 
-  const userEmail = localStorage.getItem('currentUser') || 'demo@tesserak.dev';
+  const loadPipelines = useCallback(
+    async (force: boolean = false) => {
+      try {
+        const bundle = await fetchWithSwr(
+          userEmail,
+          'pipelines',
+          async () => {
+            const [pipRes, tgtRes, intRes] = await Promise.all([
+              fetch('http://localhost:8000/api/pipelines', {
+                headers: { 'x-user-email': userEmail },
+              }),
+              fetch('http://localhost:8000/api/cluster-targets', {
+                headers: { 'x-user-email': userEmail },
+              }),
+              fetch('http://localhost:8000/api/integrations', {
+                headers: { 'x-user-email': userEmail },
+              }),
+            ]);
+            const nextPip: PipelineItem[] = pipRes.ok ? await pipRes.json() : [];
+            const nextTargets: ClusterTarget[] = tgtRes.ok ? await tgtRes.json() : [];
+            const ints: IntegrationItem[] = intRes.ok ? await intRes.json() : [];
+            return {
+              pipelines: nextPip,
+              clusterTargets: nextTargets,
+              gitIntegrations: ints.filter((i) => i.category === 'scm'),
+            };
+          },
+          { force, dedupeWindowMs: 4000 }
+        );
 
-  const loadPipelines = useCallback(async () => {
-    try {
-      const [pipRes, tgtRes, intRes] = await Promise.all([
-        fetch('http://localhost:8000/api/atmosly/pipelines', {
-          headers: { 'x-user-email': userEmail },
-        }),
-        fetch('http://localhost:8000/api/atmosly/cluster-targets', {
-          headers: { 'x-user-email': userEmail },
-        }),
-        fetch('http://localhost:8000/api/atmosly/integrations', {
-          headers: { 'x-user-email': userEmail },
-        }),
-      ]);
-      if (pipRes.ok) {
-        const data: PipelineItem[] = await pipRes.json();
-        setPipelines(data);
-        if (data.length > 0 && !selectedLogPipelineId) {
-          setSelectedLogPipelineId(data[0].id);
+        setPipelines(bundle.pipelines);
+        if (bundle.pipelines.length > 0 && !selectedLogPipelineId) {
+          setSelectedLogPipelineId(bundle.pipelines[0].id);
         }
-      }
-      if (tgtRes.ok) {
-        const targets: ClusterTarget[] = await tgtRes.json();
-        setClusterTargets(targets);
-        if (targets.length > 0 && !targetCluster) {
-          setTargetCluster(targets[0].id);
+        setClusterTargets(bundle.clusterTargets);
+        if (bundle.clusterTargets.length > 0 && !targetCluster) {
+          setTargetCluster(bundle.clusterTargets[0].id);
         }
+        setGitIntegrations(bundle.gitIntegrations);
+      } catch {
+        setError('Unable to reach backend CI/CD runner');
       }
-      if (intRes.ok) {
-        const ints: IntegrationItem[] = await intRes.json();
-        setGitIntegrations(ints.filter((i) => i.category === 'scm'));
-      }
-    } catch {
-      setError('Unable to reach backend CI/CD runner');
-    }
-  }, [userEmail, selectedLogPipelineId, targetCluster]);
+    },
+    [userEmail, selectedLogPipelineId, targetCluster]
+  );
 
   useEffect(() => {
     if (requestedPipelineId) {
@@ -104,14 +127,14 @@ export const Pipelines: React.FC = () => {
   }, [requestedPipelineId]);
 
   useEffect(() => {
-    loadPipelines();
+    loadPipelines(false);
   }, [loadPipelines]);
 
   // Poll automatically while any pipeline is actively running git/docker/kubectl
   useEffect(() => {
     const anyRunning = pipelines.some((p) => p.status === 'Running');
     if (!anyRunning) return;
-    const timer = setInterval(loadPipelines, 1500);
+    const timer = setInterval(() => loadPipelines(true), 1500);
     return () => clearInterval(timer);
   }, [pipelines, loadPipelines]);
 
@@ -127,7 +150,7 @@ export const Pipelines: React.FC = () => {
     }
 
     try {
-      const res = await fetch('http://localhost:8000/api/atmosly/pipelines', {
+      const res = await fetch('http://localhost:8000/api/pipelines', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -157,7 +180,9 @@ export const Pipelines: React.FC = () => {
       setImageTag('');
       setSelectedLogPipelineId(data.id);
       setNotice(`Git verified (${data.verifiedRemoteSha}). Pipeline "${data.name}" ready to run.`);
-      await loadPipelines();
+      invalidateSwrCache(userEmail, 'pipelines');
+      invalidateSwrCache(userEmail, 'overview');
+      await loadPipelines(true);
     } catch (err: any) {
       setModalError(err.message || 'Pipeline creation failed');
     } finally {
@@ -169,7 +194,7 @@ export const Pipelines: React.FC = () => {
     setError('');
     setNotice('');
     try {
-      const res = await fetch(`http://localhost:8000/api/atmosly/pipelines/${pipeline.id}/trigger`, {
+      const res = await fetch(`http://localhost:8000/api/pipelines/${pipeline.id}/trigger`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -184,20 +209,24 @@ export const Pipelines: React.FC = () => {
       }
       setSelectedLogPipelineId(pipeline.id);
       setNotice(`Executing "${pipeline.name}" on backend (git clone → scan → kubectl apply)...`);
-      await loadPipelines();
+      invalidateSwrCache(userEmail, 'pipelines');
+      invalidateSwrCache(userEmail, 'overview');
+      await loadPipelines(true);
     } catch {
       setError('Failed to dispatch pipeline run');
     }
   };
 
   const handleDelete = async (pipelineId: string) => {
-    const res = await fetch(`http://localhost:8000/api/atmosly/pipelines/${pipelineId}`, {
+    const res = await fetch(`http://localhost:8000/api/pipelines/${pipelineId}`, {
       method: 'DELETE',
       headers: { 'x-user-email': userEmail },
     });
     if (res.ok) {
       setNotice('Pipeline removed.');
-      await loadPipelines();
+      invalidateSwrCache(userEmail, 'pipelines');
+      invalidateSwrCache(userEmail, 'overview');
+      await loadPipelines(true);
     }
   };
 
@@ -259,7 +288,7 @@ export const Pipelines: React.FC = () => {
           <Button
             variant="outlined"
             startIcon={<RefreshIcon />}
-            onClick={loadPipelines}
+            onClick={() => loadPipelines(true)}
             sx={{ borderColor: '#09090b', color: '#09090b' }}
           >
             Refresh

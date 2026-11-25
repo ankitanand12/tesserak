@@ -44,6 +44,7 @@ import { AuthPage } from './components/Auth/AuthPage';
 import { TesserakLogo } from './components/TesserakLogo';
 import Dashboard from './pages/Dashboard';
 import Clusters from './pages/Clusters';
+import ClusterDetails from './pages/ClusterDetails';
 import CreateCluster from './pages/CreateCluster';
 import Profile from './pages/Profile';
 import { CloudResources } from './pages/CloudResources';
@@ -175,7 +176,10 @@ const Layout: React.FC<LayoutProps> = ({
   const location = useLocation();
 
   useEffect(() => {
-    document.title = ROUTE_TITLES[location.pathname] || 'Tesserak | EKS & Cloud IDP';
+    const title = location.pathname.startsWith('/clusters/')
+      ? 'Cluster Details | Tesserak'
+      : ROUTE_TITLES[location.pathname] || 'Tesserak | EKS & Cloud IDP';
+    document.title = title;
   }, [location.pathname]);
 
   const users = JSON.parse(localStorage.getItem('users') || '{}');
@@ -216,7 +220,8 @@ const Layout: React.FC<LayoutProps> = ({
         {navItems.map((item) => {
           const isActive =
             location.pathname === item.path ||
-            (item.path === '/clusters' && location.pathname === '/create-cluster') ||
+            (item.path === '/clusters' &&
+              (location.pathname === '/create-cluster' || location.pathname.startsWith('/clusters/'))) ||
             (item.path === '/resources' && location.pathname === '/infrastructure') ||
             (item.path === '/guardrails' && location.pathname === '/security') ||
             (item.path === '/integrations' && location.pathname === '/connectors');
@@ -466,6 +471,10 @@ const AppShell: React.FC = () => {
       ? 'Auth0 SSO Verified'
       : sessionUser?.authProvider === 'auth0-demo-sso'
       ? 'Auth0 SSO (Dev Mode)'
+      : sessionUser?.authProvider === 'email'
+      ? sessionUser.accountType === 'organization'
+        ? `Org Account · ${sessionUser.organization || 'Team'}`
+        : 'Individual Email Account'
       : 'Local Workspace Session';
 
   return (
@@ -476,6 +485,7 @@ const AppShell: React.FC = () => {
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/clusters" element={<Clusters />} />
+            <Route path="/clusters/:clusterName" element={<ClusterDetails />} />
             <Route path="/create-cluster" element={<CreateCluster />} />
             <Route path="/resources" element={<CloudResources />} />
             <Route path="/infrastructure" element={<CloudResources />} />

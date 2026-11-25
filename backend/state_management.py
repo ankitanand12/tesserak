@@ -68,14 +68,23 @@ class StateData:
 
     def record_state_change(self, current_state: dict, change_type: str, details: dict) -> dict:
         """Record a change in the cluster state"""
+        updated = dict(current_state.get("state", current_state))
         history_entry = {
             "timestamp": datetime.utcnow().isoformat(),
             "type": change_type,
             "details": details
         }
         
-        current_state["history"] = current_state.get("history", [])
-        current_state["history"].append(history_entry)
-        current_state["lastUpdated"] = datetime.utcnow().isoformat()
-        
-        return current_state
+        updated["history"] = list(updated.get("history", []))
+        updated["history"].append(history_entry)
+        updated["lastUpdated"] = datetime.utcnow().isoformat()
+
+        # Sync top-level comparison attributes if provided directly or nested under aws_state
+        source_aws = details.get("aws_state") if isinstance(details, dict) else None
+        for key in ("status", "version", "endpoint"):
+            if isinstance(details, dict) and details.get(key) is not None:
+                updated[key] = details[key]
+            elif isinstance(source_aws, dict) and source_aws.get(key) is not None:
+                updated[key] = source_aws[key]
+
+        return updated

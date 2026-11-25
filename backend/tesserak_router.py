@@ -1,18 +1,31 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 import asyncio
-import json
 import os
-import re
 import uuid
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
+from auth import (
+    authenticate_email_user,
+    get_user_profile,
+    register_email_user,
+    require_auth_if_configured,
+    upsert_user_profile,
+)
 from connections import ConnectionManager
+from db import (
+    ApprovalRecord,
+    GuardrailRuleRecord,
+    IntegrationRecord,
+    PendingResourceRecord,
+    PipelineRecord,
+    get_db,
+    normalize_email,
+)
 from integrations_service import utc_now_iso, verify_integration_credentials
 from pipelines_service import (
     list_deployable_clusters,
@@ -24,18 +37,17 @@ from resources_service import (
     execute_aws_delete,
     execute_aws_provision,
     execute_aws_reconcile,
+    invalidate_resource_cache,
     run_live_guardrail_audit,
 )
 
-router = APIRouter(tags=["Tesserak Platform"])
+public_router = APIRouter(tags=["Auth Status"])
+router = APIRouter(
+    tags=["Tesserak Platform"],
+    dependencies=[Depends(require_auth_if_configured)],
+)
 
-DATA_DIR = Path("atmosly_data")
-DATA_DIR.mkdir(exist_ok=True)
 connection_manager = ConnectionManager("connections")
-
-
-def _safe_user_key(email: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9._-]", "_", (email or "guest@tesserak.dev").lower())
 
 
 def _default_guardrail_rules() -> List[Dict[str, Any]]:
@@ -99,34 +111,176 @@ def _default_guardrail_rules() -> List[Dict[str, Any]]:
     ]
 
 
-def _empty_platform_state() -> Dict[str, Any]:
-    """Initialize cleanly with ZERO dummy/fake integrations, resources, approvals, or pipelines."""
+def _ensure_user_guardrails(session: Any, clean_email: str) -> List[GuardrailRuleRecord]:
+    rows = (
+        session.query(GuardrailRuleRecord)
+        .filter(GuardrailRuleRecord.user_email == clean_email)
+        .order_by(GuardrailRuleRecord.sort_order.asc(), GuardrailRuleRecord.id.asc())
+        .all()
+    )
+    if rows:
+        return rows
+    created: List[GuardrailRuleRecord] = []
+    for idx, rule in enumerate(_default_guardrail_rules()):
+        rec = GuardrailRuleRecord(
+            user_email=clean_email,
+            id=rule["id"],
+            name=rule["name"],
+            description=rule["description"],
+            category=rule["category"],
+            severity=rule["severity"],
+            enabled=bool(rule["enabled"]),
+            threshold=rule.get("threshold"),
+            violations=int(rule.get("violations", 0)),
+            updated_at=rule["updatedAt"],
+            sort_order=idx,
+        )
+        session.add(rec)
+        created.append(rec)
+    session.flush()
+    return created
+
+
+def _integration_to_dict(row: IntegrationRecord, include_secret: bool = False) -> Dict[str, Any]:
+    db = get_db()
+    out: Dict[str, Any] = {
+        "id": row.id,
+        "name": row.name,
+        "provider": row.provider,
+        "category": row.category,
+        "scope": row.scope or "",
+        "endpoint": row.endpoint,
+        "credentialHint": row.credential_hint or "",
+        "status": row.status,
+        "lastCheckedAt": row.last_checked_at,
+        "latencyMs": row.latency_ms,
+        "managedBy": row.managed_by,
+        "metadata": row.metadata_json or {},
+    }
+    if include_secret:
+        out["secretPayload"] = db.decrypt_json(row.secret_payload_enc)
+    return out
+
+
+def _rule_to_dict(row: GuardrailRuleRecord) -> Dict[str, Any]:
     return {
-        "integrations": [],
-        "guardrailRules": _default_guardrail_rules(),
-        "approvals": [],
-        "pendingResources": [],
-        "pipelines": [],
+        "id": row.id,
+        "name": row.name,
+        "description": row.description,
+        "category": row.category,
+        "severity": row.severity,
+        "enabled": bool(row.enabled),
+        "threshold": row.threshold,
+        "violations": int(row.violations or 0),
+        "updatedAt": row.updated_at,
+    }
+
+
+def _approval_to_dict(row: ApprovalRecord) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "id": row.id,
+        "resourceId": row.resource_id,
+        "resourceName": row.resource_name,
+        "resourceKind": row.resource_kind,
+        "environment": row.environment,
+        "requestedBy": row.requested_by,
+        "estimatedMonthlyCost": row.estimated_monthly_cost,
+        "triggeredRule": row.triggered_rule,
+        "reason": row.reason,
+        "status": row.status,
+        "createdAt": row.created_at,
+        "provisionSpec": row.provision_spec_json,
+    }
+    if row.decided_at:
+        out["decidedAt"] = row.decided_at
+    if row.comment:
+        out["comment"] = row.comment
+    return out
+
+
+def _pipeline_to_dict(row: PipelineRecord) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "repositoryUrl": row.repository_url,
+        "branch": row.branch,
+        "targetCluster": row.target_cluster,
+        "namespace": row.namespace,
+        "manifestPath": row.manifest_path,
+        "dockerfilePath": row.dockerfile_path or "",
+        "imageTag": row.image_tag or "",
+        "gitIntegrationId": row.git_integration_id,
+        "verifiedRemoteSha": row.verified_remote_sha,
+        "lastRunNumber": int(row.last_run_number or 0),
+        "status": row.status,
+        "durationSec": float(row.duration_sec or 0.0),
+        "triggeredBy": row.triggered_by,
+        "lastRunAt": row.last_run_at,
+        "stages": row.stages_json or [],
+        "recentRuns": row.recent_runs_json or [],
     }
 
 
 def _load_state(user_email: str) -> Dict[str, Any]:
-    path = DATA_DIR / f"{_safe_user_key(user_email)}.json"
-    if not path.exists():
-        state = _empty_platform_state()
-        _save_state(user_email, state)
-        return state
-    with open(path, "r") as f:
-        data = json.load(f)
-    if "pendingResources" not in data:
-        data["pendingResources"] = []
-    return data
+    clean_email = normalize_email(user_email)
+    db = get_db()
+    with db.session_scope() as session:
+        rule_rows = _ensure_user_guardrails(session, clean_email)
+        int_rows = (
+            session.query(IntegrationRecord)
+            .filter(IntegrationRecord.user_email == clean_email)
+            .order_by(IntegrationRecord.created_at.desc())
+            .all()
+        )
+        apr_rows = (
+            session.query(ApprovalRecord)
+            .filter(ApprovalRecord.user_email == clean_email)
+            .order_by(ApprovalRecord.created_at.desc())
+            .all()
+        )
+        pend_rows = (
+            session.query(PendingResourceRecord)
+            .filter(PendingResourceRecord.user_email == clean_email)
+            .order_by(PendingResourceRecord.created_at.desc())
+            .all()
+        )
+        pip_rows = (
+            session.query(PipelineRecord)
+            .filter(PipelineRecord.user_email == clean_email)
+            .order_by(PipelineRecord.created_at.desc())
+            .all()
+        )
+        return {
+            "integrations": [_integration_to_dict(r, include_secret=True) for r in int_rows],
+            "guardrailRules": [_rule_to_dict(r) for r in rule_rows],
+            "approvals": [_approval_to_dict(r) for r in apr_rows],
+            "pendingResources": [dict(r.payload_json) for r in pend_rows],
+            "pipelines": [_pipeline_to_dict(r) for r in pip_rows],
+        }
 
 
-def _save_state(user_email: str, state: Dict[str, Any]) -> None:
-    path = DATA_DIR / f"{_safe_user_key(user_email)}.json"
-    with open(path, "w") as f:
-        json.dump(state, f, indent=2)
+def _save_pipeline_state(user_email: str, state: Dict[str, Any]) -> None:
+    """Persist pipeline execution updates atomically back to PostgreSQL."""
+    clean_email = normalize_email(user_email)
+    db = get_db()
+    with db.session_scope() as session:
+        for p in state.get("pipelines", []):
+            row = (
+                session.query(PipelineRecord)
+                .filter(
+                    PipelineRecord.id == p["id"],
+                    PipelineRecord.user_email == clean_email,
+                )
+                .first()
+            )
+            if row:
+                row.last_run_number = int(p.get("lastRunNumber", 0))
+                row.status = p.get("status", row.status)
+                row.duration_sec = float(p.get("durationSec", 0.0))
+                row.last_run_at = p.get("lastRunAt") or row.last_run_at
+                row.triggered_by = p.get("triggeredBy") or row.triggered_by
+                row.stages_json = list(p.get("stages", []))
+                row.recent_runs_json = list(p.get("recentRuns", []))
 
 
 def _sanitize_integration(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -217,7 +371,31 @@ class PipelineTriggerRequest(BaseModel):
     branch: Optional[str] = None
 
 
-@router.get("/api/auth/status")
+class EmailLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class EmailRegisterRequest(BaseModel):
+    email: str
+    password: str
+    firstName: str
+    lastName: str
+    accountType: Literal["individual", "organization"] = "individual"
+    organization: Optional[str] = None
+
+
+class ProfileUpdateRequest(BaseModel):
+    firstName: Optional[str] = None
+    lastName: Optional[str] = None
+    accountType: Optional[Literal["individual", "organization"]] = None
+    organization: Optional[str] = None
+    authProvider: Optional[str] = None
+    mobile: Optional[Dict[str, str]] = None
+    avatarUrl: Optional[str] = None
+
+
+@public_router.get("/api/auth/status")
 async def get_auth_config_status():
     domain = os.getenv("AUTH0_DOMAIN", "").strip()
     audience = os.getenv("AUTH0_AUDIENCE", "").strip()
@@ -225,8 +403,62 @@ async def get_auth_config_status():
         "auth0Configured": bool(domain),
         "domainConfigured": bool(domain),
         "audienceConfigured": bool(audience),
+        "emailAuthEnabled": True,
+        "database": "postgresql",
         "mode": "auth0" if domain else "local-fallback",
     }
+
+
+@router.get("/api/profile")
+async def read_user_profile(x_user_email: str = Header(default="demo@tesserak.dev")):
+    profile = await asyncio.to_thread(get_user_profile, x_user_email)
+    if not profile:
+        return {
+            "email": normalize_email(x_user_email),
+            "firstName": "",
+            "lastName": "",
+            "accountType": "individual",
+            "organization": "Individual Workspace",
+            "authProvider": "local",
+            "mobile": {"countryCode": "+1", "number": ""},
+            "avatarUrl": "",
+        }
+    return profile
+
+
+@router.put("/api/profile")
+async def save_user_profile(
+    payload: ProfileUpdateRequest,
+    x_user_email: str = Header(default="demo@tesserak.dev"),
+):
+    return await asyncio.to_thread(
+        upsert_user_profile,
+        email=x_user_email,
+        first_name=payload.firstName,
+        last_name=payload.lastName,
+        account_type=payload.accountType,
+        organization=payload.organization,
+        auth_provider=payload.authProvider,
+        mobile=payload.mobile,
+        avatar_url=payload.avatarUrl,
+    )
+
+
+@public_router.post("/api/auth/email/register")
+async def email_register(payload: EmailRegisterRequest):
+    return register_email_user(
+        email=payload.email,
+        password=payload.password,
+        first_name=payload.firstName,
+        last_name=payload.lastName,
+        account_type=payload.accountType,
+        organization=payload.organization,
+    )
+
+
+@public_router.post("/api/auth/email/login")
+async def email_login(payload: EmailLoginRequest):
+    return authenticate_email_user(email=payload.email, password=payload.password)
 
 
 def _build_overview_alerts(
@@ -462,12 +694,20 @@ def _build_recent_deployments(pipelines: List[Dict[str, Any]], fallback_user: st
     return (running_deps + other_deps)[:10], pipeline_summaries[:6]
 
 
-@router.get("/api/atmosly/overview")
-async def get_platform_overview(x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
+@router.get("/api/overview")
+async def get_platform_overview(
+    refresh: bool = False,
+    x_user_email: str = Header(default="demo@tesserak.dev"),
+):
+    state = await asyncio.to_thread(_load_state, x_user_email)
     aws_conns = await _load_aws_connectors_as_integrations(x_user_email)
     integrations = aws_conns + [_sanitize_integration(i) for i in state["integrations"]]
-    res_data = await discover_live_aws_resources(x_user_email, connection_manager, state["pendingResources"])
+    res_data = await discover_live_aws_resources(
+        x_user_email,
+        connection_manager,
+        state["pendingResources"],
+        force_refresh=refresh,
+    )
     rules = state["guardrailRules"]
     approvals = state["approvals"]
     pipelines = state["pipelines"]
@@ -499,14 +739,14 @@ async def get_platform_overview(x_user_email: str = Header(default="demo@tessera
     }
 
 
-@router.get("/api/atmosly/integrations")
+@router.get("/api/integrations")
 async def list_integrations(x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
+    state = await asyncio.to_thread(_load_state, x_user_email)
     aws_conns = await _load_aws_connectors_as_integrations(x_user_email)
     return aws_conns + [_sanitize_integration(i) for i in state["integrations"]]
 
 
-@router.post("/api/atmosly/integrations")
+@router.post("/api/integrations")
 async def create_integration(payload: IntegrationCreate, x_user_email: str = Header(default="demo@tesserak.dev")):
     try:
         verified = await verify_integration_credentials(
@@ -525,31 +765,55 @@ async def create_integration(payload: IntegrationCreate, x_user_email: str = Hea
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    state = _load_state(x_user_email)
-    new_item = {
-        "id": f"int-{uuid.uuid4().hex[:8]}",
-        "name": payload.name.strip(),
-        "provider": payload.provider,
-        "category": payload.category,
-        "scope": verified["scope"],
-        "endpoint": payload.endpoint,
-        "credentialHint": verified["credentialHint"],
-        "status": "connected",
-        "lastCheckedAt": utc_now_iso(),
-        "latencyMs": verified["latencyMs"],
-        "managedBy": "atmosly",
-        "metadata": verified.get("metadata", {}),
-        "secretPayload": verified.get("secretPayload", {}),
-    }
-    state["integrations"].insert(0, new_item)
-    _save_state(x_user_email, state)
-    return _sanitize_integration(new_item)
+    db = get_db()
+    clean_email = normalize_email(x_user_email)
+    new_id = f"int-{uuid.uuid4().hex[:8]}"
+    now = utc_now_iso()
+    secret_enc = db.encrypt_json(verified.get("secretPayload", {}))
+
+    def _insert():
+        with db.session_scope() as session:
+            rec = IntegrationRecord(
+                id=new_id,
+                user_email=clean_email,
+                name=payload.name.strip(),
+                provider=payload.provider,
+                category=payload.category,
+                scope=verified["scope"],
+                endpoint=payload.endpoint,
+                credential_hint=verified["credentialHint"],
+                status="connected",
+                last_checked_at=now,
+                latency_ms=int(verified["latencyMs"]),
+                managed_by="tesserak",
+                metadata_json=verified.get("metadata", {}),
+                secret_payload_enc=secret_enc,
+            )
+            session.add(rec)
+            session.flush()
+            return _integration_to_dict(rec, include_secret=False)
+
+    return await asyncio.to_thread(_insert)
 
 
-@router.post("/api/atmosly/integrations/{integration_id}/test")
+@router.post("/api/integrations/{integration_id}/test")
 async def test_integration(integration_id: str, x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
-    item = next((i for i in state["integrations"] if i["id"] == integration_id), None)
+    db = get_db()
+    clean_email = normalize_email(x_user_email)
+
+    def _get_item():
+        with db.session_scope() as session:
+            row = (
+                session.query(IntegrationRecord)
+                .filter(
+                    IntegrationRecord.id == integration_id,
+                    IntegrationRecord.user_email == clean_email,
+                )
+                .first()
+            )
+            return _integration_to_dict(row, include_secret=True) if row else None
+
+    item = await asyncio.to_thread(_get_item)
     if not item:
         raise HTTPException(status_code=404, detail="Integration not found")
 
@@ -568,34 +832,84 @@ async def test_integration(integration_id: str, x_user_email: str = Header(defau
             connection_manager=connection_manager,
             user_email=x_user_email,
         )
-        item["status"] = "connected"
-        item["lastCheckedAt"] = utc_now_iso()
-        item["latencyMs"] = verified["latencyMs"]
-        item["metadata"] = verified.get("metadata", {})
-        _save_state(x_user_email, state)
-        return _sanitize_integration(item)
+
+        def _mark_ok():
+            with db.session_scope() as session:
+                row = (
+                    session.query(IntegrationRecord)
+                    .filter(
+                        IntegrationRecord.id == integration_id,
+                        IntegrationRecord.user_email == clean_email,
+                    )
+                    .first()
+                )
+                if not row:
+                    return None
+                row.status = "connected"
+                row.last_checked_at = utc_now_iso()
+                row.latency_ms = int(verified["latencyMs"])
+                row.metadata_json = verified.get("metadata", {})
+                session.flush()
+                return _integration_to_dict(row, include_secret=False)
+
+        return await asyncio.to_thread(_mark_ok)
     except ValueError as exc:
-        item["status"] = "error"
-        item["lastCheckedAt"] = utc_now_iso()
-        _save_state(x_user_email, state)
+        def _mark_err():
+            with db.session_scope() as session:
+                row = (
+                    session.query(IntegrationRecord)
+                    .filter(
+                        IntegrationRecord.id == integration_id,
+                        IntegrationRecord.user_email == clean_email,
+                    )
+                    .first()
+                )
+                if row:
+                    row.status = "error"
+                    row.last_checked_at = utc_now_iso()
+
+        await asyncio.to_thread(_mark_err)
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@router.delete("/api/atmosly/integrations/{integration_id}")
+@router.delete("/api/integrations/{integration_id}")
 async def delete_integration(integration_id: str, x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
-    before = len(state["integrations"])
-    state["integrations"] = [i for i in state["integrations"] if i["id"] != integration_id]
-    if len(state["integrations"]) == before:
+    db = get_db()
+    clean_email = normalize_email(x_user_email)
+
+    def _delete():
+        with db.session_scope() as session:
+            row = (
+                session.query(IntegrationRecord)
+                .filter(
+                    IntegrationRecord.id == integration_id,
+                    IntegrationRecord.user_email == clean_email,
+                )
+                .first()
+            )
+            if not row:
+                return False
+            session.delete(row)
+            return True
+
+    deleted = await asyncio.to_thread(_delete)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Integration not found or managed by AWS Connectors")
-    _save_state(x_user_email, state)
     return {"status": "deleted", "id": integration_id}
 
 
-@router.get("/api/atmosly/guardrails")
-async def get_guardrails(x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
-    audit = await run_live_guardrail_audit(x_user_email, connection_manager, state["guardrailRules"])
+@router.get("/api/guardrails")
+async def get_guardrails(
+    refresh: bool = False,
+    x_user_email: str = Header(default="demo@tesserak.dev"),
+):
+    state = await asyncio.to_thread(_load_state, x_user_email)
+    audit = await run_live_guardrail_audit(
+        x_user_email,
+        connection_manager,
+        state["guardrailRules"],
+        force_refresh=refresh,
+    )
     rules = state["guardrailRules"]
     approvals = state["approvals"]
     enabled = sum(1 for r in rules if r["enabled"])
@@ -613,56 +927,109 @@ async def get_guardrails(x_user_email: str = Header(default="demo@tesserak.dev")
     }
 
 
-@router.post("/api/atmosly/guardrails/rules")
+@router.post("/api/guardrails/rules")
 async def create_guardrail_rule(payload: GuardrailRuleCreate, x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
-    new_rule = {
-        "id": f"gr-{uuid.uuid4().hex[:6]}",
-        "name": payload.name.strip(),
-        "description": payload.description.strip(),
-        "category": payload.category.strip(),
-        "severity": payload.severity,
-        "enabled": True,
-        "threshold": payload.threshold,
-        "violations": 0,
-        "updatedAt": utc_now_iso(),
-    }
-    state["guardrailRules"].append(new_rule)
-    _save_state(x_user_email, state)
-    return new_rule
+    db = get_db()
+    clean_email = normalize_email(x_user_email)
+    new_id = f"gr-{uuid.uuid4().hex[:6]}"
+    now = utc_now_iso()
+
+    def _create_rule():
+        with db.session_scope() as session:
+            existing = _ensure_user_guardrails(session, clean_email)
+            next_order = max((r.sort_order for r in existing), default=-1) + 1
+            rec = GuardrailRuleRecord(
+                user_email=clean_email,
+                id=new_id,
+                name=payload.name.strip(),
+                description=payload.description.strip(),
+                category=payload.category.strip(),
+                severity=payload.severity,
+                enabled=True,
+                threshold=payload.threshold,
+                violations=0,
+                updated_at=now,
+                sort_order=next_order,
+            )
+            session.add(rec)
+            session.flush()
+            return _rule_to_dict(rec)
+
+    return await asyncio.to_thread(_create_rule)
 
 
-@router.patch("/api/atmosly/guardrails/rules/{rule_id}")
+@router.patch("/api/guardrails/rules/{rule_id}")
 async def update_guardrail_rule(rule_id: str, patch: GuardrailRulePatch, x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
-    for rule in state["guardrailRules"]:
-        if rule["id"] == rule_id:
+    db = get_db()
+    clean_email = normalize_email(x_user_email)
+
+    def _patch_rule():
+        with db.session_scope() as session:
+            _ensure_user_guardrails(session, clean_email)
+            rule = (
+                session.query(GuardrailRuleRecord)
+                .filter(
+                    GuardrailRuleRecord.user_email == clean_email,
+                    GuardrailRuleRecord.id == rule_id,
+                )
+                .first()
+            )
+            if not rule:
+                return None
             if patch.enabled is not None:
-                rule["enabled"] = patch.enabled
+                rule.enabled = patch.enabled
             if patch.severity is not None:
-                rule["severity"] = patch.severity
+                rule.severity = patch.severity
             if patch.threshold is not None:
-                rule["threshold"] = patch.threshold
-            rule["updatedAt"] = utc_now_iso()
-            _save_state(x_user_email, state)
-            return rule
-    raise HTTPException(status_code=404, detail="Guardrail rule not found")
+                rule.threshold = patch.threshold
+            rule.updated_at = utc_now_iso()
+            session.flush()
+            return _rule_to_dict(rule)
+
+    updated = await asyncio.to_thread(_patch_rule)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Guardrail rule not found")
+    return updated
 
 
-@router.post("/api/atmosly/approvals/{approval_id}/decision")
+@router.post("/api/approvals/{approval_id}/decision")
 async def decide_approval(approval_id: str, body: ApprovalDecisionRequest, x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
-    target = next((a for a in state["approvals"] if a["id"] == approval_id), None)
+    db = get_db()
+    clean_email = normalize_email(x_user_email)
+
+    def _get_approval():
+        with db.session_scope() as session:
+            row = (
+                session.query(ApprovalRecord)
+                .filter(
+                    ApprovalRecord.id == approval_id,
+                    ApprovalRecord.user_email == clean_email,
+                )
+                .first()
+            )
+            return _approval_to_dict(row) if row else None
+
+    target = await asyncio.to_thread(_get_approval)
     if not target:
         raise HTTPException(status_code=404, detail="Approval request not found")
 
     if body.decision == "reject":
-        target["status"] = "rejected"
-        target["decidedAt"] = utc_now_iso()
-        target["comment"] = body.comment or "Rejected by guardrail reviewer"
-        state["pendingResources"] = [r for r in state["pendingResources"] if r["id"] != target["resourceId"]]
-        _save_state(x_user_email, state)
-        return target
+        def _reject():
+            with db.session_scope() as session:
+                row = session.get(ApprovalRecord, approval_id)
+                if not row:
+                    return None
+                row.status = "rejected"
+                row.decided_at = utc_now_iso()
+                row.comment = body.comment or "Rejected by guardrail reviewer"
+                session.query(PendingResourceRecord).filter(
+                    PendingResourceRecord.id == row.resource_id,
+                    PendingResourceRecord.user_email == clean_email,
+                ).delete()
+                session.flush()
+                return _approval_to_dict(row)
+
+        return await asyncio.to_thread(_reject)
 
     conn = await connection_manager.get_valid_connection(x_user_email)
     if not conn:
@@ -673,27 +1040,47 @@ async def decide_approval(approval_id: str, body: ApprovalDecisionRequest, x_use
         raise HTTPException(status_code=400, detail="Missing stored AWS provisioning specification.")
 
     try:
-        created = execute_aws_provision(conn, spec)
+        created = await asyncio.to_thread(execute_aws_provision, conn, spec)
+        invalidate_resource_cache(x_user_email)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"AWS provisioning failed after approval: {exc}")
 
-    target["status"] = "approved"
-    target["decidedAt"] = utc_now_iso()
-    target["comment"] = body.comment or "Approved and created in AWS"
-    state["pendingResources"] = [r for r in state["pendingResources"] if r["id"] != target["resourceId"]]
-    _save_state(x_user_email, state)
-    return {"approval": target, "provisioned": created}
+    def _approve():
+        with db.session_scope() as session:
+            row = session.get(ApprovalRecord, approval_id)
+            row.status = "approved"
+            row.decided_at = utc_now_iso()
+            row.comment = body.comment or "Approved and created in AWS"
+            session.query(PendingResourceRecord).filter(
+                PendingResourceRecord.id == row.resource_id,
+                PendingResourceRecord.user_email == clean_email,
+            ).delete()
+            session.flush()
+            return _approval_to_dict(row)
+
+    approved_target = await asyncio.to_thread(_approve)
+    return {"approval": approved_target, "provisioned": created}
 
 
-@router.get("/api/atmosly/resources")
-async def list_cloud_resources(x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
-    return await discover_live_aws_resources(x_user_email, connection_manager, state["pendingResources"])
+@router.get("/api/resources")
+async def list_cloud_resources(
+    refresh: bool = False,
+    x_user_email: str = Header(default="demo@tesserak.dev"),
+):
+    state = await asyncio.to_thread(_load_state, x_user_email)
+    return await discover_live_aws_resources(
+        x_user_email,
+        connection_manager,
+        state["pendingResources"],
+        force_refresh=refresh,
+    )
 
 
-@router.post("/api/atmosly/resources")
+@router.post("/api/resources")
 async def create_cloud_resource(payload: CloudResourceCreate, x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
+    db = get_db()
+    clean_email = normalize_email(x_user_email)
+    state = await asyncio.to_thread(_load_state, x_user_email)
     conn = await connection_manager.get_valid_connection(x_user_email)
     if not conn:
         raise HTTPException(
@@ -703,16 +1090,28 @@ async def create_cloud_resource(payload: CloudResourceCreate, x_user_email: str 
 
     rules_by_id = {r["id"]: r for r in state["guardrailRules"]}
 
+    def _bump_violation(rule_id: str) -> None:
+        with db.session_scope() as session:
+            rec = (
+                session.query(GuardrailRuleRecord)
+                .filter(
+                    GuardrailRuleRecord.user_email == clean_email,
+                    GuardrailRuleRecord.id == rule_id,
+                )
+                .first()
+            )
+            if rec:
+                rec.violations = int(rec.violations or 0) + 1
+                rec.updated_at = utc_now_iso()
+
     enc_rule = rules_by_id.get("gr-encryption")
     if enc_rule and enc_rule["enabled"] and not payload.encrypted:
-        enc_rule["violations"] += 1
-        _save_state(x_user_email, state)
+        await asyncio.to_thread(_bump_violation, "gr-encryption")
         raise HTTPException(status_code=422, detail="Blocked by Guardrail [Enforce KMS / SSE Encryption at Rest].")
 
     pub_rule = rules_by_id.get("gr-public-access")
     if pub_rule and pub_rule["enabled"] and payload.publicAccess:
-        pub_rule["violations"] += 1
-        _save_state(x_user_email, state)
+        await asyncio.to_thread(_bump_violation, "gr-public-access")
         raise HTTPException(status_code=422, detail="Blocked by Guardrail [Block Public Access & Privileged Pods].")
 
     allowed_regions = {"us-east-1", "us-west-2", "eu-west-1"}
@@ -724,6 +1123,7 @@ async def create_cloud_resource(payload: CloudResourceCreate, x_user_email: str 
     threshold = (cost_rule.get("threshold") or 250) if cost_rule else 250
     if cost_rule and cost_rule["enabled"] and payload.estimatedMonthlyCost > threshold:
         res_id = f"pending-{uuid.uuid4().hex[:8]}"
+        apr_id = f"apr-{uuid.uuid4().hex[:6]}"
         now = utc_now_iso()
         pending_res = {
             "id": res_id,
@@ -742,40 +1142,54 @@ async def create_cloud_resource(payload: CloudResourceCreate, x_user_email: str 
             "lastSyncAt": now,
             "source": "pending-approval",
         }
-        state["pendingResources"].insert(0, pending_res)
-        state["approvals"].insert(
-            0,
-            {
-                "id": f"apr-{uuid.uuid4().hex[:6]}",
-                "resourceId": res_id,
-                "resourceName": payload.name.strip(),
-                "resourceKind": payload.serviceType,
-                "environment": payload.environment,
-                "requestedBy": x_user_email,
-                "estimatedMonthlyCost": payload.estimatedMonthlyCost,
-                "triggeredRule": cost_rule["name"],
-                "reason": f"Estimated spend (${payload.estimatedMonthlyCost:.0f}/mo) exceeds guardrail ceiling (${threshold:.0f}/mo).",
-                "status": "pending",
-                "createdAt": now,
-                "provisionSpec": payload.dict(),
-            },
-        )
-        _save_state(x_user_email, state)
+
+        def _queue_approval():
+            with db.session_scope() as session:
+                session.add(
+                    PendingResourceRecord(
+                        id=res_id,
+                        user_email=clean_email,
+                        payload_json=pending_res,
+                        created_at=now,
+                    )
+                )
+                session.add(
+                    ApprovalRecord(
+                        id=apr_id,
+                        user_email=clean_email,
+                        resource_id=res_id,
+                        resource_name=payload.name.strip(),
+                        resource_kind=payload.serviceType,
+                        environment=payload.environment,
+                        requested_by=x_user_email,
+                        estimated_monthly_cost=float(payload.estimatedMonthlyCost),
+                        triggered_rule=cost_rule["name"],
+                        reason=f"Estimated spend (${payload.estimatedMonthlyCost:.0f}/mo) exceeds guardrail ceiling (${threshold:.0f}/mo).",
+                        status="pending",
+                        created_at=now,
+                        provision_spec_json=payload.dict(),
+                    )
+                )
+
+        await asyncio.to_thread(_queue_approval)
         return pending_res
 
     try:
-        return execute_aws_provision(conn, payload.dict())
+        created = await asyncio.to_thread(execute_aws_provision, conn, payload.dict())
+        invalidate_resource_cache(x_user_email)
+        return created
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"AWS provisioning failed: {exc}")
 
 
-@router.post("/api/atmosly/resources/{resource_id}/drift-check")
+@router.post("/api/resources/{resource_id}/drift-check")
 async def reconcile_resource_drift(resource_id: str, x_user_email: str = Header(default="demo@tesserak.dev")):
     conn = await connection_manager.get_valid_connection(x_user_email)
     if not conn:
         raise HTTPException(status_code=400, detail="No valid AWS IAM connection found.")
     try:
-        message = execute_aws_reconcile(conn, resource_id)
+        message = await asyncio.to_thread(execute_aws_reconcile, conn, resource_id)
+        invalidate_resource_cache(x_user_email)
         return {"status": "reconciled", "message": message}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -783,13 +1197,13 @@ async def reconcile_resource_drift(resource_id: str, x_user_email: str = Header(
         raise HTTPException(status_code=500, detail=f"AWS drift remediation failed: {exc}")
 
 
-@router.delete("/api/atmosly/resources/{resource_id}")
+@router.delete("/api/resources/{resource_id}")
 async def delete_cloud_resource(
     resource_id: str,
     environment: str = "staging",
     x_user_email: str = Header(default="demo@tesserak.dev"),
 ):
-    state = _load_state(x_user_email)
+    state = await asyncio.to_thread(_load_state, x_user_email)
     delete_rule = next((r for r in state["guardrailRules"] if r["id"] == "gr-prod-delete-lock"), None)
     if delete_rule and delete_rule["enabled"] and environment == "prod":
         raise HTTPException(
@@ -799,41 +1213,64 @@ async def delete_cloud_resource(
 
     pending_match = next((r for r in state["pendingResources"] if r["id"] == resource_id), None)
     if pending_match:
-        state["pendingResources"] = [r for r in state["pendingResources"] if r["id"] != resource_id]
-        state["approvals"] = [a for a in state["approvals"] if a["resourceId"] != resource_id]
-        _save_state(x_user_email, state)
+        db = get_db()
+        clean_email = normalize_email(x_user_email)
+
+        def _delete_pending():
+            with db.session_scope() as session:
+                session.query(PendingResourceRecord).filter(
+                    PendingResourceRecord.id == resource_id,
+                    PendingResourceRecord.user_email == clean_email,
+                ).delete()
+                session.query(ApprovalRecord).filter(
+                    ApprovalRecord.resource_id == resource_id,
+                    ApprovalRecord.user_email == clean_email,
+                ).delete()
+
+        await asyncio.to_thread(_delete_pending)
         return {"status": "deleted", "message": "Removed pending request."}
 
     conn = await connection_manager.get_valid_connection(x_user_email)
     if not conn:
         raise HTTPException(status_code=400, detail="No valid AWS IAM connection found.")
     try:
-        msg = execute_aws_delete(conn, resource_id)
+        msg = await asyncio.to_thread(execute_aws_delete, conn, resource_id)
+        invalidate_resource_cache(x_user_email)
         return {"status": "deleted", "message": msg}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"AWS deletion failed: {exc}")
 
 
-@router.get("/api/atmosly/cluster-targets")
+@router.get("/api/cluster-targets")
 async def get_pipeline_cluster_targets(x_user_email: str = Header(default="demo@tesserak.dev")):
     return await list_deployable_clusters(x_user_email, connection_manager)
 
 
-@router.get("/api/atmosly/pipelines")
+@router.get("/api/pipelines")
 async def list_pipelines(x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
+    state = await asyncio.to_thread(_load_state, x_user_email)
     return state["pipelines"]
 
 
-@router.post("/api/atmosly/pipelines")
+@router.post("/api/pipelines")
 async def create_pipeline(payload: PipelineCreate, x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
-
+    db = get_db()
+    clean_email = normalize_email(x_user_email)
     git_token: Optional[str] = None
     if payload.gitIntegrationId:
-        integ = next((i for i in state["integrations"] if i["id"] == payload.gitIntegrationId), None)
-        if integ:
-            git_token = integ.get("secretPayload", {}).get("token")
+        def _get_git_token():
+            with db.session_scope() as session:
+                row = (
+                    session.query(IntegrationRecord)
+                    .filter(
+                        IntegrationRecord.id == payload.gitIntegrationId,
+                        IntegrationRecord.user_email == clean_email,
+                    )
+                    .first()
+                )
+                return db.decrypt_json(row.secret_payload_enc).get("token") if row else None
+
+        git_token = await asyncio.to_thread(_get_git_token)
 
     branch = (payload.branch or "main").strip()
     try:
@@ -842,51 +1279,79 @@ async def create_pipeline(payload: PipelineCreate, x_user_email: str = Header(de
         raise HTTPException(status_code=400, detail=str(exc))
 
     now = utc_now_iso()
-    pipeline = {
-        "id": f"pip-{uuid.uuid4().hex[:8]}",
-        "name": payload.name.strip(),
-        "repositoryUrl": payload.repositoryUrl.strip(),
-        "branch": branch,
-        "targetCluster": payload.targetCluster.strip(),
-        "namespace": (payload.namespace or "default").strip(),
-        "manifestPath": (payload.manifestPath or ".").strip(),
-        "dockerfilePath": (payload.dockerfilePath or "").strip(),
-        "imageTag": (payload.imageTag or "").strip(),
-        "gitIntegrationId": payload.gitIntegrationId,
-        "verifiedRemoteSha": head_sha,
-        "lastRunNumber": 0,
-        "status": "Ready",
-        "durationSec": 0,
-        "triggeredBy": x_user_email,
-        "lastRunAt": now,
-        "stages": [],
-        "recentRuns": [],
-    }
-    state["pipelines"].insert(0, pipeline)
-    _save_state(x_user_email, state)
-    return pipeline
+    pip_id = f"pip-{uuid.uuid4().hex[:8]}"
+
+    def _insert_pipeline():
+        with db.session_scope() as session:
+            rec = PipelineRecord(
+                id=pip_id,
+                user_email=clean_email,
+                name=payload.name.strip(),
+                repository_url=payload.repositoryUrl.strip(),
+                branch=branch,
+                target_cluster=payload.targetCluster.strip(),
+                namespace=(payload.namespace or "default").strip(),
+                manifest_path=(payload.manifestPath or ".").strip(),
+                dockerfile_path=(payload.dockerfilePath or "").strip(),
+                image_tag=(payload.imageTag or "").strip(),
+                git_integration_id=payload.gitIntegrationId,
+                verified_remote_sha=head_sha,
+                last_run_number=0,
+                status="Ready",
+                duration_sec=0.0,
+                triggered_by=x_user_email,
+                last_run_at=now,
+                stages_json=[],
+                recent_runs_json=[],
+            )
+            session.add(rec)
+            session.flush()
+            return _pipeline_to_dict(rec)
+
+    return await asyncio.to_thread(_insert_pipeline)
 
 
-@router.post("/api/atmosly/pipelines/{pipeline_id}/trigger")
+@router.post("/api/pipelines/{pipeline_id}/trigger")
 async def trigger_pipeline(pipeline_id: str, payload: PipelineTriggerRequest, x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
-    target = next((p for p in state["pipelines"] if p["id"] == pipeline_id), None)
+    db = get_db()
+    clean_email = normalize_email(x_user_email)
+
+    def _prep_trigger():
+        with db.session_scope() as session:
+            row = (
+                session.query(PipelineRecord)
+                .filter(
+                    PipelineRecord.id == pipeline_id,
+                    PipelineRecord.user_email == clean_email,
+                )
+                .first()
+            )
+            if not row:
+                return None, None, None
+            git_token: Optional[str] = None
+            if row.git_integration_id:
+                integ = (
+                    session.query(IntegrationRecord)
+                    .filter(
+                        IntegrationRecord.id == row.git_integration_id,
+                        IntegrationRecord.user_email == clean_email,
+                    )
+                    .first()
+                )
+                if integ:
+                    git_token = db.decrypt_json(integ.secret_payload_enc).get("token")
+            branch = (payload.branch or row.branch).strip()
+            row.status = "Running"
+            row.last_run_at = utc_now_iso()
+            row.stages_json = [
+                {"name": "Git Checkout", "status": "Running", "durationSec": 0, "log": f"Cloning {row.repository_url}@{branch}..."},
+            ]
+            session.flush()
+            return _pipeline_to_dict(row), branch, git_token
+
+    target, branch, git_token = await asyncio.to_thread(_prep_trigger)
     if not target:
         raise HTTPException(status_code=404, detail="Pipeline not found")
-
-    git_token: Optional[str] = None
-    if target.get("gitIntegrationId"):
-        integ = next((i for i in state["integrations"] if i["id"] == target["gitIntegrationId"]), None)
-        if integ:
-            git_token = integ.get("secretPayload", {}).get("token")
-
-    branch = (payload.branch or target["branch"]).strip()
-    target["status"] = "Running"
-    target["lastRunAt"] = utc_now_iso()
-    target["stages"] = [
-        {"name": "Git Checkout", "status": "Running", "durationSec": 0, "log": f"Cloning {target['repositoryUrl']}@{branch}..."},
-    ]
-    _save_state(x_user_email, state)
 
     asyncio.create_task(
         run_pipeline_async(
@@ -896,18 +1361,33 @@ async def trigger_pipeline(pipeline_id: str, payload: PipelineTriggerRequest, x_
             git_token=git_token,
             connection_manager=connection_manager,
             load_state_fn=_load_state,
-            save_state_fn=_save_state,
+            save_state_fn=_save_pipeline_state,
         )
     )
     return target
 
 
-@router.delete("/api/atmosly/pipelines/{pipeline_id}")
+@router.delete("/api/pipelines/{pipeline_id}")
 async def delete_pipeline(pipeline_id: str, x_user_email: str = Header(default="demo@tesserak.dev")):
-    state = _load_state(x_user_email)
-    before = len(state["pipelines"])
-    state["pipelines"] = [p for p in state["pipelines"] if p["id"] != pipeline_id]
-    if len(state["pipelines"]) == before:
+    db = get_db()
+    clean_email = normalize_email(x_user_email)
+
+    def _delete_pipeline():
+        with db.session_scope() as session:
+            row = (
+                session.query(PipelineRecord)
+                .filter(
+                    PipelineRecord.id == pipeline_id,
+                    PipelineRecord.user_email == clean_email,
+                )
+                .first()
+            )
+            if not row:
+                return False
+            session.delete(row)
+            return True
+
+    deleted = await asyncio.to_thread(_delete_pipeline)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Pipeline not found")
-    _save_state(x_user_email, state)
     return {"status": "deleted", "id": pipeline_id}

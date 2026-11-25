@@ -36,10 +36,18 @@ import {
   Refresh as RefreshIcon,
   Storage as StorageIcon,
 } from '@mui/icons-material';
+import { useTesserakAuth } from '../auth/AuthContext';
 import ConnectorForm from '../components/Connectors/ConnectorForm';
 import ConnectorList, { Connector } from '../components/Connectors/ConnectorList';
 import { Perspective3DCard } from '../components/Perspective3DCard';
-import { IntegrationCategory, IntegrationItem, IntegrationProvider } from '../types/atmosly';
+import { IntegrationCategory, IntegrationItem, IntegrationProvider } from '../types/platform';
+import { fetchWithSwr, invalidateSwrCache, readSwrCache } from '../utils/swrCache';
+
+const extractErrorMessage = (detail: any, fallback: string): string => {
+  if (!detail) return fallback;
+  if (typeof detail === 'string') return detail;
+  return detail.error_description || detail.message || detail.error || fallback;
+};
 
 const CATEGORY_META: Record<IntegrationCategory, { label: string; icon: React.ReactNode }> = {
   cloud: { label: 'Cloud Providers', icon: <StorageIcon fontSize="small" /> },
@@ -116,8 +124,19 @@ const PROVIDER_CONFIGS: Array<{
 ];
 
 export const Integrations: React.FC = () => {
-  const [integrations, setIntegrations] = useState<IntegrationItem[]>([]);
-  const [awsConnectors, setAwsConnectors] = useState<Connector[]>([]);
+  const { userEmail: authEmail } = useTesserakAuth();
+  const userEmail = authEmail || localStorage.getItem('currentUser') || 'demo@tesserak.dev';
+
+  const cachedBundle = readSwrCache<{ integrations: IntegrationItem[]; awsConnectors: Connector[] }>(
+    userEmail,
+    'integrations'
+  );
+  const [integrations, setIntegrations] = useState<IntegrationItem[]>(
+    () => cachedBundle?.integrations ?? []
+  );
+  const [awsConnectors, setAwsConnectors] = useState<Connector[]>(
+    () => cachedBundle?.awsConnectors ?? []
+  );
   const [categoryFilter, setCategoryFilter] = useState<'all' | IntegrationCategory | 'aws-iam'>('all');
 
   const [addModalOpen, setAddModalOpen] = useState(false);
@@ -140,29 +159,51 @@ export const Integrations: React.FC = () => {
   const [awsSecretKey, setAwsSecretKey] = useState('');
   const [awsRegion, setAwsRegion] = useState('us-east-1');
 
-  const userEmail = localStorage.getItem('currentUser') || 'demo@tesserak.dev';
   const currentCfg = PROVIDER_CONFIGS.find((p) => p.provider === formProvider) || PROVIDER_CONFIGS[0];
 
-  const loadAll = useCallback(async () => {
-    try {
-      const [intRes, connRes] = await Promise.all([
-        fetch('http://localhost:8000/api/atmosly/integrations', {
-          headers: { 'x-user-email': userEmail },
-        }),
-        fetch('http://localhost:8000/api/connections', {
-          headers: { 'x-user-email': userEmail },
-        }),
-      ]);
-      if (intRes.ok) {
-        setIntegrations(await intRes.json());
+  const loadAll = useCallback(
+    async (force: boolean = false) => {
+      try {
+        const data = await fetchWithSwr(
+          userEmail,
+          'integrations',
+          async () => {
+            const [intRes, connRes] = await Promise.all([
+              fetch('http://localhost:8000/api/integrations', {
+                headers: { 'x-user-email': userEmail },
+              }),
+              fetch('http://localhost:8000/api/connections', {
+                headers: { 'x-user-email': userEmail },
+              }),
+            ]);
+            if (!intRes.ok) {
+              const errData = await intRes.json().catch(() => ({}));
+              throw new Error(
+                extractErrorMessage(errData.detail, `Failed to load integrations (HTTP ${intRes.status})`)
+              );
+            }
+            if (!connRes.ok) {
+              const errData = await connRes.json().catch(() => ({}));
+              throw new Error(
+                extractErrorMessage(errData.detail, `Failed to load AWS connections (HTTP ${connRes.status})`)
+              );
+            }
+            return {
+              integrations: (await intRes.json()) as IntegrationItem[],
+              awsConnectors: (await connRes.json()) as Connector[],
+            };
+          },
+          { force, dedupeWindowMs: 4000 }
+        );
+        setIntegrations(data.integrations);
+        setAwsConnectors(data.awsConnectors);
+        setError('');
+      } catch (err: any) {
+        setError(err?.message || 'Unable to reach backend integrations API');
       }
-      if (connRes.ok) {
-        setAwsConnectors(await connRes.json());
-      }
-    } catch {
-      setError('Unable to reach backend integrations API');
-    }
-  }, [userEmail]);
+    },
+    [userEmail]
+  );
 
   useEffect(() => {
     loadAll();
@@ -189,7 +230,7 @@ export const Integrations: React.FC = () => {
     setSubmitting(true);
 
     try {
-      const res = await fetch('http://localhost:8000/api/atmosly/integrations', {
+      const res = await fetch('http://localhost:8000/api/integrations', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -210,12 +251,14 @@ export const Integrations: React.FC = () => {
       });
       const data = await res.json();
       if (!res.ok) {
-        setModalError(data.detail || 'Live credential verification failed');
+        setModalError(extractErrorMessage(data.detail, 'Live credential verification failed'));
         return;
       }
       setAddModalOpen(false);
       setNotice(`Verified & connected "${data.name}" (${data.latencyMs}ms).`);
-      await loadAll();
+      invalidateSwrCache(userEmail, 'integrations');
+      invalidateSwrCache(userEmail, 'overview');
+      await loadAll(true);
     } catch (err: any) {
       setModalError(err.message || 'Network failure connecting to backend');
     } finally {
@@ -232,25 +275,25 @@ export const Integrations: React.FC = () => {
       });
       if (res.ok) {
         setNotice(`AWS Connector "${item.name}" verified via live STS check.`);
-        await loadAll();
+        await loadAll(true);
       }
       return;
     }
 
     setTestingId(item.id);
     try {
-      const res = await fetch(`http://localhost:8000/api/atmosly/integrations/${item.id}/test`, {
+      const res = await fetch(`http://localhost:8000/api/integrations/${item.id}/test`, {
         method: 'POST',
         headers: { 'x-user-email': userEmail },
       });
       const data = await res.json();
       if (!res.ok) {
-        setError(data.detail || `Verification failed for "${item.name}"`);
-        await loadAll();
+        setError(extractErrorMessage(data.detail, `Verification failed for "${item.name}"`));
+        await loadAll(true);
         return;
       }
       setNotice(`Live ping succeeded for "${data.name}" (${data.latencyMs}ms).`);
-      await loadAll();
+      await loadAll(true);
     } catch {
       setError('Health check request failed');
     } finally {
@@ -265,13 +308,15 @@ export const Integrations: React.FC = () => {
       return;
     }
     try {
-      const res = await fetch(`http://localhost:8000/api/atmosly/integrations/${item.id}`, {
+      const res = await fetch(`http://localhost:8000/api/integrations/${item.id}`, {
         method: 'DELETE',
         headers: { 'x-user-email': userEmail },
       });
       if (res.ok) {
         setNotice(`Disconnected "${item.name}".`);
-        await loadAll();
+        invalidateSwrCache(userEmail, 'integrations');
+        invalidateSwrCache(userEmail, 'overview');
+        await loadAll(true);
       }
     } catch {
       setError('Failed to disconnect integration');
@@ -293,14 +338,16 @@ export const Integrations: React.FC = () => {
       },
       body: JSON.stringify({ ...credentials, type: 'aws' }),
     });
-    const data = await response.json();
+    const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      setError(data.detail || 'AWS credential validation failed');
-      return;
+      const msg = extractErrorMessage(data.detail, 'AWS credential validation failed');
+      setError(msg);
+      throw new Error(msg);
     }
     setAwsModalOpen(false);
     setNotice(`AWS IAM account "${credentials.accountName}" verified via STS and connected.`);
-    await loadAll();
+    invalidateSwrCache(userEmail);
+    await loadAll(true);
   };
 
   const handleDeleteAwsConnector = async (id: string) => {
@@ -310,7 +357,8 @@ export const Integrations: React.FC = () => {
     });
     if (res.ok) {
       setNotice('AWS IAM connection removed.');
-      await loadAll();
+      invalidateSwrCache(userEmail);
+      await loadAll(true);
     }
   };
 

@@ -3,3 +3,7 @@ uvicorn==0.24.0
 boto3==1.29.0
 python-dotenv==1.0.0
 pydantic==2.4.2
+auth0-fastapi-api
+sqlalchemy>=2.0,<2.1
+psycopg2-binary>=2.9.9
+cryptography>=41.0.0

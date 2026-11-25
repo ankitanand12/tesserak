@@ -23,6 +23,7 @@ import {
   Error as ErrorIcon,
   Sync as SyncIcon,
   DeleteOutline as DeleteIcon,
+  ChevronRight as ChevronRightIcon,
 } from '@mui/icons-material';
 import { Cluster } from '../types/cluster';
 
@@ -30,6 +31,7 @@ interface ClusterTableProps {
   clusters: Cluster[];
   onDeleteCluster: (name: string) => void;
   onSyncCluster?: (name: string) => void;
+  onSelectCluster?: (name: string) => void;
   syncingCluster?: string | null;
   emptyMessage?: string;
 }
@@ -64,6 +66,7 @@ const ClusterTable: React.FC<ClusterTableProps> = ({
   clusters,
   onDeleteCluster,
   onSyncCluster,
+  onSelectCluster,
   syncingCluster,
   emptyMessage,
 }) => {
@@ -135,17 +138,42 @@ const ClusterTable: React.FC<ClusterTableProps> = ({
                 return (
                   <TableRow
                     key={cluster.name}
+                    onClick={onSelectCluster ? () => onSelectCluster(cluster.name) : undefined}
                     sx={{
                       opacity: cluster.deletedAt ? 0.72 : 1,
                       backgroundColor: cluster.deletedAt ? 'rgba(0,0,0,0.03)' : 'inherit',
+                      cursor: onSelectCluster ? 'pointer' : 'default',
                       transition: 'background-color 0.15s ease',
                       '&:hover': { bgcolor: '#f8fafc' },
+                      '&:hover .cluster-name-label': onSelectCluster
+                        ? { color: '#2563eb', textDecoration: 'underline' }
+                        : undefined,
+                      '&:hover .cluster-inspect-chevron': onSelectCluster
+                        ? { opacity: 1, transform: 'translateX(2px)', color: '#2563eb' }
+                        : undefined,
                     }}
                   >
                     <TableCell component="th" scope="row" sx={{ fontWeight: 700, color: '#09090b', maxWidth: 260 }}>
-                      <Typography variant="body2" sx={{ fontWeight: 700, color: '#09090b' }}>
-                        {cluster.name}
-                      </Typography>
+                      <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.5 }}>
+                        <Typography
+                          variant="body2"
+                          className="cluster-name-label"
+                          sx={{ fontWeight: 700, color: '#09090b', transition: 'color 0.15s ease' }}
+                        >
+                          {cluster.name}
+                        </Typography>
+                        {onSelectCluster && (
+                          <ChevronRightIcon
+                            className="cluster-inspect-chevron"
+                            sx={{
+                              fontSize: 16,
+                              color: '#94a3b8',
+                              opacity: 0.75,
+                              transition: 'transform 0.15s ease, opacity 0.15s ease, color 0.15s ease',
+                            }}
+                          />
+                        )}
+                      </Box>
                       {cluster.endpoint && (
                         <Typography
                           variant="caption"
@@ -222,7 +250,10 @@ const ClusterTable: React.FC<ClusterTableProps> = ({
                     </TableCell>
                     <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>
                       {!cluster.deletedAt && (
-                        <Box sx={{ display: 'inline-flex', gap: 1, alignItems: 'center' }}>
+                        <Box
+                          sx={{ display: 'inline-flex', gap: 1, alignItems: 'center' }}
+                          onClick={(e) => e.stopPropagation()}
+                        >
                           {onSyncCluster && (
                             <Button
                               variant="outlined"
@@ -230,7 +261,10 @@ const ClusterTable: React.FC<ClusterTableProps> = ({
                               disabled={isSyncing}
                               aria-label={`Sync ${cluster.name}`}
                               startIcon={isSyncing ? <CircularProgress size={13} /> : <SyncIcon fontSize="small" />}
-                              onClick={() => onSyncCluster(cluster.name)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onSyncCluster(cluster.name);
+                              }}
                               sx={{
                                 borderColor: 'rgba(15, 23, 42, 0.22)',
                                 color: '#09090b',
@@ -246,7 +280,10 @@ const ClusterTable: React.FC<ClusterTableProps> = ({
                             size="small"
                             aria-label={`Delete ${cluster.name}`}
                             startIcon={<DeleteIcon fontSize="small" />}
-                            onClick={() => setConfirmTarget(cluster.name)}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setConfirmTarget(cluster.name);
+                            }}
                           >
                             Delete
                           </Button>
