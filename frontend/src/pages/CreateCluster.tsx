@@ -31,6 +31,20 @@ export interface ClusterConfig {
     isNew: boolean;
     cidr?: string;
   };
+  amiType: string;
+  amiId: string;
+  amiManual?: boolean;
+  createNodeGroup?: boolean;
+  nodeGroupName?: string;
+  instanceType?: string;
+  capacityType?: 'ON_DEMAND' | 'SPOT';
+  minNodes?: number;
+  desiredNodes?: number;
+  maxNodes?: number;
+  diskSize?: number;
+  publicSubnets?: string[];
+  privateSubnets?: string[];
+  enableClusterLogs?: boolean;
   environment: {
     type: 'Non-Prod' | 'Prod';
     endpoint: 'public' | 'public-private' | 'private';
@@ -63,6 +77,20 @@ const CreateCluster: React.FC = () => {
       id: '',
       isNew: false,
     },
+    amiType: 'amazon-linux-2023/x86_64/standard',
+    amiId: '',
+    amiManual: false,
+    createNodeGroup: true,
+    nodeGroupName: '',
+    instanceType: 't3.medium',
+    capacityType: 'ON_DEMAND',
+    minNodes: 1,
+    desiredNodes: 2,
+    maxNodes: 4,
+    diskSize: 20,
+    publicSubnets: [],
+    privateSubnets: [],
+    enableClusterLogs: false,
     environment: {
       type: '' as 'Non-Prod' | 'Prod',
       endpoint: '' as 'public' | 'public-private' | 'private',
@@ -158,10 +186,14 @@ const CreateCluster: React.FC = () => {
       tz: 42,
     },
     {
-      title: 'Layer 2 · EKS Control Plane',
+      title: 'Layer 2 · EKS Control Plane & AMI',
       subtitle: `${config.name || 'Unnamed Cluster'} · K8s ${
-        config.environment.kubernetesVersion || 'TBD'
-      } · ${config.environment.endpoint || 'endpoint pending'}`,
+        config.environment.kubernetesVersion || 'Latest'
+      } · ${config.amiId || config.amiType}${
+        config.createNodeGroup !== false
+          ? ` · ${config.desiredNodes ?? 2}× ${config.instanceType || 't3.medium'}`
+          : ''
+      }`,
       borderColor: activeStep >= 1 ? '#60a5fa' : '#e2e8f0',
       bg: '#eff6ff',
       tz: 20,

@@ -1,14 +1,24 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   Alert,
+  Autocomplete,
   Box,
   Button,
   Chip,
   CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Divider,
+  FormControl,
   Grid,
   IconButton,
+  InputAdornment,
+  InputLabel,
+  MenuItem,
   Paper,
+  Select,
   Tab,
   Table,
   TableBody,
@@ -17,13 +27,16 @@ import {
   TableHead,
   TableRow,
   Tabs,
+  TextField,
   Tooltip,
   Typography,
 } from '@mui/material';
 import {
+  Add as AddIcon,
   ArrowBack as ArrowBackIcon,
   CheckCircle as CheckCircleIcon,
   ContentCopy as CopyIcon,
+  DeleteOutline as DeleteIcon,
   Extension as AddonIcon,
   History as HistoryIcon,
   Hub as NetworkIcon,
@@ -33,10 +46,12 @@ import {
   Security as SecurityIcon,
   Storage as StorageIcon,
   Sync as SyncIcon,
+  Tune as TuneIcon,
   Visibility as ObservabilityIcon,
 } from '@mui/icons-material';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useTesserakAuth } from '../auth/AuthContext';
+import { EKS_AMI_TYPES } from '../components/CreateCluster/ClusterEnvironment';
 import { Perspective3DCard } from '../components/Perspective3DCard';
 import { fetchWithSwr, invalidateSwrCache, readSwrCache } from '../utils/swrCache';
 
@@ -97,6 +112,17 @@ interface ClusterDetailResponse {
     releaseVersion?: string;
     scalingConfig?: { minSize?: number; desiredSize?: number; maxSize?: number };
     subnets?: string[];
+  }>;
+  workerNodes?: Array<{
+    instanceId: string;
+    name?: string;
+    nodegroupName?: string;
+    instanceType?: string;
+    availabilityZone?: string;
+    privateIpAddress?: string;
+    publicIpAddress?: string;
+    state?: string;
+    launchTime?: string;
   }>;
   fargateProfiles: Array<{
     fargateProfileName: string;
@@ -198,6 +224,34 @@ export const ClusterDetails: React.FC = () => {
   const [notice, setNotice] = useState('');
   const [tab, setTab] = useState(0);
 
+  // Node Group create / scale / delete state
+  const [ngDialogOpen, setNgDialogOpen] = useState(false);
+  const [ngName, setNgName] = useState('');
+  const [ngAmiType, setNgAmiType] = useState('amazon-linux-2023/x86_64/standard');
+  const [ngAmiId, setNgAmiId] = useState('');
+  const [ngAmiManual, setNgAmiManual] = useState(false);
+  const [ngLoadingAmi, setNgLoadingAmi] = useState(false);
+  const [ngInstanceType, setNgInstanceType] = useState('t3.medium');
+  const [ngCapacityType, setNgCapacityType] = useState<'ON_DEMAND' | 'SPOT'>('ON_DEMAND');
+  const [ngMinSize, setNgMinSize] = useState(1);
+  const [ngDesiredSize, setNgDesiredSize] = useState(2);
+  const [ngMaxSize, setNgMaxSize] = useState(4);
+  const [ngDiskSize, setNgDiskSize] = useState(20);
+  const [ngSubnets, setNgSubnets] = useState<string[]>([]);
+  const [ngSubmitting, setNgSubmitting] = useState(false);
+  const [ngDialogError, setNgDialogError] = useState('');
+
+  const [scaleTarget, setScaleTarget] = useState<{
+    nodegroupName: string;
+    minSize: number;
+    desiredSize: number;
+    maxSize: number;
+  } | null>(null);
+  const [scaleSubmitting, setScaleSubmitting] = useState(false);
+
+  const [deleteNgTarget, setDeleteNgTarget] = useState<string | null>(null);
+  const [deleteNgSubmitting, setDeleteNgSubmitting] = useState(false);
+
   const loadDetails = useCallback(
     async (force: boolean = false) => {
       if (!decodedName) return;
@@ -270,6 +324,154 @@ export const ClusterDetails: React.FC = () => {
       setError(err?.message || 'Unable to sync cluster state');
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const fetchNodegroupAmi = async (amiTypeVal: string, forceOverwrite: boolean = false) => {
+    if (!detail?.accountId || !detail?.region) return;
+    setNgLoadingAmi(true);
+    try {
+      const params = new URLSearchParams({ ami_type: amiTypeVal });
+      if (detail.cluster?.version) {
+        params.set('kubernetes_version', detail.cluster.version);
+      }
+      const res = await fetch(
+        `http://localhost:8000/api/aws/eks-ami/${detail.accountId}/${detail.region}?${params.toString()}`,
+        { headers: { 'x-user-email': userEmail } }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.amiId && (forceOverwrite || !ngAmiManual)) {
+        setNgAmiId(data.amiId);
+        setNgAmiManual(false);
+      }
+    } catch {
+      // Optional preview helper; EKS defaults safely via amiType enum
+    } finally {
+      setNgLoadingAmi(false);
+    }
+  };
+
+  const openAddNodegroupDialog = () => {
+    const defaultType = 'amazon-linux-2023/x86_64/standard';
+    setNgName(`${decodedName}-ng`);
+    setNgAmiType(defaultType);
+    setNgAmiManual(false);
+    setNgInstanceType('t3.medium');
+    setNgCapacityType('ON_DEMAND');
+    setNgMinSize(1);
+    setNgDesiredSize(2);
+    setNgMaxSize(4);
+    setNgDiskSize(20);
+    setNgSubnets((detail?.networking.subnets || []).map((s) => s.subnetId));
+    setNgDialogError('');
+    setNgDialogOpen(true);
+    fetchNodegroupAmi(defaultType, true);
+  };
+
+  const handleCreateNodegroup = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setNgDialogError('');
+    setNgSubmitting(true);
+    try {
+      const res = await fetch(
+        `http://localhost:8000/clusters/${encodeURIComponent(decodedName)}/nodegroups`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-email': userEmail,
+          },
+          body: JSON.stringify({
+            nodegroupName: ngName.trim(),
+            amiType: ngAmiType,
+            amiId: ngAmiId.trim() || undefined,
+            amiManual: ngAmiManual,
+            instanceTypes: [ngInstanceType.trim() || 't3.medium'],
+            capacityType: ngCapacityType,
+            minSize: Number(ngMinSize),
+            desiredSize: Number(ngDesiredSize),
+            maxSize: Number(ngMaxSize),
+            diskSize: Number(ngDiskSize),
+            subnets: ngSubnets,
+          }),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || 'Failed to create node group');
+      }
+      setNgDialogOpen(false);
+      setNotice(`Node group "${ngName.trim()}" creation initiated on AWS EKS.`);
+      invalidateSwrCache(userEmail, cacheKey);
+      invalidateSwrCache(userEmail, 'clusters');
+      await loadDetails(true);
+    } catch (err: any) {
+      setNgDialogError(err?.message || 'Unable to create node group');
+    } finally {
+      setNgSubmitting(false);
+    }
+  };
+
+  const handleScaleNodegroup = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!scaleTarget) return;
+    setScaleSubmitting(true);
+    setError('');
+    try {
+      const res = await fetch(
+        `http://localhost:8000/clusters/${encodeURIComponent(decodedName)}/nodegroups/${encodeURIComponent(scaleTarget.nodegroupName)}`,
+        {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-email': userEmail,
+          },
+          body: JSON.stringify({
+            minSize: Number(scaleTarget.minSize),
+            desiredSize: Number(scaleTarget.desiredSize),
+            maxSize: Number(scaleTarget.maxSize),
+          }),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || 'Failed to update node group scaling');
+      }
+      setNotice(`Scaling update started for node group "${scaleTarget.nodegroupName}".`);
+      setScaleTarget(null);
+      invalidateSwrCache(userEmail, cacheKey);
+      await loadDetails(true);
+    } catch (err: any) {
+      setError(err?.message || 'Unable to scale node group');
+    } finally {
+      setScaleSubmitting(false);
+    }
+  };
+
+  const handleDeleteNodegroup = async () => {
+    if (!deleteNgTarget) return;
+    setDeleteNgSubmitting(true);
+    setError('');
+    try {
+      const res = await fetch(
+        `http://localhost:8000/clusters/${encodeURIComponent(decodedName)}/nodegroups/${encodeURIComponent(deleteNgTarget)}`,
+        {
+          method: 'DELETE',
+          headers: { 'x-user-email': userEmail },
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || 'Failed to delete node group');
+      }
+      setNotice(`Node group "${deleteNgTarget}" deletion initiated.`);
+      setDeleteNgTarget(null);
+      invalidateSwrCache(userEmail, cacheKey);
+      await loadDetails(true);
+    } catch (err: any) {
+      setError(err?.message || 'Unable to delete node group');
+    } finally {
+      setDeleteNgSubmitting(false);
     }
   };
 
@@ -567,9 +769,32 @@ export const ClusterDetails: React.FC = () => {
           {tab === 1 && (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3.5 }}>
               <Box>
-                <Typography variant="subtitle1" sx={{ fontWeight: 700, mb: 1.5, color: '#09090b' }}>
-                  Managed Node Groups ({detail?.nodegroups.length || 0})
-                </Typography>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 1.5, mb: 1.5 }}>
+                  <Typography variant="subtitle1" sx={{ fontWeight: 700, color: '#09090b' }}>
+                    Managed Node Groups ({detail?.nodegroups.length || 0})
+                  </Typography>
+                  {!detail?.awsMissing && (
+                    <Tooltip
+                      title={
+                        detail?.status !== 'ACTIVE'
+                          ? 'Wait until cluster status is ACTIVE to create a node group'
+                          : 'Launch a managed EKS node group with EC2 worker nodes'
+                      }
+                    >
+                      <span>
+                        <Button
+                          variant="contained"
+                          size="small"
+                          startIcon={<AddIcon />}
+                          disabled={detail?.status !== 'ACTIVE'}
+                          onClick={openAddNodegroupDialog}
+                        >
+                          Add Node Group
+                        </Button>
+                      </span>
+                    </Tooltip>
+                  )}
+                </Box>
                 {detail?.nodegroups && detail.nodegroups.length > 0 ? (
                   <TableContainer component={Paper} variant="outlined">
                     <Table size="small">
@@ -581,6 +806,7 @@ export const ClusterDetails: React.FC = () => {
                           <TableCell><strong>Scaling (Min / Desired / Max)</strong></TableCell>
                           <TableCell><strong>AMI Type / Disk</strong></TableCell>
                           <TableCell><strong>Capacity</strong></TableCell>
+                          <TableCell align="right"><strong>Actions</strong></TableCell>
                         </TableRow>
                       </TableHead>
                       <TableBody>
@@ -604,13 +830,89 @@ export const ClusterDetails: React.FC = () => {
                               {ng.amiType || '—'} · {ng.diskSize ? `${ng.diskSize} GB` : 'default'}
                             </TableCell>
                             <TableCell>{ng.capacityType || 'ON_DEMAND'}</TableCell>
+                            <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>
+                              <Box sx={{ display: 'inline-flex', gap: 1 }}>
+                                <Button
+                                  size="small"
+                                  variant="outlined"
+                                  startIcon={<TuneIcon fontSize="small" />}
+                                  onClick={() =>
+                                    setScaleTarget({
+                                      nodegroupName: ng.nodegroupName,
+                                      minSize: ng.scalingConfig?.minSize ?? 1,
+                                      desiredSize: ng.scalingConfig?.desiredSize ?? 2,
+                                      maxSize: ng.scalingConfig?.maxSize ?? 4,
+                                    })
+                                  }
+                                >
+                                  Scale
+                                </Button>
+                                <Button
+                                  size="small"
+                                  variant="outlined"
+                                  color="error"
+                                  startIcon={<DeleteIcon fontSize="small" />}
+                                  onClick={() => setDeleteNgTarget(ng.nodegroupName)}
+                                >
+                                  Delete
+                                </Button>
+                              </Box>
+                            </TableCell>
                           </TableRow>
                         ))}
                       </TableBody>
                     </Table>
                   </TableContainer>
                 ) : (
-                  <Alert severity="info">No managed node groups attached to this cluster yet.</Alert>
+                  <Alert severity="info">
+                    No managed node groups attached yet. Click <strong>Add Node Group</strong> to provision EC2 worker nodes for pods, add-ons, and CI/CD workloads.
+                  </Alert>
+                )}
+              </Box>
+
+              <Divider />
+
+              <Box>
+                <Typography variant="subtitle1" sx={{ fontWeight: 700, mb: 1.5, color: '#09090b' }}>
+                  EC2 Worker Nodes ({detail?.workerNodes?.length || 0})
+                </Typography>
+                {detail?.workerNodes && detail.workerNodes.length > 0 ? (
+                  <TableContainer component={Paper} variant="outlined">
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow sx={{ bgcolor: '#f8fafc' }}>
+                          <TableCell><strong>Instance ID</strong></TableCell>
+                          <TableCell><strong>Node Group</strong></TableCell>
+                          <TableCell><strong>Instance Type</strong></TableCell>
+                          <TableCell><strong>AZ</strong></TableCell>
+                          <TableCell><strong>Private / Public IP</strong></TableCell>
+                          <TableCell><strong>State</strong></TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {detail.workerNodes.map((n) => (
+                          <TableRow key={n.instanceId}>
+                            <TableCell sx={{ fontFamily: 'monospace', fontWeight: 700 }}>{n.instanceId}</TableCell>
+                            <TableCell>{n.nodegroupName || '—'}</TableCell>
+                            <TableCell>{n.instanceType || '—'}</TableCell>
+                            <TableCell>{n.availabilityZone || '—'}</TableCell>
+                            <TableCell sx={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>
+                              {n.privateIpAddress || '—'}{n.publicIpAddress ? ` / ${n.publicIpAddress}` : ''}
+                            </TableCell>
+                            <TableCell>
+                              <Chip
+                                size="small"
+                                label={n.state || 'unknown'}
+                                color={n.state === 'running' ? 'success' : 'warning'}
+                              />
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                ) : (
+                  <Alert severity="info">No running EC2 worker nodes discovered for this cluster yet.</Alert>
                 )}
               </Box>
 
@@ -931,6 +1233,231 @@ export const ClusterDetails: React.FC = () => {
           )}
         </Box>
       </Perspective3DCard>
+
+      {/* Add Node Group Dialog */}
+      <Dialog open={ngDialogOpen} onClose={() => setNgDialogOpen(false)} maxWidth="sm" fullWidth>
+        <form onSubmit={handleCreateNodegroup}>
+          <DialogTitle sx={{ bgcolor: '#09090b', color: '#ffffff', fontWeight: 700 }}>
+            Add Managed Node Group
+          </DialogTitle>
+          <DialogContent sx={{ pt: '20px !important', display: 'flex', flexDirection: 'column', gap: 2.25 }}>
+            {ngDialogError && (
+              <Alert severity="error" onClose={() => setNgDialogError('')}>
+                {ngDialogError}
+              </Alert>
+            )}
+            <TextField
+              label="Node Group Name"
+              value={ngName}
+              onChange={(e) => setNgName(e.target.value)}
+              required
+              fullWidth
+            />
+            <Grid container spacing={2}>
+              <Grid item xs={12} sm={6}>
+                <FormControl fullWidth>
+                  <InputLabel>AMI Type</InputLabel>
+                  <Select
+                    value={ngAmiType}
+                    label="AMI Type"
+                    onChange={(e) => {
+                      const next = e.target.value;
+                      setNgAmiType(next);
+                      setNgAmiManual(false);
+                      if (next.includes('arm64') && ngInstanceType.startsWith('t3.')) {
+                        setNgInstanceType('t4g.medium');
+                      } else if (!next.includes('arm64') && ngInstanceType.startsWith('t4g.')) {
+                        setNgInstanceType('t3.medium');
+                      }
+                      fetchNodegroupAmi(next, true);
+                    }}
+                  >
+                    {EKS_AMI_TYPES.map((opt) => (
+                      <MenuItem key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              </Grid>
+              <Grid item xs={12} sm={6}>
+                <TextField
+                  label="AMI ID"
+                  value={ngAmiId}
+                  onChange={(e) => {
+                    setNgAmiId(e.target.value);
+                    setNgAmiManual(true);
+                  }}
+                  fullWidth
+                  helperText={`K8s ${detail?.cluster?.version || 'latest'} (${detail?.region || ''}) · Editable`}
+                  InputProps={{
+                    endAdornment: (
+                      <InputAdornment position="end">
+                        {ngLoadingAmi ? <CircularProgress size={16} /> : null}
+                      </InputAdornment>
+                    ),
+                  }}
+                />
+              </Grid>
+            </Grid>
+
+            <Grid container spacing={2}>
+              <Grid item xs={12} sm={6}>
+                <Autocomplete
+                  freeSolo
+                  options={['t3.medium', 't3.large', 'm5.large', 'm6i.large', 'c6i.large', 't4g.medium', 'm7g.large', 'g5.xlarge']}
+                  value={ngInstanceType}
+                  onInputChange={(_, v) => setNgInstanceType(v)}
+                  renderInput={(params) => <TextField {...params} label="Instance Type" required />}
+                />
+              </Grid>
+              <Grid item xs={12} sm={6}>
+                <FormControl fullWidth>
+                  <InputLabel>Capacity Type</InputLabel>
+                  <Select
+                    value={ngCapacityType}
+                    label="Capacity Type"
+                    onChange={(e) => setNgCapacityType(e.target.value as 'ON_DEMAND' | 'SPOT')}
+                  >
+                    <MenuItem value="ON_DEMAND">On-Demand</MenuItem>
+                    <MenuItem value="SPOT">Spot Instances</MenuItem>
+                  </Select>
+                </FormControl>
+              </Grid>
+            </Grid>
+
+            <Grid container spacing={2}>
+              <Grid item xs={6} sm={3}>
+                <TextField
+                  label="Min Nodes"
+                  type="number"
+                  value={ngMinSize}
+                  onChange={(e) => setNgMinSize(Math.max(0, Number(e.target.value)))}
+                  inputProps={{ min: 0 }}
+                  fullWidth
+                />
+              </Grid>
+              <Grid item xs={6} sm={3}>
+                <TextField
+                  label="Desired"
+                  type="number"
+                  value={ngDesiredSize}
+                  onChange={(e) => setNgDesiredSize(Math.max(0, Number(e.target.value)))}
+                  inputProps={{ min: 0 }}
+                  fullWidth
+                />
+              </Grid>
+              <Grid item xs={6} sm={3}>
+                <TextField
+                  label="Max Nodes"
+                  type="number"
+                  value={ngMaxSize}
+                  onChange={(e) => setNgMaxSize(Math.max(1, Number(e.target.value)))}
+                  inputProps={{ min: 1 }}
+                  fullWidth
+                />
+              </Grid>
+              <Grid item xs={6} sm={3}>
+                <TextField
+                  label="Disk (GB)"
+                  type="number"
+                  value={ngDiskSize}
+                  onChange={(e) => setNgDiskSize(Math.max(20, Number(e.target.value)))}
+                  inputProps={{ min: 20 }}
+                  fullWidth
+                />
+              </Grid>
+            </Grid>
+
+            <Autocomplete
+              multiple
+              options={(detail?.networking.subnets || []).map((s) => s.subnetId)}
+              value={ngSubnets}
+              onChange={(_, vals) => setNgSubnets(vals)}
+              renderInput={(params) => (
+                <TextField {...params} label="Worker Subnets" placeholder="Select cluster subnets..." />
+              )}
+            />
+          </DialogContent>
+          <DialogActions sx={{ px: 3, pb: 2.5 }}>
+            <Button onClick={() => setNgDialogOpen(false)} disabled={ngSubmitting}>
+              Cancel
+            </Button>
+            <Button type="submit" variant="contained" disabled={ngSubmitting || !ngName.trim()}>
+              {ngSubmitting ? 'Creating...' : 'Create Node Group'}
+            </Button>
+          </DialogActions>
+        </form>
+      </Dialog>
+
+      {/* Scale Node Group Dialog */}
+      <Dialog open={Boolean(scaleTarget)} onClose={() => setScaleTarget(null)} maxWidth="xs" fullWidth>
+        <form onSubmit={handleScaleNodegroup}>
+          <DialogTitle sx={{ bgcolor: '#09090b', color: '#ffffff', fontWeight: 700 }}>
+            Scale Node Group: {scaleTarget?.nodegroupName}
+          </DialogTitle>
+          <DialogContent sx={{ pt: '20px !important', display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <TextField
+              label="Min Size"
+              type="number"
+              value={scaleTarget?.minSize ?? 1}
+              onChange={(e) =>
+                scaleTarget && setScaleTarget({ ...scaleTarget, minSize: Math.max(0, Number(e.target.value)) })
+              }
+              inputProps={{ min: 0 }}
+              fullWidth
+            />
+            <TextField
+              label="Desired Size"
+              type="number"
+              value={scaleTarget?.desiredSize ?? 2}
+              onChange={(e) =>
+                scaleTarget && setScaleTarget({ ...scaleTarget, desiredSize: Math.max(0, Number(e.target.value)) })
+              }
+              inputProps={{ min: 0 }}
+              fullWidth
+            />
+            <TextField
+              label="Max Size"
+              type="number"
+              value={scaleTarget?.maxSize ?? 4}
+              onChange={(e) =>
+                scaleTarget && setScaleTarget({ ...scaleTarget, maxSize: Math.max(1, Number(e.target.value)) })
+              }
+              inputProps={{ min: 1 }}
+              fullWidth
+            />
+          </DialogContent>
+          <DialogActions sx={{ px: 3, pb: 2.5 }}>
+            <Button onClick={() => setScaleTarget(null)} disabled={scaleSubmitting}>
+              Cancel
+            </Button>
+            <Button type="submit" variant="contained" disabled={scaleSubmitting}>
+              {scaleSubmitting ? 'Updating...' : 'Apply Scaling'}
+            </Button>
+          </DialogActions>
+        </form>
+      </Dialog>
+
+      {/* Delete Node Group Dialog */}
+      <Dialog open={Boolean(deleteNgTarget)} onClose={() => setDeleteNgTarget(null)} maxWidth="xs" fullWidth>
+        <DialogTitle sx={{ bgcolor: '#09090b', color: '#ffffff', fontWeight: 700 }}>
+          Delete Node Group?
+        </DialogTitle>
+        <DialogContent sx={{ pt: '20px !important' }}>
+          <Typography variant="body2" sx={{ color: '#334155' }}>
+            This will terminate worker nodes in <strong>{deleteNgTarget}</strong> on AWS EKS.
+          </Typography>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2.5 }}>
+          <Button onClick={() => setDeleteNgTarget(null)} disabled={deleteNgSubmitting}>
+            Cancel
+          </Button>
+          <Button color="error" variant="contained" disabled={deleteNgSubmitting} onClick={handleDeleteNodegroup}>
+            {deleteNgSubmitting ? 'Deleting...' : 'Confirm Delete'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 };

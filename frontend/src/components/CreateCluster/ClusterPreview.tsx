@@ -34,7 +34,15 @@ const Field: React.FC<{ label: string; value: string | React.ReactNode }> = ({ l
 const ClusterPreview: React.FC<Props> = ({ config }) => {
   return (
     <Box>
-      <Typography variant="h6" sx={{ mb: 3 }}>Review Cluster Configuration</Typography>
+      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 1.5, mb: 3 }}>
+        <Typography variant="h6">Review Cluster Configuration</Typography>
+        <Chip
+          label="Est. Control Plane: $73/mo + Compute"
+          color="success"
+          variant="outlined"
+          sx={{ fontWeight: 700 }}
+        />
+      </Box>
 
       <Paper variant="outlined" sx={{ p: 3 }}>
         <Section title="Basic Details">
@@ -52,6 +60,8 @@ const ClusterPreview: React.FC<Props> = ({ config }) => {
             label="VPC"
             value={config.vpc.isNew ? `New VPC (CIDR: ${config.vpc.cidr})` : config.vpc.id}
           />
+          <Field label="AMI Type" value={config.amiType || 'amazon-linux-2023/x86_64/standard'} />
+          <Field label="AMI ID" value={config.amiId || 'AWS Recommended (on launch)'} />
         </Section>
 
         <Divider sx={{ my: 3 }} />
@@ -66,6 +76,28 @@ const ClusterPreview: React.FC<Props> = ({ config }) => {
               config.environment.availabilityZones.length > 0 
                 ? config.environment.availabilityZones.join(', ')
                 : 'Not configured'
+            }
+          />
+          {config.publicSubnets && config.publicSubnets.length > 0 && (
+            <Field label="Public Subnets" value={config.publicSubnets.join(', ')} />
+          )}
+          {config.privateSubnets && config.privateSubnets.length > 0 && (
+            <Field label="Private Subnets" value={config.privateSubnets.join(', ')} />
+          )}
+          <Field
+            label="Cluster & Flow Logs"
+            value={config.enableClusterLogs ? 'Enabled' : 'Disabled'}
+          />
+          <Field
+            label="Initial Node Group"
+            value={
+              config.createNodeGroup !== false
+                ? `${config.nodeGroupName || `${config.name || 'eks'}-ng`} · ${
+                    config.desiredNodes ?? 2
+                  }× ${config.instanceType || 't3.medium'} (${config.capacityType || 'ON_DEMAND'}, min ${
+                    config.minNodes ?? 1
+                  } / max ${config.maxNodes ?? 4})`
+                : 'Disabled (Control plane only)'
             }
           />
         </Section>

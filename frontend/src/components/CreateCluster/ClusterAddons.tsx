@@ -8,7 +8,7 @@ import {
   IconButton,
   Card,
   CardContent,
-  Stack,
+  Grid,
   Select,
   MenuItem,
   FormControl,
@@ -86,30 +86,121 @@ const AWS_ADDONS: Addon[] = [
     recommended: false,
     type: 'aws',
   },
+  {
+    id: 'aws-fsx-csi-driver',
+    name: 'Amazon FSx CSI Driver',
+    description: 'CSI interface for managing Amazon FSx for Lustre storage',
+    recommended: false,
+    type: 'aws',
+  },
+  {
+    id: 'snapshot-controller',
+    name: 'CSI Snapshot Controller',
+    description: 'Manages VolumeSnapshot CRDs for CSI volume backups',
+    recommended: false,
+    type: 'aws',
+  },
 ];
 
 const COMMUNITY_ADDONS: Addon[] = [
+  {
+    id: 'ingress-nginx',
+    name: 'Ingress NGINX',
+    description: 'Handles routing of external HTTP/S traffic to Kubernetes services.',
+    type: 'community',
+    defaultVersion: '4.12.1',
+  },
+  {
+    id: 'cert-manager',
+    name: 'Cert Manager',
+    description: 'Automates management and issuance of TLS certificates within your cluster.',
+    type: 'community',
+    defaultVersion: '1.19.1',
+  },
   {
     id: 'external-dns',
     name: 'External DNS',
     description: 'Synchronizes exposed Kubernetes Services and Ingresses with DNS providers.',
     type: 'community',
-    defaultVersion: '0.13.5'
+    defaultVersion: '0.20.0',
   },
   {
-    id: 'cert-manager',
-    name: 'Cert Manager',
-    description: 'Automates management and issuance of TLS certificates.',
+    id: 'argo-cd',
+    name: 'Argo CD',
+    description: 'Declarative GitOps continuous delivery controller for Kubernetes.',
     type: 'community',
-    defaultVersion: '0.13.5'
+    defaultVersion: '2.14.8',
+  },
+  {
+    id: 'argo-workflow',
+    name: 'Argo Workflows',
+    description: 'Orchestrates parallel jobs and complex Kubernetes workflows.',
+    type: 'community',
+    defaultVersion: '3.6.5',
   },
   {
     id: 'metrics-server',
     name: 'Metrics Server',
-    description: 'Collects resource metrics from Kubelets and exposes them to the metrics API for use by HPA and VPA.',
+    description: 'Collects resource metrics from Kubelets for HPA and VPA.',
     type: 'community',
-    defaultVersion: '1.12.3'
-  }
+    defaultVersion: '0.8.0',
+  },
+  {
+    id: 'reloader',
+    name: 'Reloader',
+    description: 'Hot-reloads Kubernetes deployments on ConfigMap or Secret changes.',
+    type: 'community',
+    defaultVersion: '1.4.1',
+  },
+  {
+    id: 'cluster-proportional-autoscaler',
+    name: 'Cluster Proportional Autoscaler',
+    description: 'Auto-scales cluster components like CoreDNS based on cluster size.',
+    type: 'community',
+    defaultVersion: '1.9.0',
+  },
+  {
+    id: 'cluster-autoscaler',
+    name: 'Cluster Autoscaler',
+    description: 'Automatically adjusts the size of Kubernetes node groups based on pod demand.',
+    type: 'community',
+    defaultVersion: '1.32.1',
+  },
+  {
+    id: 'karpenter',
+    name: 'Karpenter',
+    description: 'High-performance node autoscaler for dynamic EC2 provisioning.',
+    type: 'community',
+    defaultVersion: '1.3.3',
+  },
+  {
+    id: 'aws-load-balancer-controller',
+    name: 'AWS Load Balancer Controller',
+    description: 'Manages AWS ALB and NLB instances for routing external traffic to services.',
+    type: 'community',
+    defaultVersion: '2.12.0',
+  },
+  {
+    id: 'ops-agent',
+    name: 'Ops Agent',
+    description: 'Cluster operations telemetry agent for health and incident diagnostics.',
+    type: 'community',
+    defaultVersion: '1.4.2',
+  },
+  {
+    id: 'grafana-stack',
+    name: 'Grafana Stack',
+    description: 'Bundles Prometheus monitoring, Grafana dashboards, and Loki log aggregation.',
+    type: 'community',
+    defaultVersion: '70.4.2',
+  },
+  {
+    id: 'debug-agent',
+    name: 'Debug Agent',
+    description: 'Provides ephemeral node and pod diagnostics for cluster troubleshooting.',
+    type: 'community',
+    defaultVersion: '1.2.0',
+  },
 ];
 
 
@@ -268,144 +359,146 @@ const ClusterAddons: React.FC<Props> = ({ config, onChange }) => {
       <Typography variant="h6" sx={{ mb: 2 }}>
         AWS Add-ons
       </Typography>
-      <Stack spacing={2} sx={{ mb: 4 }}>
+      <Grid container spacing={2} sx={{ mb: 4 }}>
         {AWS_ADDONS.map((addon) => (
-          <Card key={addon.id} variant="outlined">
-            <CardContent>
-              <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
-                <FormControlLabel
-                  control={
-                    <Checkbox
-                      checked={selectedIds.includes(addon.id)}
-                      onChange={() => handleAddonToggle(addon)}
-                    />
-                  }
-                  label={
-                    <Box sx={{ display: 'flex', alignItems: 'center' }}>
-                      <Typography>{addon.name}</Typography>
-                      {addon.recommended && (
-                        <Typography
-                          variant="caption"
-                          sx={{ ml: 1, bgcolor: 'primary.main', color: 'white', px: 1, py: 0.5, borderRadius: 1 }}
-                        >
-                          Recommended
-                        </Typography>
-                      )}
-                    </Box>
-                  }
-                />
-                <Tooltip title={addon.description}>
-                  <IconButton size="small">
-                    <InfoIcon fontSize="small" />
-                  </IconButton>
-                </Tooltip>
-              </Box>
-              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <Typography variant="body2" color="text.secondary">
+          <Grid item xs={12} md={6} key={addon.id}>
+          <Card variant="outlined" sx={{ height: '100%', transition: 'border-color 0.2s ease, box-shadow 0.2s ease', '&:hover': { borderColor: '#2563eb', boxShadow: '0 6px 16px rgba(37, 99, 235, 0.08)' } }}>
+            <CardContent sx={{ display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'space-between' }}>
+              <Box>
+                <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={selectedIds.includes(addon.id)}
+                        onChange={() => handleAddonToggle(addon)}
+                      />
+                    }
+                    label={
+                      <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 0.75 }}>
+                        <Typography sx={{ fontWeight: 600 }}>{addon.name}</Typography>
+                        {addon.recommended && (
+                          <Typography
+                            variant="caption"
+                            sx={{ bgcolor: 'primary.main', color: 'white', px: 1, py: 0.25, borderRadius: 1 }}
+                          >
+                            Recommended
+                          </Typography>
+                        )}
+                      </Box>
+                    }
+                  />
+                  <Tooltip title={addon.description}>
+                    <IconButton size="small">
+                      <InfoIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                </Box>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
                   {addon.description}
                 </Typography>
-                {selectedIds.includes(addon.id) && (
-                  <Box sx={{ display: 'flex', alignItems: 'center', ml: 2 }}>
-                    <Typography variant="body2" color="text.secondary" sx={{ mr: 1 }}>
-                      Version:
-                    </Typography>
-                    <FormControl size="small" sx={{ minWidth: 200 }}>
-                      <Select
-                        value={config.addons.find(a => a.id === addon.id)?.version || ''}
-                        onChange={(e: SelectChangeEvent<string>) => handleVersionChange(addon.id, e.target.value)}
-                        displayEmpty
-                        sx={{ height: 32 }}
-                      >
-                        {getAvailableVersions(addon).map(version => (
-                          <MenuItem 
-                            key={version.version} 
-                            value={version.version}
-                            sx={{
-                              fontWeight: version.defaultVersion || version.isLatest ? 'bold' : 'normal',
-                              color: version.defaultVersion ? 'primary.main' : 'inherit'
-                            }}
-                          >
-                            {version.version}
-                            {version.defaultVersion && ' (Default)'}
-                            {version.isLatest && !version.defaultVersion && ' (Latest)'}
-                          </MenuItem>
-                        ))}
-                      </Select>
-                    </FormControl>
-                  </Box>
-                )}
               </Box>
+              {selectedIds.includes(addon.id) && (
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end' }}>
+                  <Typography variant="body2" color="text.secondary" sx={{ mr: 1 }}>
+                    Version:
+                  </Typography>
+                  <FormControl size="small" sx={{ minWidth: 185 }}>
+                    <Select
+                      value={config.addons.find(a => a.id === addon.id)?.version || ''}
+                      onChange={(e: SelectChangeEvent<string>) => handleVersionChange(addon.id, e.target.value)}
+                      displayEmpty
+                      sx={{ height: 32 }}
+                    >
+                      {getAvailableVersions(addon).map(version => (
+                        <MenuItem
+                          key={version.version}
+                          value={version.version}
+                          sx={{
+                            fontWeight: version.defaultVersion || version.isLatest ? 'bold' : 'normal',
+                            color: version.defaultVersion ? 'primary.main' : 'inherit'
+                          }}
+                        >
+                          {version.version}
+                          {version.defaultVersion && ' (Default)'}
+                          {version.isLatest && !version.defaultVersion && ' (Latest)'}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                </Box>
+              )}
             </CardContent>
           </Card>
+          </Grid>
         ))}
-      </Stack>
+      </Grid>
 
       <Typography variant="h6" sx={{ mb: 2 }}>
-        Community Add-ons
+        Cluster &amp; Community Add-ons
       </Typography>
-      <Stack spacing={2}>
+      <Grid container spacing={2}>
         {COMMUNITY_ADDONS.map((addon) => (
-          <Card key={addon.id} variant="outlined">
-            <CardContent>
-              <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
-                <FormControlLabel
-                  control={
-                    <Checkbox
-                      checked={selectedIds.includes(addon.id)}
-                      onChange={() => handleAddonToggle(addon)}
-                    />
-                  }
-                  label={
-                    <Box sx={{ display: 'flex', alignItems: 'center' }}>
-                      <Typography>{addon.name}</Typography>
-                    </Box>
-                  }
-                />
-                <Tooltip title={addon.description}>
-                  <IconButton size="small">
-                    <InfoIcon fontSize="small" />
-                  </IconButton>
-                </Tooltip>
-              </Box>
-              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <Typography variant="body2" color="text.secondary">
+          <Grid item xs={12} md={6} key={addon.id}>
+          <Card variant="outlined" sx={{ height: '100%', transition: 'border-color 0.2s ease, box-shadow 0.2s ease', '&:hover': { borderColor: '#2563eb', boxShadow: '0 6px 16px rgba(37, 99, 235, 0.08)' } }}>
+            <CardContent sx={{ display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'space-between' }}>
+              <Box>
+                <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={selectedIds.includes(addon.id)}
+                        onChange={() => handleAddonToggle(addon)}
+                      />
+                    }
+                    label={
+                      <Typography sx={{ fontWeight: 600 }}>{addon.name}</Typography>
+                    }
+                  />
+                  <Tooltip title={addon.description}>
+                    <IconButton size="small">
+                      <InfoIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                </Box>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
                   {addon.description}
                 </Typography>
-                {selectedIds.includes(addon.id) && (
-                  <Box sx={{ display: 'flex', alignItems: 'center', ml: 2 }}>
-                    <Typography variant="body2" color="text.secondary" sx={{ mr: 1 }}>
-                      Version:
-                    </Typography>
-                    <FormControl size="small" sx={{ minWidth: 120 }}>
-                      <Select
-                        value={config.addons.find(a => a.id === addon.id)?.version || ''}
-                        onChange={(e: SelectChangeEvent<string>) => handleVersionChange(addon.id, e.target.value)}
-                        displayEmpty
-                        sx={{ height: 32 }}
-                      >
-                        {getAvailableVersions(addon).map(version => (
-                          <MenuItem 
-                            key={version.version} 
-                            value={version.version}
-                            sx={{
-                              fontWeight: version.defaultVersion || version.isLatest ? 'bold' : 'normal',
-                              color: version.defaultVersion ? 'primary.main' : 'inherit'
-                            }}
-                          >
-                            {version.version}
-                            {version.defaultVersion && ' (Default)'}
-                            {version.isLatest && !version.defaultVersion && ' (Latest)'}
-                          </MenuItem>
-                        ))}
-                      </Select>
-                    </FormControl>
-                  </Box>
-                )}
               </Box>
+              {selectedIds.includes(addon.id) && (
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end' }}>
+                  <Typography variant="body2" color="text.secondary" sx={{ mr: 1 }}>
+                    Version:
+                  </Typography>
+                  <FormControl size="small" sx={{ minWidth: 145 }}>
+                    <Select
+                      value={config.addons.find(a => a.id === addon.id)?.version || ''}
+                      onChange={(e: SelectChangeEvent<string>) => handleVersionChange(addon.id, e.target.value)}
+                      displayEmpty
+                      sx={{ height: 32 }}
+                    >
+                      {getAvailableVersions(addon).map(version => (
+                        <MenuItem
+                          key={version.version}
+                          value={version.version}
+                          sx={{
+                            fontWeight: version.defaultVersion || version.isLatest ? 'bold' : 'normal',
+                            color: version.defaultVersion ? 'primary.main' : 'inherit'
+                          }}
+                        >
+                          {version.version}
+                          {version.defaultVersion && ' (Default)'}
+                          {version.isLatest && !version.defaultVersion && ' (Latest)'}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                </Box>
+              )}
             </CardContent>
           </Card>
+          </Grid>
         ))}
-      </Stack>
+      </Grid>
     </Box>
   );
 };

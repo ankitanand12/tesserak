@@ -104,6 +104,17 @@ const sampleClusterDetail = {
       subnets: ['subnet-111aaa'],
     },
   ],
+  workerNodes: [
+    {
+      instanceId: 'i-0worker123456',
+      name: 'tesserak-ng-node-1',
+      nodegroupName: 'ng-workers',
+      instanceType: 't3.medium',
+      availabilityZone: 'us-east-1a',
+      privateIpAddress: '10.0.1.42',
+      state: 'running',
+    },
+  ],
   fargateProfiles: [],
   addons: [
     {
@@ -196,6 +207,30 @@ describe('ClusterDetails page', () => {
           json: async () => ({ message: 'Cluster synced' }),
         } as Response;
       }
+      if (url.includes('/api/aws/eks-ami/162655485574/us-east-1')) {
+        return {
+          ok: true,
+          json: async () => ({ amiId: 'ami-0134recommended', kubernetesVersion: '1.34' }),
+        } as Response;
+      }
+      if (url.endsWith('/clusters/tesserak/nodegroups') && init?.method === 'POST') {
+        return {
+          ok: true,
+          json: async () => ({ nodegroupName: 'tesserak-ng', status: 'CREATING' }),
+        } as Response;
+      }
+      if (url.endsWith('/clusters/tesserak/nodegroups/ng-workers') && init?.method === 'PATCH') {
+        return {
+          ok: true,
+          json: async () => ({ id: 'upd-scale-1', status: 'InProgress' }),
+        } as Response;
+      }
+      if (url.endsWith('/clusters/tesserak/nodegroups/ng-workers') && init?.method === 'DELETE') {
+        return {
+          ok: true,
+          json: async () => ({ nodegroupName: 'ng-workers', status: 'DELETING' }),
+        } as Response;
+      }
       if (url.endsWith('/clusters/tesserak')) {
         return {
           ok: true,
@@ -220,12 +255,37 @@ describe('ClusterDetails page', () => {
 
     // Compute & Add-ons tab (tab 1)
     fireEvent.click(screen.getByRole('tab', { name: /Compute & Add-ons/i }));
-    expect(screen.getByText('ng-workers')).toBeInTheDocument();
+    expect(screen.getAllByText('ng-workers').length).toBeGreaterThan(0);
+    expect(screen.getByText('i-0worker123456')).toBeInTheDocument();
     expect(screen.getByText('vpc-cni')).toBeInTheDocument();
     expect(screen.getByText('v1.22.4-eksbuild.14')).toBeInTheDocument();
 
+    // Add Node Group dialog
+    fireEvent.click(screen.getByRole('button', { name: 'Add Node Group' }));
+    await waitFor(() => {
+      expect(screen.getByDisplayValue('ami-0134recommended')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Create Node Group' }));
+    await waitFor(() => {
+      expect(screen.getByText('Node group "tesserak-ng" creation initiated on AWS EKS.')).toBeInTheDocument();
+    });
+
+    // Scale Node Group dialog
+    fireEvent.click(await screen.findByRole('button', { name: 'Scale' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Apply Scaling' }));
+    await waitFor(() => {
+      expect(screen.getByText('Scaling update started for node group "ng-workers".')).toBeInTheDocument();
+    });
+
+    // Delete Node Group dialog
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Confirm Delete' }));
+    await waitFor(() => {
+      expect(screen.getByText('Node group "ng-workers" deletion initiated.')).toBeInTheDocument();
+    });
+
     // Networking tab (tab 2)
-    fireEvent.click(screen.getByRole('tab', { name: /Networking/i }));
+    fireEvent.click(await screen.findByRole('tab', { name: /Networking/i }));
     expect(screen.getByText('tesserak-vpc (vpc-0d8a17ab04fc40a71)')).toBeInTheDocument();
     expect(screen.getByText('sg-0cluster123')).toBeInTheDocument();
     expect(screen.getByText('10.100.0.0/16 (ipv4)')).toBeInTheDocument();

@@ -44,6 +44,10 @@ AWS_FAST_CFG = Config(connect_timeout=4, read_timeout=10, retries={"max_attempts
 _EKS_META_CACHE: Dict[str, tuple[float, Any]] = {}
 _CLUSTER_LIST_CACHE: Dict[str, tuple[float, List[Any]]] = {}
 _COMMUNITY_ADDON_REPOS = {
+    "ingress-nginx": {
+        "repo": "kubernetes/ingress-nginx",
+        "fallback": ["4.12.1", "4.11.5", "4.11.3", "4.10.6"],
+    },
     "external-dns": {
         "repo": "kubernetes-sigs/external-dns",
         "fallback": ["0.20.0", "0.19.0", "0.18.0", "0.17.0", "0.16.0"],
@@ -56,6 +60,62 @@ _COMMUNITY_ADDON_REPOS = {
         "repo": "kubernetes-sigs/metrics-server",
         "fallback": ["0.8.0", "0.7.2", "0.7.1", "0.7.0", "0.6.4"],
     },
+    "argo-cd": {
+        "repo": "argoproj/argo-cd",
+        "fallback": ["2.14.8", "2.14.5", "2.13.4", "2.12.11"],
+    },
+    "argo-workflow": {
+        "repo": "argoproj/argo-workflows",
+        "fallback": ["3.6.5", "3.6.2", "3.5.14"],
+    },
+    "reloader": {
+        "repo": "stakater/Reloader",
+        "fallback": ["1.4.1", "1.3.0", "1.2.1", "1.1.0"],
+    },
+    "cluster-proportional-autoscaler": {
+        "repo": "kubernetes-sigs/cluster-proportional-autoscaler",
+        "fallback": ["1.9.0", "1.8.8", "1.8.6"],
+    },
+    "cluster-autoscaler": {
+        "repo": "kubernetes/autoscaler",
+        "fallback": ["1.32.1", "1.31.2", "1.30.3"],
+    },
+    "karpenter": {
+        "repo": "aws/karpenter-provider-aws",
+        "fallback": ["1.3.3", "1.2.4", "1.1.5", "1.0.9"],
+    },
+    "aws-load-balancer-controller": {
+        "repo": "kubernetes-sigs/aws-load-balancer-controller",
+        "fallback": ["2.12.0", "2.11.0", "2.10.1"],
+    },
+    "grafana-stack": {
+        "repo": "prometheus-community/helm-charts",
+        "fallback": ["70.4.2", "69.8.2", "68.4.4"],
+    },
+    "ops-agent": {
+        "repo": None,
+        "fallback": ["1.4.2", "1.3.0", "1.2.0"],
+    },
+    "debug-agent": {
+        "repo": None,
+        "fallback": ["1.2.0", "1.1.0", "1.0.0"],
+    },
+}
+
+_ALLOWED_EKS_AMI_TYPES = {
+    "amazon-linux-2023/x86_64/standard": "Standard x86_64",
+    "amazon-linux-2023/arm64/standard": "Standard ARM64 (Graviton)",
+    "amazon-linux-2023/x86_64/nvidia": "NVIDIA GPU (x86_64)",
+    "amazon-linux-2023/arm64/nvidia": "NVIDIA GPU (ARM64)",
+    "amazon-linux-2023/x86_64/neuron": "AWS Neuron / Inferentia / Trainium (x86_64)",
+}
+
+_SSM_AMI_TO_EKS_ENUM = {
+    "amazon-linux-2023/x86_64/standard": "AL2023_x86_64_STANDARD",
+    "amazon-linux-2023/arm64/standard": "AL2023_ARM_64_STANDARD",
+    "amazon-linux-2023/x86_64/nvidia": "AL2023_x86_64_NVIDIA",
+    "amazon-linux-2023/arm64/nvidia": "AL2023_ARM_64_NVIDIA",
+    "amazon-linux-2023/x86_64/neuron": "AL2023_x86_64_NEURON",
 }
 
 
@@ -198,11 +258,15 @@ def _get_eks_supported_versions_sync(conn: Any, region: Optional[str] = None) ->
                         continue
                     ver = cv.get("clusterVersion")
                     if ver:
+                        std_end = cv.get("endOfStandardSupportDate")
+                        ext_end = cv.get("endOfExtendedSupportDate")
                         items.append(
                             {
                                 "version": ver,
                                 "status": status or "STANDARD_SUPPORT",
                                 "awsDefault": bool(cv.get("defaultVersion", False)),
+                                "endOfStandardSupport": std_end.isoformat() if hasattr(std_end, "isoformat") else std_end,
+                                "endOfExtendedSupport": ext_end.isoformat() if hasattr(ext_end, "isoformat") else ext_end,
                             }
                         )
         except Exception as exc:
@@ -266,7 +330,8 @@ def _fetch_all_addon_versions_sync(conn: Any, eks_version: str, region: Optional
         'aws-ebs-csi-driver': {'name': 'aws-ebs-csi-driver', 'default': 'v1.25.0-eksbuild.1'},
         'aws-efs-csi-driver': {'name': 'aws-efs-csi-driver', 'default': 'v1.7.0-eksbuild.1'},
         'aws-fsx-csi-driver': {'name': 'aws-fsx-csi-driver', 'default': 'v1.7.0-eksbuild.1'},
-        'eks-pod-identity-agent': {'name': 'eks-pod-identity-agent', 'default': 'v1.0.0-eksbuild.1'}
+        'eks-pod-identity-agent': {'name': 'eks-pod-identity-agent', 'default': 'v1.0.0-eksbuild.1'},
+        'snapshot-controller': {'name': 'snapshot-controller', 'default': 'v8.1.1-eksbuild.1'},
     }
 
     def _fetch_one(frontend_id: str, addon_info: Dict[str, str]):
@@ -407,6 +472,15 @@ class ClusterRequest(BaseModel):
     accountId: Optional[str] = None
     region: str
     vpc: Optional[VpcSelection] = None
+    amiType: Optional[str] = "amazon-linux-2023/x86_64/standard"
+    amiId: Optional[str] = None
+    amiManual: bool = False
+    createNodeGroup: bool = True
+    capacityType: str = "ON_DEMAND"
+    diskSize: int = 20
+    publicSubnets: Optional[List[str]] = []
+    privateSubnets: Optional[List[str]] = []
+    enableClusterLogs: bool = False
     environment: Optional[EnvironmentConfigModel] = None
     tags: Optional[List[TagModel]] = []
     addons: Optional[List[AddonModel]] = []
@@ -416,6 +490,27 @@ class ClusterRequest(BaseModel):
     minNodes: int = 1
     maxNodes: int = 3
     roleArn: Optional[str] = None
+
+
+class NodeGroupCreateRequest(BaseModel):
+    nodegroupName: str
+    amiType: str = "amazon-linux-2023/x86_64/standard"
+    amiId: Optional[str] = None
+    amiManual: bool = False
+    instanceTypes: List[str] = ["t3.medium"]
+    capacityType: str = "ON_DEMAND"
+    minSize: int = 1
+    desiredSize: int = 2
+    maxSize: int = 4
+    diskSize: int = 20
+    subnets: Optional[List[str]] = []
+    nodeRoleArn: Optional[str] = None
+
+
+class NodeGroupScaleRequest(BaseModel):
+    minSize: int = 1
+    desiredSize: int = 2
+    maxSize: int = 4
 
 class ClusterResponse(BaseModel):
     name: str
@@ -609,7 +704,8 @@ def _create_eks_cluster_sync(conn: Any, cluster: ClusterRequest, user_email: str
 
     vpc_id = cluster.vpc.id if cluster.vpc and cluster.vpc.id else None
     azs = env_cfg.availabilityZones if env_cfg else []
-    subnet_ids = _resolve_cluster_subnets(ec2_client, vpc_id, azs)
+    explicit_subnets = list(dict.fromkeys([s for s in ([*(cluster.publicSubnets or []), *(cluster.privateSubnets or [])]) if s]))
+    subnet_ids = explicit_subnets if len(explicit_subnets) >= 2 else _resolve_cluster_subnets(ec2_client, vpc_id, azs)
     role_arn = _resolve_eks_role_arn(iam_client, cluster.roleArn)
 
     tags_dict = {
@@ -626,17 +722,28 @@ def _create_eks_cluster_sync(conn: Any, cluster: ClusterRequest, user_email: str
     initial_state = state_data.create_initial_state(create_payload, user_email)
     state_manager.save_cluster_state(user_email, cluster.name, initial_state)
 
-    response = eks_client.create_cluster(
-        name=cluster.name,
-        version=k8s_version,
-        roleArn=role_arn,
-        resourcesVpcConfig={
+    create_kwargs: Dict[str, Any] = {
+        "name": cluster.name,
+        "version": k8s_version,
+        "roleArn": role_arn,
+        "resourcesVpcConfig": {
             "subnetIds": subnet_ids,
             "endpointPublicAccess": pub_access,
             "endpointPrivateAccess": priv_access,
         },
-        tags=tags_dict,
-    )
+        "tags": tags_dict,
+    }
+    if cluster.enableClusterLogs:
+        create_kwargs["logging"] = {
+            "clusterLogging": [
+                {
+                    "types": ["api", "audit", "authenticator", "controllerManager", "scheduler"],
+                    "enabled": True,
+                }
+            ]
+        }
+
+    response = eks_client.create_cluster(**create_kwargs)
     aws_cluster = response["cluster"]
     aws_details = {
         "status": aws_cluster["status"],
@@ -656,8 +763,10 @@ async def _finalize_cluster_addons(
     cluster_name: str,
     addons: List[AddonModel],
     eks_version: str,
+    nodegroup_req: Optional[NodeGroupCreateRequest] = None,
+    user_email: str = "",
 ) -> None:
-    if not addons:
+    if not addons and not nodegroup_req:
         return
     try:
         eks_client = boto3.client(
@@ -673,13 +782,25 @@ async def _finalize_cluster_addons(
                 WaiterConfig={"Delay": 30, "MaxAttempts": 40},
             )
         )
+        if nodegroup_req:
+            try:
+                await asyncio.to_thread(
+                    _create_nodegroup_sync,
+                    conn,
+                    cluster_name,
+                    nodegroup_req,
+                    user_email,
+                    region,
+                )
+            except Exception as ng_exc:
+                logger.warning(f"Initial nodegroup creation skipped/failed for {cluster_name}: {ng_exc}")
         for addon in addons:
             if addon.type == "aws":
                 await install_aws_addon(eks_client, cluster_name, addon, eks_version)
             else:
                 await install_community_addon(cluster_name, addon)
     except Exception as exc:
-        logger.warning(f"Background addon installation skipped/failed for {cluster_name}: {exc}")
+        logger.warning(f"Background addon/nodegroup finalization skipped/failed for {cluster_name}: {exc}")
 
 
 @app.post("/clusters", response_model=ClusterResponse, dependencies=[Depends(require_auth_if_configured)])
@@ -700,14 +821,31 @@ async def create_cluster(cluster: ClusterRequest, x_user_email: str = Header(...
         )
         invalidate_cluster_list_cache(x_user_email)
 
-        if cluster.addons:
+        initial_ng_req = None
+        if cluster.createNodeGroup:
+            initial_ng_req = NodeGroupCreateRequest(
+                nodegroupName=cluster.nodeGroupName or f"{cluster.name}-ng",
+                amiType=cluster.amiType or "amazon-linux-2023/x86_64/standard",
+                amiId=cluster.amiId,
+                amiManual=bool(cluster.amiManual),
+                instanceTypes=[cluster.instanceType or "t3.medium"],
+                capacityType=(cluster.capacityType or "ON_DEMAND").upper(),
+                minSize=max(0, int(cluster.minNodes)),
+                desiredSize=max(1, int(cluster.desiredNodes)),
+                maxSize=max(1, int(cluster.maxNodes)),
+                diskSize=max(20, int(cluster.diskSize)),
+            )
+
+        if cluster.addons or initial_ng_req:
             asyncio.create_task(
                 _finalize_cluster_addons(
                     conn,
                     region,
                     cluster.name,
-                    cluster.addons,
-                    aws_cluster.get("version", "1.33"),
+                    cluster.addons or [],
+                    aws_cluster.get("version", "1.37"),
+                    nodegroup_req=initial_ng_req,
+                    user_email=x_user_email,
                 )
             )
 
@@ -896,6 +1034,7 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
                     "cluster": None,
                     "networking": {},
                     "nodegroups": [],
+                    "workerNodes": [],
                     "fargateProfiles": [],
                     "addons": [],
                     "updateHistory": [],
@@ -946,6 +1085,40 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
         updates = [local_eks.describe_update(name=cluster_name, updateId=uid)["update"] for uid in upd_ids[:15]]
         updates.sort(key=lambda u: str(u.get("createdAt", "")), reverse=True)
         return updates
+
+    def _fetch_worker_nodes():
+        try:
+            local_ec2 = boto3.client(
+                "ec2",
+                aws_access_key_id=connection.accessKey,
+                aws_secret_access_key=connection.secretKey,
+                region_name=region,
+                config=AWS_FAST_CFG,
+            )
+            resp = local_ec2.describe_instances(
+                Filters=[
+                    {"Name": "tag:eks:cluster-name", "Values": [cluster_name]},
+                    {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
+                ]
+            )
+            nodes = []
+            for res in resp.get("Reservations", []):
+                for inst in res.get("Instances", []):
+                    tags = {t.get("Key", ""): t.get("Value", "") for t in inst.get("Tags", [])}
+                    nodes.append({
+                        "instanceId": inst.get("InstanceId"),
+                        "name": tags.get("Name") or inst.get("InstanceId"),
+                        "nodegroupName": tags.get("eks:nodegroup-name", "—"),
+                        "instanceType": inst.get("InstanceType"),
+                        "availabilityZone": inst.get("Placement", {}).get("AvailabilityZone"),
+                        "privateIpAddress": inst.get("PrivateIpAddress"),
+                        "publicIpAddress": inst.get("PublicIpAddress"),
+                        "state": inst.get("State", {}).get("Name", "unknown"),
+                        "launchTime": inst.get("LaunchTime"),
+                    })
+            return nodes
+        except Exception:
+            return []
 
     def _fetch_networking():
         vpc_details = {}
@@ -1002,18 +1175,20 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
             "kubernetesNetworkConfig": cluster_info.get("kubernetesNetworkConfig", {}),
         }
 
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=6) as pool:
         f_ng = pool.submit(_fetch_nodegroups)
         f_ad = pool.submit(_fetch_addons)
         f_fg = pool.submit(_fetch_fargate)
         f_up = pool.submit(_fetch_updates)
         f_net = pool.submit(_fetch_networking)
+        f_nodes = pool.submit(_fetch_worker_nodes)
 
         nodegroups = f_ng.result()
         addons = f_ad.result()
         fargate_profiles = f_fg.result()
         updates = f_up.result()
         networking = f_net.result()
+        worker_nodes = f_nodes.result()
 
     aws_state = {
         "status": cluster_info["status"],
@@ -1055,6 +1230,7 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
         },
         "networking": networking,
         "nodegroups": nodegroups,
+        "workerNodes": worker_nodes,
         "fargateProfiles": fargate_profiles,
         "addons": addons,
         "updateHistory": updates,
@@ -1090,6 +1266,246 @@ async def get_cluster_details(cluster_name: str, x_user_email: str = Header(...)
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _resolve_eks_node_role_arn(iam_client: Any, explicit_role: Optional[str] = None) -> str:
+    if explicit_role and explicit_role.strip():
+        return explicit_role.strip()
+    env_role = os.getenv("EKS_NODE_ROLE_ARN", "").strip()
+    if env_role:
+        return env_role
+
+    candidates = []
+    for role in iam_client.list_roles(MaxItems=200).get("Roles", []):
+        arn = role.get("Arn", "")
+        if "/aws-service-role/" in arn:
+            continue
+        doc = json.dumps(role.get("AssumeRolePolicyDocument", {}))
+        if "ec2.amazonaws.com" in doc:
+            candidates.append((role.get("RoleName", ""), arn))
+
+    for preferred in ("tesserakeksnodegrouprole", "amazoneksnoderole", "eks-node-role", "eksworkernoderole"):
+        for rname, rarn in candidates:
+            if rname.lower() == preferred:
+                return rarn
+    for rname, rarn in candidates:
+        if "node" in rname.lower() or "worker" in rname.lower() or "eks" in rname.lower():
+            try:
+                attached = [p["PolicyArn"] for p in iam_client.list_attached_role_policies(RoleName=rname).get("AttachedPolicies", [])]
+                if "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy" in attached:
+                    return rarn
+            except Exception:
+                pass
+
+    role_name = "TesserakEKSNodeGroupRole"
+    try:
+        existing = iam_client.get_role(RoleName=role_name)
+        return existing["Role"]["Arn"]
+    except iam_client.exceptions.NoSuchEntityException:
+        pass
+
+    trust_policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "ec2.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        }],
+    })
+    created = iam_client.create_role(
+        RoleName=role_name,
+        AssumeRolePolicyDocument=trust_policy,
+        Description="EKS Worker Node Group Role managed by Tesserak",
+    )
+    for policy_arn in (
+        "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+        "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
+        "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
+    ):
+        iam_client.attach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
+    time.sleep(6)
+    return created["Role"]["Arn"]
+
+
+def _create_nodegroup_sync(
+    connection: Any,
+    cluster_name: str,
+    req: NodeGroupCreateRequest,
+    user_email: str,
+    region_override: Optional[str] = None,
+) -> Dict[str, Any]:
+    if req.minSize > req.desiredSize or req.desiredSize > req.maxSize:
+        raise HTTPException(
+            status_code=400,
+            detail="Scaling config must satisfy minSize <= desiredSize <= maxSize.",
+        )
+
+    region = region_override or connection.region or "us-east-1"
+    sess = boto3.Session(
+        aws_access_key_id=connection.accessKey,
+        aws_secret_access_key=connection.secretKey,
+        region_name=region,
+    )
+    eks = sess.client("eks", config=AWS_FAST_CFG)
+    iam = sess.client("iam", config=AWS_FAST_CFG)
+    ec2 = sess.client("ec2", config=AWS_FAST_CFG)
+
+    cluster_info = eks.describe_cluster(name=cluster_name)["cluster"]
+    subnets = [s for s in (req.subnets or []) if s] or (cluster_info.get("resourcesVpcConfig", {}).get("subnetIds") or [])
+    if not subnets:
+        raise HTTPException(status_code=400, detail="No subnets available on cluster for node group creation.")
+
+    node_role_arn = _resolve_eks_node_role_arn(iam, req.nodeRoleArn)
+    instance_types = [i.strip() for i in (req.instanceTypes or ["t3.medium"]) if i.strip()] or ["t3.medium"]
+    capacity_type = (req.capacityType or "ON_DEMAND").upper()
+
+    ng_kwargs: Dict[str, Any] = {
+        "clusterName": cluster_name,
+        "nodegroupName": req.nodegroupName.strip(),
+        "scalingConfig": {
+            "minSize": req.minSize,
+            "desiredSize": req.desiredSize,
+            "maxSize": req.maxSize,
+        },
+        "subnets": subnets,
+        "nodeRole": node_role_arn,
+        "instanceTypes": instance_types,
+        "capacityType": capacity_type,
+        "tags": {"ManagedBy": "Tesserak"},
+    }
+
+    if req.amiManual and req.amiId and req.amiId.strip():
+        lt_name = f"tesserak-{cluster_name}-{req.nodegroupName.strip()}-{int(time.time())}"[:128]
+        lt_resp = ec2.create_launch_template(
+            LaunchTemplateName=lt_name,
+            LaunchTemplateData={
+                "ImageId": req.amiId.strip(),
+                "BlockDeviceMappings": [
+                    {
+                        "DeviceName": "/dev/xvda",
+                        "Ebs": {"VolumeSize": max(20, int(req.diskSize)), "VolumeType": "gp3"},
+                    }
+                ],
+            },
+        )
+        ng_kwargs["launchTemplate"] = {
+            "id": lt_resp["LaunchTemplate"]["LaunchTemplateId"],
+            "version": "$Latest",
+        }
+        ng_kwargs["amiType"] = "CUSTOM"
+    else:
+        eks_ami_enum = _SSM_AMI_TO_EKS_ENUM.get(req.amiType) or (
+            req.amiType if req.amiType in set(_SSM_AMI_TO_EKS_ENUM.values()) else "AL2023_x86_64_STANDARD"
+        )
+        ng_kwargs["amiType"] = eks_ami_enum
+        ng_kwargs["diskSize"] = max(20, int(req.diskSize))
+
+    resp = eks.create_nodegroup(**ng_kwargs)
+    ng = resp.get("nodegroup", {})
+    if user_email:
+        try:
+            current_state = state_manager.get_cluster_state(user_email, cluster_name) or {
+                "name": cluster_name,
+                "region": region,
+            }
+            updated = state_data.record_state_change(
+                current_state,
+                "nodegroup_created",
+                {"nodegroupName": req.nodegroupName.strip(), "instanceTypes": instance_types, "amiType": ng_kwargs.get("amiType"), "amiId": req.amiId},
+            )
+            state_manager.save_cluster_state(user_email, cluster_name, updated)
+        except Exception:
+            pass
+    invalidate_cluster_list_cache(user_email)
+    return json.loads(json.dumps(ng, default=str))
+
+
+@app.post("/clusters/{cluster_name}/nodegroups", dependencies=[Depends(require_auth_if_configured)])
+async def create_cluster_nodegroup(
+    cluster_name: str,
+    payload: NodeGroupCreateRequest,
+    x_user_email: str = Header(...),
+):
+    try:
+        connection = await connection_manager.get_valid_connection(x_user_email)
+        if not connection:
+            raise HTTPException(status_code=400, detail="No valid AWS connection found.")
+        return await asyncio.to_thread(_create_nodegroup_sync, connection, cluster_name, payload, x_user_email)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Node group creation failed: {str(e)}")
+
+
+@app.patch("/clusters/{cluster_name}/nodegroups/{nodegroup_name}", dependencies=[Depends(require_auth_if_configured)])
+async def scale_cluster_nodegroup(
+    cluster_name: str,
+    nodegroup_name: str,
+    payload: NodeGroupScaleRequest,
+    x_user_email: str = Header(...),
+):
+    if payload.minSize > payload.desiredSize or payload.desiredSize > payload.maxSize:
+        raise HTTPException(status_code=400, detail="Scaling config must satisfy minSize <= desiredSize <= maxSize.")
+    try:
+        connection = await connection_manager.get_valid_connection(x_user_email)
+        if not connection:
+            raise HTTPException(status_code=400, detail="No valid AWS connection found.")
+
+        def _scale_sync():
+            eks = boto3.client(
+                "eks",
+                aws_access_key_id=connection.accessKey,
+                aws_secret_access_key=connection.secretKey,
+                region_name=connection.region or "us-east-1",
+                config=AWS_FAST_CFG,
+            )
+            resp = eks.update_nodegroup_config(
+                clusterName=cluster_name,
+                nodegroupName=nodegroup_name,
+                scalingConfig={
+                    "minSize": payload.minSize,
+                    "desiredSize": payload.desiredSize,
+                    "maxSize": payload.maxSize,
+                },
+            )
+            return json.loads(json.dumps(resp.get("update", {}), default=str))
+
+        invalidate_cluster_list_cache(x_user_email)
+        return await asyncio.to_thread(_scale_sync)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Node group scaling failed: {str(e)}")
+
+
+@app.delete("/clusters/{cluster_name}/nodegroups/{nodegroup_name}", dependencies=[Depends(require_auth_if_configured)])
+async def delete_cluster_nodegroup(
+    cluster_name: str,
+    nodegroup_name: str,
+    x_user_email: str = Header(...),
+):
+    try:
+        connection = await connection_manager.get_valid_connection(x_user_email)
+        if not connection:
+            raise HTTPException(status_code=400, detail="No valid AWS connection found.")
+
+        def _delete_ng_sync():
+            eks = boto3.client(
+                "eks",
+                aws_access_key_id=connection.accessKey,
+                aws_secret_access_key=connection.secretKey,
+                region_name=connection.region or "us-east-1",
+                config=AWS_FAST_CFG,
+            )
+            resp = eks.delete_nodegroup(clusterName=cluster_name, nodegroupName=nodegroup_name)
+            return json.loads(json.dumps(resp.get("nodegroup", {}), default=str))
+
+        invalidate_cluster_list_cache(x_user_email)
+        return await asyncio.to_thread(_delete_ng_sync)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Node group deletion failed: {str(e)}")
 
 
 @app.delete("/clusters/{cluster_name}", dependencies=[Depends(require_auth_if_configured)])
@@ -1367,6 +1783,139 @@ async def get_aws_availability_zones(account_id: str, region: str, x_user_email:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/aws/subnets/{account_id}/{region}/{vpc_id}", dependencies=[Depends(require_auth_if_configured)])
+async def get_aws_vpc_subnets(account_id: str, region: str, vpc_id: str, x_user_email: str = Header(...)):
+    try:
+        cache_key = f"subnets:{account_id}:{region}:{vpc_id}"
+        cached = _EKS_META_CACHE.get(cache_key)
+        if cached and cached[0] > time.monotonic():
+            return cached[1]
+
+        connection = await connection_manager.get_valid_connection(x_user_email)
+        if not connection:
+            raise HTTPException(status_code=400, detail="No active connection found")
+
+        def _fetch_subnets_sync():
+            client = boto3.client(
+                "ec2",
+                aws_access_key_id=connection.accessKey,
+                aws_secret_access_key=connection.secretKey,
+                region_name=region,
+                config=AWS_FAST_CFG,
+            )
+            subnets = []
+            for sub in client.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]).get("Subnets", []):
+                name = next((t.get("Value", "") for t in sub.get("Tags", []) if t.get("Key") == "Name"), "")
+                map_public = bool(sub.get("MapPublicIpOnLaunch", False))
+                is_public = map_public or ("public" in name.lower())
+                subnets.append({
+                    "id": sub["SubnetId"],
+                    "name": name or sub["SubnetId"],
+                    "cidr": sub.get("CidrBlock", ""),
+                    "availabilityZone": sub.get("AvailabilityZone", ""),
+                    "isPublic": is_public,
+                    "availableIpAddressCount": sub.get("AvailableIpAddressCount"),
+                })
+            subnets.sort(key=lambda s: (not s["isPublic"], s["availabilityZone"], s["name"]))
+            return subnets
+
+        subnets = await asyncio.to_thread(_fetch_subnets_sync)
+        _EKS_META_CACHE[cache_key] = (time.monotonic() + 60.0, subnets)
+        return subnets
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _get_eks_ami_sync(
+    connection: Any,
+    region: str,
+    ami_type: str,
+    kubernetes_version: Optional[str] = None,
+) -> Dict[str, Any]:
+    clean_ami_type = (ami_type or "amazon-linux-2023/x86_64/standard").strip().lstrip("/")
+    if clean_ami_type not in _ALLOWED_EKS_AMI_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported AMI type '{clean_ami_type}'. Allowed values: {', '.join(_ALLOWED_EKS_AMI_TYPES.keys())}",
+        )
+
+    target_k8s = (kubernetes_version or "").strip()
+    if not target_k8s:
+        supported = _get_eks_supported_versions_sync(connection, region)
+        target_k8s = supported.get("latest") or "1.35"
+
+    cache_key = f"eks_ami:{region}:{target_k8s}:{clean_ami_type}"
+    cached = _EKS_META_CACHE.get(cache_key)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+
+    ssm = boto3.client(
+        "ssm",
+        aws_access_key_id=connection.accessKey,
+        aws_secret_access_key=connection.secretKey,
+        region_name=region,
+        config=AWS_FAST_CFG,
+    )
+
+    candidate_versions = [target_k8s]
+    if not kubernetes_version:
+        supported = _get_eks_supported_versions_sync(connection, region)
+        for v in supported.get("versions", []):
+            ver = v.get("version")
+            if ver and ver not in candidate_versions:
+                candidate_versions.append(ver)
+
+    last_err = None
+    for ver in candidate_versions[:4]:
+        param_name = f"/aws/service/eks/optimized-ami/{ver}/{clean_ami_type}/recommended/image_id"
+        try:
+            resp = ssm.get_parameter(Name=param_name)
+            param = resp.get("Parameter", {})
+            last_mod = param.get("LastModifiedDate")
+            result = {
+                "amiId": param.get("Value", ""),
+                "amiType": clean_ami_type,
+                "amiLabel": _ALLOWED_EKS_AMI_TYPES[clean_ami_type],
+                "kubernetesVersion": ver,
+                "region": region,
+                "parameterName": param_name,
+                "lastModified": last_mod.isoformat() if hasattr(last_mod, "isoformat") else last_mod,
+            }
+            _EKS_META_CACHE[cache_key] = (time.monotonic() + 300.0, result)
+            return result
+        except ssm.exceptions.ParameterNotFound as exc:
+            last_err = exc
+            if kubernetes_version:
+                break
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"No recommended AWS EKS AMI found in {region} for Kubernetes {target_k8s} ({clean_ami_type}): {last_err}",
+    )
+
+
+@app.get("/api/aws/eks-ami/{account_id}/{region}", dependencies=[Depends(require_auth_if_configured)])
+async def get_eks_recommended_ami(
+    account_id: str,
+    region: str,
+    ami_type: str = "amazon-linux-2023/x86_64/standard",
+    kubernetes_version: Optional[str] = None,
+    x_user_email: str = Header(...),
+):
+    try:
+        connection = await connection_manager.get_valid_connection(x_user_email)
+        if not connection:
+            raise HTTPException(status_code=400, detail="No active connection found")
+        return await asyncio.to_thread(_get_eks_ami_sync, connection, region, ami_type, kubernetes_version)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch recommended EKS AMI: {str(e)}")
+
 
 from tesserak_router import public_router as tesserak_public_router, router as tesserak_router
 app.include_router(tesserak_public_router)

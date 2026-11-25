@@ -28,6 +28,8 @@ const baseConfig: ClusterConfig = {
   accountName: 'Deloitte',
   region: 'us-east-1',
   vpc: { id: 'vpc-0d8a17ab04fc40a71', isNew: false },
+  amiType: 'amazon-linux-2023/x86_64/standard',
+  amiId: '',
   environment: {
     type: 'Non-Prod',
     endpoint: 'public-private',
@@ -161,5 +163,88 @@ describe('CreateCluster wizard fixes', () => {
         ]),
       })
     );
+
+    expect(screen.getByLabelText(/Karpenter/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Grafana Stack/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/CSI Snapshot Controller/i)).toBeInTheDocument();
+  });
+
+  test('auto-fills recommended AWS SSM AMI ID in Environment Setup, updates on K8s version or AMI type change, and supports manual edit', async () => {
+    const fetchMock = jest.fn((url: RequestInfo | URL) => {
+      const s = url.toString();
+      if (s.includes('/api/aws/eks-versions')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            versions: [
+              { version: '1.37', status: 'STANDARD_SUPPORT', isLatest: true },
+              { version: '1.35', status: 'STANDARD_SUPPORT', isLatest: false },
+            ],
+            latest: '1.37',
+          }),
+        } as Response);
+      }
+      if (s.includes('/api/aws/zones/')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => [{ name: 'us-east-1a' }, { name: 'us-east-1b' }],
+        } as Response);
+      }
+      if (s.includes('/api/aws/eks-ami/162655485574/us-east-1')) {
+        const isArm = s.includes('arm64');
+        const is135 = s.includes('kubernetes_version=1.35');
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            amiId: isArm
+              ? 'ami-0arm64recommended'
+              : is135
+              ? 'ami-0d4c5f36cb9ec8fdf'
+              : 'ami-00975b531d8dc8286',
+            amiType: isArm ? 'amazon-linux-2023/arm64/standard' : 'amazon-linux-2023/x86_64/standard',
+            kubernetesVersion: is135 ? '1.35' : '1.37',
+            region: 'us-east-1',
+          }),
+        } as Response);
+      }
+      return Promise.resolve({ ok: true, json: async () => [] } as Response);
+    });
+    global.fetch = fetchMock as any;
+
+    const Wrapper: React.FC = () => {
+      const [cfg, setCfg] = React.useState<ClusterConfig>(baseConfig);
+      return <ClusterEnvironment config={cfg} onChange={setCfg} />;
+    };
+
+    render(<Wrapper />);
+
+    // Open Configure Environment dialog by choosing Production
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    fireEvent.click(screen.getByRole('option', { name: 'Production' }));
+
+    await waitFor(() => {
+      expect(screen.getByDisplayValue('ami-00975b531d8dc8286')).toBeInTheDocument();
+    });
+
+    // Switch Kubernetes Version to 1.35 -> AMI updates for 1.35
+    fireEvent.mouseDown(screen.getByText(/1\.37 \(Latest\)/i));
+    fireEvent.click(screen.getByText('1.35'));
+
+    await waitFor(() => {
+      expect(screen.getByDisplayValue('ami-0d4c5f36cb9ec8fdf')).toBeInTheDocument();
+    });
+
+    // Switch AMI Type to ARM64 -> AMI updates for ARM64
+    fireEvent.mouseDown(screen.getByText(/Standard x86_64/i));
+    fireEvent.click(screen.getByText(/Standard ARM64 \(Graviton\)/i));
+
+    await waitFor(() => {
+      expect(screen.getByDisplayValue('ami-0arm64recommended')).toBeInTheDocument();
+    });
+
+    const amiInput = screen.getByLabelText(/AMI ID/i);
+    fireEvent.change(amiInput, { target: { value: 'ami-custommanual01' } });
+    expect(screen.getByDisplayValue('ami-custommanual01')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Use Recommended' })).toBeInTheDocument();
   });
 });
