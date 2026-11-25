@@ -29,14 +29,19 @@ import {
   Refresh as RefreshIcon,
   Terminal as TerminalIcon,
 } from '@mui/icons-material';
+import { useLocation } from 'react-router-dom';
 import { Perspective3DCard } from '../components/Perspective3DCard';
 import { ClusterTarget, IntegrationItem, PipelineItem } from '../types/atmosly';
 
 export const Pipelines: React.FC = () => {
+  const location = useLocation();
+  const requestedPipelineId = new URLSearchParams(location.search).get('pipelineId');
   const [pipelines, setPipelines] = useState<PipelineItem[]>([]);
   const [clusterTargets, setClusterTargets] = useState<ClusterTarget[]>([]);
   const [gitIntegrations, setGitIntegrations] = useState<IntegrationItem[]>([]);
-  const [selectedLogPipelineId, setSelectedLogPipelineId] = useState<string | null>(null);
+  const [selectedLogPipelineId, setSelectedLogPipelineId] = useState<string | null>(
+    requestedPipelineId
+  );
   const [createOpen, setCreateOpen] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -91,6 +96,12 @@ export const Pipelines: React.FC = () => {
       setError('Unable to reach backend CI/CD runner');
     }
   }, [userEmail, selectedLogPipelineId, targetCluster]);
+
+  useEffect(() => {
+    if (requestedPipelineId) {
+      setSelectedLogPipelineId(requestedPipelineId);
+    }
+  }, [requestedPipelineId]);
 
   useEffect(() => {
     loadPipelines();
@@ -229,7 +240,7 @@ export const Pipelines: React.FC = () => {
       >
         <Box>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 0.5 }}>
-            <Typography variant="h4" sx={{ fontWeight: 800, color: '#09090b', letterSpacing: '-0.02em' }}>
+            <Typography variant="h4" component="h1" sx={{ fontWeight: 800, color: '#09090b', letterSpacing: '-0.02em' }}>
               CI/CD Pipelines
             </Typography>
             <Chip

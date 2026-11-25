@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   AppBar,
   Avatar,
@@ -43,6 +43,7 @@ import { TesserakAuthProvider, useTesserakAuth } from './auth/AuthContext';
 import { AuthPage } from './components/Auth/AuthPage';
 import { TesserakLogo } from './components/TesserakLogo';
 import Dashboard from './pages/Dashboard';
+import Clusters from './pages/Clusters';
 import CreateCluster from './pages/CreateCluster';
 import Profile from './pages/Profile';
 import { CloudResources } from './pages/CloudResources';
@@ -129,6 +130,21 @@ const obsidianBlueTheme = createTheme({
   },
 });
 
+const ROUTE_TITLES: Record<string, string> = {
+  '/': 'Overview | Tesserak',
+  '/clusters': 'Clusters (EKS) | Tesserak',
+  '/create-cluster': 'Launch EKS Cluster | Tesserak',
+  '/resources': 'Cloud Resources | Tesserak',
+  '/infrastructure': 'Cloud Resources | Tesserak',
+  '/pipelines': 'CI/CD Pipelines | Tesserak',
+  '/guardrails': 'Guardrails | Tesserak',
+  '/security': 'Guardrails | Tesserak',
+  '/integrations': 'Integrations | Tesserak',
+  '/connectors': 'Integrations | Tesserak',
+  '/settings': 'Settings | Tesserak',
+  '/profile': 'Profile & Identity | Tesserak',
+};
+
 const navItems = [
   { label: 'Overview', path: '/', icon: <DashboardIcon /> },
   { label: 'Clusters (EKS)', path: '/clusters', icon: <StorageIcon /> },
@@ -157,6 +173,10 @@ const Layout: React.FC<LayoutProps> = ({
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
   const navigate = useNavigate();
   const location = useLocation();
+
+  useEffect(() => {
+    document.title = ROUTE_TITLES[location.pathname] || 'Tesserak | EKS & Cloud IDP';
+  }, [location.pathname]);
 
   const users = JSON.parse(localStorage.getItem('users') || '{}');
   const userProfile = users[currentUser] || { firstName: currentUser.split('@')[0], lastName: '' };
@@ -196,6 +216,7 @@ const Layout: React.FC<LayoutProps> = ({
         {navItems.map((item) => {
           const isActive =
             location.pathname === item.path ||
+            (item.path === '/clusters' && location.pathname === '/create-cluster') ||
             (item.path === '/resources' && location.pathname === '/infrastructure') ||
             (item.path === '/guardrails' && location.pathname === '/security') ||
             (item.path === '/integrations' && location.pathname === '/connectors');
@@ -250,6 +271,9 @@ const Layout: React.FC<LayoutProps> = ({
 
   return (
     <Box sx={{ display: 'flex', minHeight: '100vh', bgcolor: '#f8fafc' }}>
+      <a href="#main-content" className="skip-link">
+        Skip to main content
+      </a>
       <AppBar
         position="fixed"
         elevation={0}
@@ -383,12 +407,15 @@ const Layout: React.FC<LayoutProps> = ({
 
       <Box
         component="main"
+        id="main-content"
+        tabIndex={-1}
         sx={{
           flexGrow: 1,
           p: { xs: 2, sm: 3.5 },
           mt: '64px',
           maxWidth: '100%',
           overflowX: 'hidden',
+          outline: 'none',
         }}
       >
         {children}
@@ -448,7 +475,7 @@ const AppShell: React.FC = () => {
         <Layout onLogout={logout} currentUser={userEmail} authProviderLabel={providerBadge}>
           <Routes>
             <Route path="/" element={<Dashboard />} />
-            <Route path="/clusters" element={<Dashboard />} />
+            <Route path="/clusters" element={<Clusters />} />
             <Route path="/create-cluster" element={<CreateCluster />} />
             <Route path="/resources" element={<CloudResources />} />
             <Route path="/infrastructure" element={<CloudResources />} />

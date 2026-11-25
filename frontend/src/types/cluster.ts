@@ -5,7 +5,7 @@ export interface Cluster {
     region: string;
     version: string;
     endpoint: string | null;
-    stateStatus: 'synced' | 'differences_found' | 'missing_local' | 'unknown' | 'deleted';
+    stateStatus: 'synced' | 'in_sync' | 'differences_found' | 'missing_local' | 'unknown' | 'deleted';
     createdAt: string;
     deletedAt?: string | null;
     deletedBy?: 'aws-console' | 'tool' | null;

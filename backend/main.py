@@ -386,16 +386,21 @@ async def list_clusters(x_user_email: str = Header(...)):
         )
         account_id = sts_client.get_caller_identity()['Account']
 
-        # Get all local cluster names and load their states
-        cluster_names = state_manager.list_user_clusters(x_user_email)
+        # Merge local cluster states with live AWS EKS clusters
+        local_cluster_names = state_manager.list_user_clusters(x_user_email)
+        aws_cluster_names = response.get('clusters', [])
+        all_cluster_names = sorted(set(local_cluster_names) | set(aws_cluster_names))
+
         all_states = []
-        for cname in cluster_names:
+        for cname in all_cluster_names:
             cstate = state_manager.get_cluster_state(x_user_email, cname)
             if cstate:
-                state_data_entry = cstate.get('state', cstate)
+                state_data_entry = dict(cstate.get('state', cstate))
                 if 'name' not in state_data_entry:
                     state_data_entry['name'] = cname
                 all_states.append(state_data_entry)
+            else:
+                all_states.append({'name': cname, '_aws_only': True})
         current_time = datetime.utcnow()
 
         for state in all_states:
@@ -420,12 +425,23 @@ async def list_clusters(x_user_email: str = Header(...)):
                 }
                 
                 # Compare states
-                try:
-                    comparison = state_manager.compare_with_aws_state(x_user_email, cluster_name, aws_state)
-                    state_status = comparison['status']
-                except Exception:
-                    state_status = 'unknown'
-                
+                if state.get('_aws_only'):
+                    state_status = 'missing_local'
+                else:
+                    try:
+                        comparison = state_manager.compare_with_aws_state(x_user_email, cluster_name, aws_state)
+                        state_status = comparison['status']
+                        if state_status == 'in_sync':
+                            state_status = 'synced'
+                    except Exception:
+                        state_status = 'unknown'
+
+                raw_created = state.get('createdAt') or cluster_info.get('createdAt') or datetime.utcnow()
+                if isinstance(raw_created, str):
+                    created_at_val = datetime.fromisoformat(raw_created.replace('Z', '+00:00'))
+                else:
+                    created_at_val = raw_created
+
                 clusters.append(
                     ClusterResponse(
                         name=cluster_info['name'],
@@ -435,7 +451,7 @@ async def list_clusters(x_user_email: str = Header(...)):
                         version=cluster_info['version'],
                         endpoint=cluster_info.get('endpoint'),
                         stateStatus=state_status,
-                        createdAt=state.get('createdAt', datetime.utcnow()),
+                        createdAt=created_at_val,
                         deletedAt=state.get('deletedAt'),
                         deletedBy=state.get('deletedBy')
                     )

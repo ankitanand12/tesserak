@@ -229,6 +229,239 @@ async def get_auth_config_status():
     }
 
 
+def _build_overview_alerts(
+    integrations: List[Dict[str, Any]],
+    res_data: Dict[str, Any],
+    rules: List[Dict[str, Any]],
+    approvals: List[Dict[str, Any]],
+    pipelines: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Aggregate real platform alerts from AWS connections, drifted resources, approvals, and pipelines."""
+    alerts: List[Dict[str, Any]] = []
+    now = utc_now_iso()
+
+    if not res_data.get("awsConnected", False):
+        alerts.append(
+            {
+                "id": "alert-aws-disconnected",
+                "severity": "warning",
+                "category": "AWS Connection",
+                "title": "AWS IAM Connector Required",
+                "detail": res_data.get("error")
+                or "No active AWS IAM connector found. Connect AWS credentials in Integrations to unlock live EKS and cloud resource discovery.",
+                "timestamp": now,
+                "actionPath": "/integrations",
+                "actionLabel": "Connect AWS IAM",
+            }
+        )
+
+    for integ in integrations:
+        if integ.get("status") != "connected":
+            alerts.append(
+                {
+                    "id": f"alert-int-{integ.get('id', integ.get('name'))}",
+                    "severity": "error",
+                    "category": "Integration",
+                    "title": f"Integration Unhealthy: {integ.get('name', 'Connector')}",
+                    "detail": f"{integ.get('provider', '').upper()} connector status is '{integ.get('status', 'error')}'. Re-verify credentials.",
+                    "timestamp": integ.get("lastCheckedAt") or now,
+                    "actionPath": "/integrations",
+                    "actionLabel": "Verify Integration",
+                }
+            )
+
+    for pip in pipelines:
+        if pip.get("status") == "Failed":
+            failed_stage = next((s for s in pip.get("stages", []) if s.get("status") == "Failed"), None)
+            stage_note = f" at stage '{failed_stage['name']}'" if failed_stage else ""
+            alerts.append(
+                {
+                    "id": f"alert-pip-{pip.get('id')}",
+                    "severity": "error",
+                    "category": "CI/CD Failure",
+                    "title": f"Pipeline Failed: {pip.get('name')}",
+                    "detail": f"Run #{pip.get('lastRunNumber', 0)} failed{stage_note} ({pip.get('branch', 'main')} → {pip.get('targetCluster', 'cluster')}).",
+                    "timestamp": pip.get("lastRunAt") or now,
+                    "actionPath": f"/pipelines?pipelineId={pip.get('id')}",
+                    "actionLabel": "Inspect Trace",
+                }
+            )
+
+    for apr in approvals:
+        if apr.get("status") == "pending":
+            alerts.append(
+                {
+                    "id": f"alert-apr-{apr.get('id')}",
+                    "severity": "warning",
+                    "category": "Guardrail Approval",
+                    "title": f"Approval Pending: {apr.get('resourceName')}",
+                    "detail": f"{apr.get('resourceKind')} (${apr.get('estimatedMonthlyCost', 0):.0f}/mo) — {apr.get('reason', 'Requires reviewer decision')}",
+                    "timestamp": apr.get("createdAt") or now,
+                    "actionPath": "/guardrails",
+                    "actionLabel": "Review Queue",
+                }
+            )
+
+    for res in res_data.get("resources", []):
+        if res.get("driftStatus") == "Drifted":
+            notes = "; ".join(res.get("guardrailNotes") or ["Configuration drift detected"])
+            alerts.append(
+                {
+                    "id": f"alert-drift-{res.get('id')}",
+                    "severity": "warning",
+                    "category": "Cloud Drift",
+                    "title": f"Drift Detected: {res.get('name')} ({res.get('serviceType')})",
+                    "detail": notes,
+                    "timestamp": res.get("lastSyncAt") or now,
+                    "actionPath": "/resources",
+                    "actionLabel": "Remediate",
+                }
+            )
+
+    for idx, warn in enumerate(res_data.get("warnings") or []):
+        alerts.append(
+            {
+                "id": f"alert-scan-warn-{idx}",
+                "severity": "info",
+                "category": "AWS Scan",
+                "title": "Partial AWS Resource Discovery",
+                "detail": warn,
+                "timestamp": now,
+                "actionPath": "/resources",
+                "actionLabel": "View Resources",
+            }
+        )
+
+    blocked_violations = sum(int(r.get("violations", 0)) for r in rules if r.get("enabled"))
+    if blocked_violations > 0:
+        alerts.append(
+            {
+                "id": "alert-guardrail-blocks",
+                "severity": "info",
+                "category": "Policy Enforcement",
+                "title": f"{blocked_violations} Guardrail Policy Block Event(s)",
+                "detail": "Non-compliant provisioning or manifest operations were intercepted by active Guardrails.",
+                "timestamp": now,
+                "actionPath": "/guardrails",
+                "actionLabel": "View Policies",
+            }
+        )
+
+    severity_order = {"error": 0, "warning": 1, "info": 2}
+    alerts.sort(key=lambda a: (severity_order.get(a.get("severity", "info"), 3), a.get("timestamp", "")))
+    return alerts
+
+
+def _build_recent_deployments(pipelines: List[Dict[str, Any]], fallback_user: str) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Return flattened recent deployment runs plus recent pipeline summaries sorted newest-first."""
+    deployments: List[Dict[str, Any]] = []
+    pipeline_summaries: List[Dict[str, Any]] = []
+
+    for pip in pipelines:
+        stages_summary = [
+            {
+                "name": s.get("name", ""),
+                "status": s.get("status", "Ready"),
+                "durationSec": s.get("durationSec", 0),
+            }
+            for s in pip.get("stages", [])
+        ]
+        pipeline_summaries.append(
+            {
+                "id": pip.get("id"),
+                "name": pip.get("name"),
+                "repositoryUrl": pip.get("repositoryUrl"),
+                "branch": pip.get("branch", "main"),
+                "targetCluster": pip.get("targetCluster", ""),
+                "namespace": pip.get("namespace", "default"),
+                "verifiedRemoteSha": pip.get("verifiedRemoteSha"),
+                "lastRunNumber": pip.get("lastRunNumber", 0),
+                "status": pip.get("status", "Ready"),
+                "durationSec": pip.get("durationSec", 0),
+                "triggeredBy": pip.get("triggeredBy", fallback_user),
+                "lastRunAt": pip.get("lastRunAt"),
+                "stagesSummary": stages_summary,
+                "recentRuns": pip.get("recentRuns", [])[:5],
+            }
+        )
+
+        if pip.get("status") == "Running":
+            deployments.append(
+                {
+                    "id": f"{pip.get('id')}-running",
+                    "pipelineId": pip.get("id"),
+                    "pipelineName": pip.get("name"),
+                    "repositoryUrl": pip.get("repositoryUrl"),
+                    "branch": pip.get("branch", "main"),
+                    "commitSha": pip.get("verifiedRemoteSha") or "HEAD",
+                    "targetCluster": pip.get("targetCluster", ""),
+                    "namespace": pip.get("namespace", "default"),
+                    "runNumber": pip.get("lastRunNumber", 0) + 1,
+                    "status": "Running",
+                    "durationSec": pip.get("durationSec", 0),
+                    "triggeredAt": pip.get("lastRunAt") or utc_now_iso(),
+                    "triggeredBy": pip.get("triggeredBy", fallback_user),
+                    "stagesSummary": stages_summary,
+                }
+            )
+
+        recent_runs = pip.get("recentRuns", [])
+        for run in recent_runs:
+            run_num = run.get("runNumber", 0)
+            deployments.append(
+                {
+                    "id": f"{pip.get('id')}-r{run_num}",
+                    "pipelineId": pip.get("id"),
+                    "pipelineName": pip.get("name"),
+                    "repositoryUrl": pip.get("repositoryUrl"),
+                    "branch": run.get("branch") or pip.get("branch", "main"),
+                    "commitSha": run.get("commitSha") or pip.get("verifiedRemoteSha") or "HEAD",
+                    "targetCluster": pip.get("targetCluster", ""),
+                    "namespace": pip.get("namespace", "default"),
+                    "runNumber": run_num,
+                    "status": run.get("status", pip.get("status", "Ready")),
+                    "durationSec": run.get("durationSec", 0),
+                    "triggeredAt": run.get("triggeredAt") or pip.get("lastRunAt") or "",
+                    "triggeredBy": pip.get("triggeredBy", fallback_user),
+                    "stagesSummary": stages_summary if run_num == pip.get("lastRunNumber") else [],
+                }
+            )
+
+        if pip.get("status") == "Ready" and not recent_runs:
+            deployments.append(
+                {
+                    "id": f"{pip.get('id')}-ready",
+                    "pipelineId": pip.get("id"),
+                    "pipelineName": pip.get("name"),
+                    "repositoryUrl": pip.get("repositoryUrl"),
+                    "branch": pip.get("branch", "main"),
+                    "commitSha": pip.get("verifiedRemoteSha") or "HEAD",
+                    "targetCluster": pip.get("targetCluster", ""),
+                    "namespace": pip.get("namespace", "default"),
+                    "runNumber": 0,
+                    "status": "Ready",
+                    "durationSec": 0,
+                    "triggeredAt": pip.get("lastRunAt") or "",
+                    "triggeredBy": pip.get("triggeredBy", fallback_user),
+                    "stagesSummary": [],
+                }
+            )
+
+    deployments.sort(
+        key=lambda d: (0 if d.get("status") == "Running" else 1, d.get("triggeredAt", "")),
+        reverse=False,
+    )
+    # Sort non-running items newest-first while keeping Running deployments pinned at top
+    running_deps = [d for d in deployments if d.get("status") == "Running"]
+    other_deps = sorted(
+        [d for d in deployments if d.get("status") != "Running"],
+        key=lambda d: d.get("triggeredAt", ""),
+        reverse=True,
+    )
+    pipeline_summaries.sort(key=lambda p: p.get("lastRunAt") or "", reverse=True)
+    return (running_deps + other_deps)[:10], pipeline_summaries[:6]
+
+
 @router.get("/api/atmosly/overview")
 async def get_platform_overview(x_user_email: str = Header(default="demo@tesserak.dev")):
     state = _load_state(x_user_email)
@@ -244,6 +477,9 @@ async def get_platform_overview(x_user_email: str = Header(default="demo@tessera
     resources = res_data.get("resources", [])
     drifted = sum(1 for r in resources if r.get("driftStatus") == "Drifted")
 
+    alerts = _build_overview_alerts(integrations, res_data, rules, approvals, pipelines)
+    recent_deployments, recent_pipelines = _build_recent_deployments(pipelines, x_user_email)
+
     return {
         "integrationsCount": len(integrations),
         "connectedIntegrations": sum(1 for i in integrations if i.get("status") == "connected"),
@@ -255,7 +491,11 @@ async def get_platform_overview(x_user_email: str = Header(default="demo@tessera
         "pendingApprovals": pending_approvals,
         "pipelinesCount": len(pipelines),
         "healthyPipelines": sum(1 for p in pipelines if p.get("status") == "Succeeded"),
+        "activeRunningPipelines": sum(1 for p in pipelines if p.get("status") == "Running"),
         "complianceScore": round((enabled_rules / max(len(rules), 1)) * 100),
+        "alerts": alerts,
+        "recentDeployments": recent_deployments,
+        "recentPipelines": recent_pipelines,
     }
 
 

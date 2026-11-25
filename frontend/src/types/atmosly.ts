@@ -155,6 +155,59 @@ export interface PipelineItem {
   recentRuns: PipelineRunSummary[];
 }
 
+export type PlatformAlertSeverity = 'error' | 'warning' | 'info';
+
+export interface PlatformAlert {
+  id: string;
+  severity: PlatformAlertSeverity;
+  category: string;
+  title: string;
+  detail: string;
+  timestamp: string;
+  actionPath: string;
+  actionLabel: string;
+}
+
+export interface PipelineStageSummary {
+  name: string;
+  status: string;
+  durationSec: number;
+}
+
+export interface RecentDeploymentItem {
+  id: string;
+  pipelineId: string;
+  pipelineName: string;
+  repositoryUrl: string;
+  branch: string;
+  commitSha: string;
+  targetCluster: string;
+  namespace: string;
+  runNumber: number;
+  status: 'Ready' | 'Running' | 'Succeeded' | 'Failed' | string;
+  durationSec: number;
+  triggeredAt: string;
+  triggeredBy: string;
+  stagesSummary: PipelineStageSummary[];
+}
+
+export interface RecentPipelineOverviewItem {
+  id: string;
+  name: string;
+  repositoryUrl: string;
+  branch: string;
+  targetCluster: string;
+  namespace: string;
+  verifiedRemoteSha?: string;
+  lastRunNumber: number;
+  status: 'Ready' | 'Running' | 'Succeeded' | 'Failed' | string;
+  durationSec: number;
+  triggeredBy: string;
+  lastRunAt: string;
+  stagesSummary: PipelineStageSummary[];
+  recentRuns: PipelineRunSummary[];
+}
+
 export interface PlatformOverview {
   integrationsCount: number;
   connectedIntegrations: number;
@@ -166,5 +219,9 @@ export interface PlatformOverview {
   pendingApprovals: number;
   pipelinesCount: number;
   healthyPipelines: number;
+  activeRunningPipelines?: number;
   complianceScore: number;
+  alerts?: PlatformAlert[];
+  recentDeployments?: RecentDeploymentItem[];
+  recentPipelines?: RecentPipelineOverviewItem[];
 }
