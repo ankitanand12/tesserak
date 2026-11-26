@@ -37,6 +37,7 @@ import {
   Storage as StorageIcon,
 } from '@mui/icons-material';
 import { useTesserakAuth } from '../auth/AuthContext';
+import { ConfirmDeleteDialog } from '../components/ConfirmDeleteDialog';
 import ConnectorForm from '../components/Connectors/ConnectorForm';
 import ConnectorList, { Connector } from '../components/Connectors/ConnectorList';
 import { Perspective3DCard } from '../components/Perspective3DCard';
@@ -147,6 +148,8 @@ export const Integrations: React.FC = () => {
   const [modalError, setModalError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<IntegrationItem | null>(null);
+  const [deletingIntegration, setDeletingIntegration] = useState(false);
 
   const [formProvider, setFormProvider] = useState<Exclude<IntegrationProvider, 'aws'>>('github');
   const [formName, setFormName] = useState('');
@@ -301,25 +304,33 @@ export const Integrations: React.FC = () => {
     }
   };
 
-  const handleDelete = async (item: IntegrationItem) => {
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget) return;
+    setDeletingIntegration(true);
     setError('');
-    if (item.managedBy === 'connector') {
-      await handleDeleteAwsConnector(item.id);
-      return;
-    }
     try {
-      const res = await fetch(`http://localhost:8000/api/integrations/${item.id}`, {
+      if (deleteTarget.managedBy === 'connector') {
+        await handleDeleteAwsConnector(deleteTarget.id);
+        setDeleteTarget(null);
+        return;
+      }
+      const res = await fetch(`http://localhost:8000/api/integrations/${deleteTarget.id}`, {
         method: 'DELETE',
         headers: { 'x-user-email': userEmail },
       });
       if (res.ok) {
-        setNotice(`Disconnected "${item.name}".`);
+        setNotice(`Disconnected "${deleteTarget.name}".`);
+        setDeleteTarget(null);
         invalidateSwrCache(userEmail, 'integrations');
         invalidateSwrCache(userEmail, 'overview');
         await loadAll(true);
+      } else {
+        setError('Failed to disconnect integration');
       }
     } catch {
       setError('Failed to disconnect integration');
+    } finally {
+      setDeletingIntegration(false);
     }
   };
 
@@ -598,7 +609,11 @@ export const Integrations: React.FC = () => {
                         </span>
                       </Tooltip>
                       <Tooltip title="Disconnect">
-                        <IconButton size="small" onClick={() => handleDelete(item)}>
+                        <IconButton
+                          size="small"
+                          aria-label={`Disconnect ${item.name}`}
+                          onClick={() => setDeleteTarget(item)}
+                        >
                           <DeleteIcon fontSize="small" sx={{ color: '#475569' }} />
                         </IconButton>
                       </Tooltip>
@@ -757,6 +772,21 @@ export const Integrations: React.FC = () => {
           <ConnectorForm onSubmit={handleAwsSubmit} />
         </DialogContent>
       </Dialog>
+
+      <ConfirmDeleteDialog
+        open={Boolean(deleteTarget)}
+        title="Disconnect Integration?"
+        description={
+          <>
+            Are you sure you want to remove integration <strong>{deleteTarget?.name}</strong> (
+            {deleteTarget?.provider})?
+          </>
+        }
+        confirmLabel="Confirm Disconnect"
+        loading={deletingIntegration}
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={handleConfirmDelete}
+      />
     </Box>
   );
 };

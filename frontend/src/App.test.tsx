@@ -18,7 +18,7 @@ jest.mock('@auth0/auth0-react', () => ({
 jest.mock(
   'react-router-dom',
   () => ({
-    HashRouter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+    BrowserRouter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
     Routes: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
     Route: () => null,
     useNavigate: () => jest.fn(),

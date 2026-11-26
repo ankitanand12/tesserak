@@ -45,6 +45,11 @@ export interface ClusterConfig {
   publicSubnets?: string[];
   privateSubnets?: string[];
   enableClusterLogs?: boolean;
+  authenticationMode?: 'API_AND_CONFIG_MAP' | 'API';
+  bootstrapClusterAdmin?: boolean;
+  deletionProtection?: boolean;
+  ipFamily?: 'ipv4' | 'ipv6';
+  serviceIpv4Cidr?: string;
   environment: {
     type: 'Non-Prod' | 'Prod';
     endpoint: 'public' | 'public-private' | 'private';
@@ -91,6 +96,11 @@ const CreateCluster: React.FC = () => {
     publicSubnets: [],
     privateSubnets: [],
     enableClusterLogs: false,
+    authenticationMode: 'API_AND_CONFIG_MAP',
+    bootstrapClusterAdmin: true,
+    deletionProtection: false,
+    ipFamily: 'ipv4',
+    serviceIpv4Cidr: '',
     environment: {
       type: '' as 'Non-Prod' | 'Prod',
       endpoint: '' as 'public' | 'public-private' | 'private',

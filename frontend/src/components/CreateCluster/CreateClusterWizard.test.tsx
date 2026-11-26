@@ -222,29 +222,44 @@ describe('CreateCluster wizard fixes', () => {
     fireEvent.mouseDown(screen.getByRole('combobox'));
     fireEvent.click(screen.getByRole('option', { name: 'Production' }));
 
-    await waitFor(() => {
-      expect(screen.getByDisplayValue('ami-00975b531d8dc8286')).toBeInTheDocument();
-    });
+    await waitFor(
+      () => {
+        expect(screen.getByDisplayValue('ami-00975b531d8dc8286')).toBeInTheDocument();
+      },
+      { timeout: 3000 }
+    );
 
     // Switch Kubernetes Version to 1.35 -> AMI updates for 1.35
     fireEvent.mouseDown(screen.getByText(/1\.37 \(Latest\)/i));
     fireEvent.click(screen.getByText('1.35'));
 
-    await waitFor(() => {
-      expect(screen.getByDisplayValue('ami-0d4c5f36cb9ec8fdf')).toBeInTheDocument();
-    });
+    await waitFor(
+      () => {
+        expect(screen.getByDisplayValue('ami-0d4c5f36cb9ec8fdf')).toBeInTheDocument();
+      },
+      { timeout: 3000 }
+    );
 
     // Switch AMI Type to ARM64 -> AMI updates for ARM64
     fireEvent.mouseDown(screen.getByText(/Standard x86_64/i));
     fireEvent.click(screen.getByText(/Standard ARM64 \(Graviton\)/i));
 
-    await waitFor(() => {
-      expect(screen.getByDisplayValue('ami-0arm64recommended')).toBeInTheDocument();
-    });
+    await waitFor(
+      () => {
+        expect(screen.getByDisplayValue('ami-0arm64recommended')).toBeInTheDocument();
+      },
+      { timeout: 3000 }
+    );
 
     const amiInput = screen.getByLabelText(/AMI ID/i);
     fireEvent.change(amiInput, { target: { value: 'ami-custommanual01' } });
     expect(screen.getByDisplayValue('ami-custommanual01')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Use Recommended' })).toBeInTheDocument();
+
+    // Cluster Access, IP Family / Service CIDR, and Prod Deletion Protection
+    expect(screen.getByText('Cluster Access')).toBeInTheDocument();
+    expect(screen.getByLabelText(/Allow cluster admin access/i)).toBeChecked();
+    expect(screen.getByLabelText(/Service IPv4 CIDR \(Optional\)/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Turn on deletion protection/i)).toBeInTheDocument();
   });
 });

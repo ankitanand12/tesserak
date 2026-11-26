@@ -21,7 +21,7 @@ let mockPathname = '/';
 jest.mock(
   'react-router-dom',
   () => ({
-    HashRouter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+    BrowserRouter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
     Routes: ({ children }: { children: any }) => {
       const mockReact = require('react');
       const childArray = mockReact.Children.toArray(children) as any[];

@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import ClusterDetails from './ClusterDetails';
 import ClusterTable from '../components/ClusterTable';
 import { Cluster } from '../types/cluster';
@@ -108,11 +108,66 @@ const sampleClusterDetail = {
     {
       instanceId: 'i-0worker123456',
       name: 'tesserak-ng-node-1',
+      nodeName: 'ip-10-0-1-42.ec2.internal',
       nodegroupName: 'ng-workers',
       instanceType: 't3.medium',
+      capacityType: 'ON_DEMAND',
       availabilityZone: 'us-east-1a',
+      subnetId: 'subnet-111aaa',
+      amiId: 'ami-0134recommended',
+      architecture: 'amd64',
+      operatingSystem: 'linux',
+      osImage: 'Amazon Linux 2023.10',
+      kernelVersion: '6.12.115-140.210.amzn2023.x86_64',
+      containerRuntimeVersion: 'containerd://2.1.7',
+      kubeletVersion: 'v1.34.1-eks',
       privateIpAddress: '10.0.1.42',
       state: 'running',
+      k8sStatus: 'Ready',
+      createdAt: '2026-11-25T13:02:00Z',
+      allocation: {
+        cpu: {
+          capacityMillicores: 2000,
+          allocatableMillicores: 1930,
+          systemReservedMillicores: 70,
+          workloadReservedMillicores: 250,
+          availableMillicores: 1680,
+        },
+        memory: {
+          capacityBytes: 4294967296,
+          allocatableBytes: 3758096384,
+          systemReservedBytes: 536870912,
+          workloadReservedBytes: 268435456,
+          availableBytes: 3489660928,
+        },
+        pods: { max: 17, used: 1, available: 16 },
+        ephemeralStorage: {
+          capacityBytes: 21474836480,
+          allocatableBytes: 19327352832,
+          systemReservedBytes: 2147483648,
+          availableBytes: 19327352832,
+        },
+      },
+      conditions: [
+        { type: 'Ready', status: 'True', message: 'kubelet is posting ready status' },
+      ],
+      taints: [],
+      labels: { 'kubernetes.io/hostname': 'ip-10-0-1-42.ec2.internal' },
+      annotations: { 'node.alpha.kubernetes.io/ttl': '0' },
+      rawNode: { kind: 'Node', metadata: { name: 'ip-10-0-1-42.ec2.internal' } },
+    },
+  ],
+  pods: [
+    {
+      name: 'demo-app-pod-1',
+      namespace: 'default',
+      status: 'Running',
+      phase: 'Running',
+      ready: '1/1',
+      restarts: 0,
+      podIp: '10.0.1.88',
+      nodeName: 'ip-10-0-1-42.ec2.internal',
+      createdAt: '2026-11-25T13:10:00Z',
     },
   ],
   fargateProfiles: [],
@@ -253,36 +308,53 @@ describe('ClusterDetails page', () => {
     expect(screen.getByText('State Synced')).toBeInTheDocument();
     expect(screen.getByText('https://ABCDEF123456.gr7.us-east-1.eks.amazonaws.com')).toBeInTheDocument();
 
-    // Compute & Add-ons tab (tab 1)
+    // Compute & Add-ons tab (tab 1): Nodes table hides Instance ID column like AWS Console
     fireEvent.click(screen.getByRole('tab', { name: /Compute & Add-ons/i }));
     expect(screen.getAllByText('ng-workers').length).toBeGreaterThan(0);
-    expect(screen.getByText('i-0worker123456')).toBeInTheDocument();
+    expect(screen.queryByText('i-0worker123456')).not.toBeInTheDocument();
+    expect(screen.getAllByText('demo-app-pod-1').length).toBeGreaterThan(0);
+    expect(screen.getByText('10.0.1.88')).toBeInTheDocument();
     expect(screen.getByText('vpc-cni')).toBeInTheDocument();
     expect(screen.getByText('v1.22.4-eksbuild.14')).toBeInTheDocument();
 
     // Add Node Group dialog
     fireEvent.click(screen.getByRole('button', { name: 'Add Node Group' }));
-    await waitFor(() => {
-      expect(screen.getByDisplayValue('ami-0134recommended')).toBeInTheDocument();
-    });
+    await waitFor(
+      () => {
+        expect(screen.getByDisplayValue('ami-0134recommended')).toBeInTheDocument();
+      },
+      { timeout: 3000 }
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Create Node Group' }));
-    await waitFor(() => {
-      expect(screen.getByText('Node group "tesserak-ng" creation initiated on AWS EKS.')).toBeInTheDocument();
-    });
+    await waitFor(
+      () => {
+        expect(screen.getByText('Node group "tesserak-ng" creation initiated on AWS EKS.')).toBeInTheDocument();
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      },
+      { timeout: 3000 }
+    );
 
     // Scale Node Group dialog
     fireEvent.click(await screen.findByRole('button', { name: 'Scale' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Apply Scaling' }));
-    await waitFor(() => {
-      expect(screen.getByText('Scaling update started for node group "ng-workers".')).toBeInTheDocument();
-    });
+    await waitFor(
+      () => {
+        expect(screen.getByText('Scaling update started for node group "ng-workers".')).toBeInTheDocument();
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      },
+      { timeout: 3000 }
+    );
 
     // Delete Node Group dialog
     fireEvent.click(await screen.findByRole('button', { name: 'Delete' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Confirm Delete' }));
-    await waitFor(() => {
-      expect(screen.getByText('Node group "ng-workers" deletion initiated.')).toBeInTheDocument();
-    });
+    await waitFor(
+      () => {
+        expect(screen.getByText('Node group "ng-workers" deletion initiated.')).toBeInTheDocument();
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      },
+      { timeout: 3000 }
+    );
 
     // Networking tab (tab 2)
     fireEvent.click(await screen.findByRole('tab', { name: /Networking/i }));
@@ -313,5 +385,50 @@ describe('ClusterDetails page', () => {
     await waitFor(() => {
       expect(screen.getByText('Synchronized "tesserak" with live AWS EKS state.')).toBeInTheDocument();
     });
+  });
+
+  test('opens clickable Node Inspector with Instance ID, 10 pods per page pagination, and Raw JSON view', async () => {
+    const paginatedDetail = {
+      ...sampleClusterDetail,
+      pods: [
+        ...sampleClusterDetail.pods,
+        ...Array.from({ length: 14 }, (_, idx) => ({
+          name: `worker-pod-${idx + 2}`,
+          namespace: 'kube-system',
+          status: 'Running',
+          phase: 'Running',
+          ready: '1/1',
+          restarts: 0,
+          podIp: `10.0.1.${100 + idx}`,
+          nodeName: 'ip-10-0-1-42.ec2.internal',
+          createdAt: '2026-11-25T13:09:00Z',
+        })),
+      ],
+    };
+    global.fetch = jest.fn(async () => ({
+      ok: true,
+      json: async () => paginatedDetail,
+    })) as any;
+
+    render(<ClusterDetails />);
+
+    fireEvent.click(await screen.findByRole('tab', { name: /Compute & Add-ons/i }));
+    const nodeButtons = screen.getAllByRole('button', { name: 'ip-10-0-1-42.ec2.internal' });
+    fireEvent.click(nodeButtons[0]);
+
+    const dialog = await screen.findByRole('dialog');
+    expect(await within(dialog).findByText('6.12.115-140.210.amzn2023.x86_64')).toBeInTheDocument();
+    expect(within(dialog).getByText('i-0worker123456')).toBeInTheDocument();
+    expect(within(dialog).getByText('Capacity allocation')).toBeInTheDocument();
+    expect(within(dialog).getByText('Pods on Node (15)')).toBeInTheDocument();
+    expect(within(dialog).getByText('1–10 of 15')).toBeInTheDocument();
+    expect(within(dialog).queryByText('worker-pod-15')).not.toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Pods page 2' }));
+    expect(within(dialog).getByText('11–15 of 15')).toBeInTheDocument();
+    expect(within(dialog).getByText('worker-pod-15')).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Raw view' }));
+    expect(within(dialog).getByText(/RAW KUBERNETES NODE/i)).toBeInTheDocument();
   });
 });

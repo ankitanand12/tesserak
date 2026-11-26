@@ -10,15 +10,25 @@ import ipaddress
 import json
 import os
 import logging
+import re
+import shutil
+import subprocess
+import tempfile
 import time
 import urllib.request
+from pathlib import Path
 from dotenv import load_dotenv
 from auth import require_auth_if_configured
 from state_manager import StateManager
 from state_management import StateData
 from connections import ConnectionManager, Connection, ConnectionBase
 from db import get_db
-from datetime import datetime
+from pipelines_service import (
+    _cli_env as _pip_cli_env,
+    build_eks_cli_env,
+    build_eks_kubeconfig_yaml,
+)
+from datetime import datetime, timedelta, timezone
 
 # Configure logging
 logging.basicConfig(
@@ -481,6 +491,11 @@ class ClusterRequest(BaseModel):
     publicSubnets: Optional[List[str]] = []
     privateSubnets: Optional[List[str]] = []
     enableClusterLogs: bool = False
+    authenticationMode: str = "API_AND_CONFIG_MAP"
+    bootstrapClusterAdmin: bool = True
+    deletionProtection: bool = False
+    ipFamily: str = "ipv4"
+    serviceIpv4Cidr: Optional[str] = None
     environment: Optional[EnvironmentConfigModel] = None
     tags: Optional[List[TagModel]] = []
     addons: Optional[List[AddonModel]] = []
@@ -722,6 +737,18 @@ def _create_eks_cluster_sync(conn: Any, cluster: ClusterRequest, user_email: str
     initial_state = state_data.create_initial_state(create_payload, user_email)
     state_manager.save_cluster_state(user_email, cluster.name, initial_state)
 
+    auth_mode = (cluster.authenticationMode or "API_AND_CONFIG_MAP").strip().upper()
+    if auth_mode not in {"API", "API_AND_CONFIG_MAP", "CONFIG_MAP"}:
+        auth_mode = "API_AND_CONFIG_MAP"
+
+    ip_family = (cluster.ipFamily or "ipv4").strip().lower()
+    if ip_family not in {"ipv4", "ipv6"}:
+        ip_family = "ipv4"
+
+    net_cfg: Dict[str, Any] = {"ipFamily": ip_family}
+    if ip_family == "ipv4" and cluster.serviceIpv4Cidr and cluster.serviceIpv4Cidr.strip():
+        net_cfg["serviceIpv4Cidr"] = cluster.serviceIpv4Cidr.strip()
+
     create_kwargs: Dict[str, Any] = {
         "name": cluster.name,
         "version": k8s_version,
@@ -731,6 +758,12 @@ def _create_eks_cluster_sync(conn: Any, cluster: ClusterRequest, user_email: str
             "endpointPublicAccess": pub_access,
             "endpointPrivateAccess": priv_access,
         },
+        "accessConfig": {
+            "bootstrapClusterCreatorAdminPermissions": bool(cluster.bootstrapClusterAdmin),
+            "authenticationMode": auth_mode,
+        },
+        "kubernetesNetworkConfig": net_cfg,
+        "deletionProtection": bool(cluster.deletionProtection),
         "tags": tags_dict,
     }
     if cluster.enableClusterLogs:
@@ -864,6 +897,27 @@ async def create_cluster(cluster: ClusterRequest, x_user_email: str = Header(...
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+DELETED_CLUSTER_RETENTION_DAYS = 7
+
+
+def _parse_utc_naive(val: Any) -> Optional[datetime]:
+    """Normalize an ISO string or datetime object into a naive UTC datetime."""
+    if not val:
+        return None
+    try:
+        if isinstance(val, datetime):
+            dt = val
+        elif isinstance(val, str):
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+        else:
+            return None
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
 def _list_clusters_sync(connection: Any, x_user_email: str, account_id: Optional[str] = None) -> List[ClusterResponse]:
     region = connection.region or "us-east-1"
     eks_client = boto3.client(
@@ -901,9 +955,13 @@ def _list_clusters_sync(connection: Any, x_user_email: str, account_id: Optional
         else:
             state = {"name": cname, "_aws_only": True}
 
-        if state.get("deletedAt"):
-            deleted_at = datetime.fromisoformat(state["deletedAt"])
-            if (current_time - deleted_at).days > 7:
+        if state.get("deletedAt") and cname not in aws_cluster_names:
+            deleted_at = _parse_utc_naive(state["deletedAt"])
+            if deleted_at and (current_time - deleted_at) >= timedelta(days=DELETED_CLUSTER_RETENTION_DAYS):
+                try:
+                    state_manager.delete_cluster_state(x_user_email, cname)
+                except Exception:
+                    pass
                 return None
 
         local_eks = boto3.client(
@@ -932,11 +990,11 @@ def _list_clusters_sync(connection: Any, x_user_email: str, account_id: Optional
                 except Exception:
                     state_status = "unknown"
 
-            raw_created = state.get("createdAt") or cluster_info.get("createdAt") or datetime.utcnow()
-            if isinstance(raw_created, str):
-                created_at_val = datetime.fromisoformat(raw_created.replace("Z", "+00:00"))
-            else:
-                created_at_val = raw_created
+            created_at_val = (
+                _parse_utc_naive(state.get("createdAt"))
+                or _parse_utc_naive(cluster_info.get("createdAt"))
+                or current_time
+            )
 
             return ClusterResponse(
                 name=cluster_info["name"],
@@ -947,14 +1005,26 @@ def _list_clusters_sync(connection: Any, x_user_email: str, account_id: Optional
                 endpoint=cluster_info.get("endpoint"),
                 stateStatus=state_status,
                 createdAt=created_at_val,
-                deletedAt=state.get("deletedAt"),
-                deletedBy=state.get("deletedBy"),
+                deletedAt=None,
+                deletedBy=None,
             )
         except local_eks.exceptions.ResourceNotFoundException:
-            if not state.get("deletedAt"):
+            deleted_at = _parse_utc_naive(state.get("deletedAt"))
+            if not deleted_at:
+                deleted_at = current_time
                 state["deletedAt"] = current_time.isoformat()
-                state["deletedBy"] = "aws-console"
+                state["deletedBy"] = (
+                    state.get("deletedBy")
+                    or state.get("deleteInitiatedBy")
+                    or "aws-console"
+                )
                 state_manager.save_cluster_state(x_user_email, cname, state)
+            elif (current_time - deleted_at) >= timedelta(days=DELETED_CLUSTER_RETENTION_DAYS):
+                try:
+                    state_manager.delete_cluster_state(x_user_email, cname)
+                except Exception:
+                    pass
+                return None
             return ClusterResponse(
                 name=cname,
                 status="NOT_AVAILABLE",
@@ -963,8 +1033,8 @@ def _list_clusters_sync(connection: Any, x_user_email: str, account_id: Optional
                 version=state.get("version", "unknown"),
                 endpoint=None,
                 stateStatus="deleted",
-                createdAt=datetime.fromisoformat(state["createdAt"]) if state.get("createdAt") else datetime.utcnow(),
-                deletedAt=datetime.fromisoformat(state["deletedAt"]) if state.get("deletedAt") else None,
+                createdAt=_parse_utc_naive(state.get("createdAt")) or current_time,
+                deletedAt=deleted_at,
                 deletedBy=state.get("deletedBy"),
             )
 
@@ -1001,6 +1071,321 @@ async def list_clusters(refresh: bool = False, x_user_email: str = Header(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+_MEM_UNITS = {
+    "Ki": 1024,
+    "Mi": 1024 ** 2,
+    "Gi": 1024 ** 3,
+    "Ti": 1024 ** 4,
+    "Pi": 1024 ** 5,
+    "Ei": 1024 ** 6,
+    "K": 1000,
+    "k": 1000,
+    "M": 1000 ** 2,
+    "G": 1000 ** 3,
+    "T": 1000 ** 4,
+    "P": 1000 ** 5,
+    "E": 1000 ** 6,
+}
+
+
+def _parse_k8s_cpu_millicores(raw: Any) -> float:
+    if raw is None:
+        return 0.0
+    s = str(raw).strip()
+    if not s:
+        return 0.0
+    try:
+        if s.endswith("m"):
+            return float(s[:-1])
+        if s.endswith("n"):
+            return float(s[:-1]) / 1_000_000.0
+        return float(s) * 1000.0
+    except ValueError:
+        return 0.0
+
+
+def _parse_k8s_memory_bytes(raw: Any) -> int:
+    if raw is None:
+        return 0
+    s = str(raw).strip()
+    if not s:
+        return 0
+    for suffix, mult in _MEM_UNITS.items():
+        if s.endswith(suffix):
+            try:
+                return int(float(s[: -len(suffix)]) * mult)
+            except ValueError:
+                return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
+
+
+def _derive_pod_display_status(pod: Dict[str, Any]) -> str:
+    meta = pod.get("metadata", {}) or {}
+    if meta.get("deletionTimestamp"):
+        return "Terminating"
+    status = pod.get("status", {}) or {}
+    for cs in (status.get("initContainerStatuses") or []) + (status.get("containerStatuses") or []):
+        waiting = (cs.get("state") or {}).get("waiting") or {}
+        if waiting.get("reason"):
+            return str(waiting["reason"])
+        terminated = (cs.get("state") or {}).get("terminated") or {}
+        if terminated.get("reason") and terminated.get("exitCode", 0) != 0:
+            return str(terminated["reason"])
+    return str(status.get("phase") or "Unknown")
+
+
+def _extract_pod_summary(pod: Dict[str, Any]) -> Dict[str, Any]:
+    meta = pod.get("metadata", {}) or {}
+    spec = pod.get("spec", {}) or {}
+    status = pod.get("status", {}) or {}
+    c_statuses = status.get("containerStatuses") or []
+    total_containers = len(spec.get("containers") or [])
+    ready_containers = sum(1 for c in c_statuses if c.get("ready"))
+    restarts = sum(int(c.get("restartCount") or 0) for c in c_statuses)
+    containers = []
+    for c in spec.get("containers") or []:
+        res = c.get("resources") or {}
+        containers.append({
+            "name": c.get("name"),
+            "image": c.get("image"),
+            "requests": res.get("requests") or {},
+            "limits": res.get("limits") or {},
+        })
+    return {
+        "name": meta.get("name") or "",
+        "namespace": meta.get("namespace") or "default",
+        "status": _derive_pod_display_status(pod),
+        "phase": status.get("phase") or "Unknown",
+        "ready": f"{ready_containers}/{total_containers}" if total_containers else "0/0",
+        "restarts": restarts,
+        "podIp": status.get("podIP"),
+        "hostIp": status.get("hostIP"),
+        "nodeName": spec.get("nodeName"),
+        "createdAt": meta.get("creationTimestamp"),
+        "containers": containers,
+    }
+
+
+def _fetch_k8s_runtime_sync(
+    conn: Any,
+    cluster_name: str,
+    cluster_info: Dict[str, Any],
+    region: str,
+) -> tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]], Optional[str]]:
+    """Query live Kubernetes Nodes and Pods via scoped EKS IAM kubeconfig."""
+    if cluster_info.get("status") != "ACTIVE":
+        return {}, [], None
+    endpoint = cluster_info.get("endpoint")
+    ca_data = (cluster_info.get("certificateAuthority") or {}).get("data")
+    if not endpoint or not ca_data:
+        return {}, [], None
+
+    tmpdir = tempfile.mkdtemp(prefix="tesserak_k8s_")
+    try:
+        kc_path = Path(tmpdir) / "kubeconfig"
+        kc_path.write_text(build_eks_kubeconfig_yaml(cluster_name, endpoint, ca_data, region))
+        env = _pip_cli_env(build_eks_cli_env(conn, kc_path, region))
+        proc = subprocess.run(
+            ["kubectl", "--kubeconfig", str(kc_path), "get", "nodes,pods", "-A", "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+            check=False,
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip().splitlines()
+            msg = err[-1] if err else "Unable to query Kubernetes API"
+            return {}, [], msg
+        data = json.loads(proc.stdout or "{}")
+        nodes_by_key: Dict[str, Dict[str, Any]] = {}
+        pods: List[Dict[str, Any]] = []
+        for item in data.get("items") or []:
+            kind = item.get("kind")
+            if kind == "Node":
+                kname = (item.get("metadata") or {}).get("name")
+                if kname:
+                    nodes_by_key[kname] = item
+            elif kind == "Pod":
+                pods.append(_extract_pod_summary(item))
+        pods.sort(key=lambda p: str(p.get("createdAt") or ""), reverse=True)
+        return nodes_by_key, pods, None
+    except FileNotFoundError:
+        return {}, [], "kubectl CLI not installed on backend host"
+    except subprocess.TimeoutExpired:
+        return {}, [], "Timed out querying Kubernetes API for nodes and pods"
+    except Exception as exc:
+        return {}, [], f"Kubernetes API query skipped: {exc}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _merge_nodes_and_compute_allocations(
+    ec2_nodes: List[Dict[str, Any]],
+    k8s_nodes_map: Dict[str, Dict[str, Any]],
+    pods: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Combine AWS EC2 instance data with Kubernetes node status, capacity allocation, conditions, labels & raw JSON."""
+    pods_by_node: Dict[str, List[Dict[str, Any]]] = {}
+    for p in pods:
+        nname = p.get("nodeName")
+        if nname:
+            pods_by_node.setdefault(nname, []).append(p)
+
+    # Index Kubernetes nodes by EC2 instanceId and private IP for exact matching
+    k8s_by_instance: Dict[str, Dict[str, Any]] = {}
+    k8s_by_ip: Dict[str, Dict[str, Any]] = {}
+    matched_k8s_names: set[str] = set()
+    for kname, knode in k8s_nodes_map.items():
+        prov_id = str((knode.get("spec") or {}).get("providerID") or "")
+        if "/" in prov_id:
+            inst_id = prov_id.rsplit("/", 1)[-1]
+            if inst_id.startswith("i-"):
+                k8s_by_instance[inst_id] = knode
+        for addr in (knode.get("status") or {}).get("addresses") or []:
+            if addr.get("type") == "InternalIP" and addr.get("address"):
+                k8s_by_ip[str(addr["address"])] = knode
+
+    def _enrich_one(ec2_item: Dict[str, Any], knode: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        node = dict(ec2_item)
+        if not knode:
+            return node
+        meta = dict(knode.get("metadata") or {})
+        meta.pop("managedFields", None)
+        spec = knode.get("spec") or {}
+        status = knode.get("status") or {}
+        node_info = status.get("nodeInfo") or {}
+        conditions = status.get("conditions") or []
+        ready_cond = next((c for c in conditions if c.get("type") == "Ready"), {})
+        kname = meta.get("name") or ""
+        if kname:
+            matched_k8s_names.add(kname)
+
+        cap = status.get("capacity") or {}
+        alloc = status.get("allocatable") or {}
+        node_pods = pods_by_node.get(kname, [])
+        active_node_pods = [p for p in node_pods if p.get("phase") not in ("Succeeded", "Failed")]
+
+        req_cpu_mc = 0.0
+        req_mem_bytes = 0
+        for p in active_node_pods:
+            for c in p.get("containers") or []:
+                reqs = c.get("requests") or {}
+                req_cpu_mc += _parse_k8s_cpu_millicores(reqs.get("cpu"))
+                req_mem_bytes += _parse_k8s_memory_bytes(reqs.get("memory"))
+
+        cap_cpu_mc = _parse_k8s_cpu_millicores(cap.get("cpu"))
+        alloc_cpu_mc = _parse_k8s_cpu_millicores(alloc.get("cpu"))
+        cap_mem_bytes = _parse_k8s_memory_bytes(cap.get("memory"))
+        alloc_mem_bytes = _parse_k8s_memory_bytes(alloc.get("memory"))
+        cap_ephem_bytes = _parse_k8s_memory_bytes(cap.get("ephemeral-storage"))
+        alloc_ephem_bytes = _parse_k8s_memory_bytes(alloc.get("ephemeral-storage"))
+        max_pods = int(float(alloc.get("pods") or cap.get("pods") or 0))
+        used_pods = len(active_node_pods)
+
+        labels = meta.get("labels") or {}
+        if not node.get("nodegroupName") or node.get("nodegroupName") == "—":
+            node["nodegroupName"] = labels.get("eks.amazonaws.com/nodegroup", "—")
+        if not node.get("capacityType"):
+            node["capacityType"] = labels.get("eks.amazonaws.com/capacityType", "ON_DEMAND")
+        if not node.get("instanceType") and labels.get("node.kubernetes.io/instance-type"):
+            node["instanceType"] = labels["node.kubernetes.io/instance-type"]
+
+        raw_clean = {
+            "apiVersion": knode.get("apiVersion", "v1"),
+            "kind": knode.get("kind", "Node"),
+            "metadata": meta,
+            "spec": spec,
+            "status": status,
+        }
+
+        node.update({
+            "nodeName": kname,
+            "k8sStatus": "Ready" if ready_cond.get("status") == "True" else ("NotReady" if ready_cond else "Unknown"),
+            "createdAt": meta.get("creationTimestamp") or node.get("launchTime"),
+            "lastTransitionTime": ready_cond.get("lastTransitionTime"),
+            "kernelVersion": node_info.get("kernelVersion"),
+            "osImage": node_info.get("osImage"),
+            "operatingSystem": node_info.get("operatingSystem"),
+            "architecture": node_info.get("architecture") or node.get("architecture"),
+            "containerRuntimeVersion": node_info.get("containerRuntimeVersion"),
+            "kubeletVersion": node_info.get("kubeletVersion"),
+            "kubeProxyVersion": node_info.get("kubeProxyVersion"),
+            "providerID": spec.get("providerID"),
+            "podCIDRs": spec.get("podCIDRs") or [],
+            "capacity": cap,
+            "allocatable": alloc,
+            "allocation": {
+                "cpu": {
+                    "capacityMillicores": round(cap_cpu_mc),
+                    "allocatableMillicores": round(alloc_cpu_mc),
+                    "systemReservedMillicores": max(0, round(cap_cpu_mc - alloc_cpu_mc)),
+                    "workloadReservedMillicores": round(req_cpu_mc),
+                    "availableMillicores": max(0, round(alloc_cpu_mc - req_cpu_mc)),
+                },
+                "memory": {
+                    "capacityBytes": cap_mem_bytes,
+                    "allocatableBytes": alloc_mem_bytes,
+                    "systemReservedBytes": max(0, cap_mem_bytes - alloc_mem_bytes),
+                    "workloadReservedBytes": req_mem_bytes,
+                    "availableBytes": max(0, alloc_mem_bytes - req_mem_bytes),
+                },
+                "pods": {
+                    "max": max_pods,
+                    "used": used_pods,
+                    "available": max(0, max_pods - used_pods),
+                },
+                "ephemeralStorage": {
+                    "capacityBytes": cap_ephem_bytes,
+                    "allocatableBytes": alloc_ephem_bytes,
+                    "systemReservedBytes": max(0, cap_ephem_bytes - alloc_ephem_bytes),
+                    "availableBytes": alloc_ephem_bytes,
+                },
+            },
+            "conditions": conditions,
+            "taints": spec.get("taints") or [],
+            "labels": labels,
+            "annotations": meta.get("annotations") or {},
+            "addresses": status.get("addresses") or [],
+            "podCount": len(node_pods),
+            "rawNode": raw_clean,
+        })
+        return node
+
+    merged: List[Dict[str, Any]] = []
+    for ec2_item in ec2_nodes:
+        knode = k8s_by_instance.get(str(ec2_item.get("instanceId") or "")) or k8s_by_ip.get(
+            str(ec2_item.get("privateIpAddress") or "")
+        )
+        merged.append(_enrich_one(ec2_item, knode))
+
+    # Append Kubernetes nodes that don't match an EC2 instance (e.g., EKS Auto Mode / Karpenter / Fargate)
+    for kname, knode in k8s_nodes_map.items():
+        if kname not in matched_k8s_names:
+            prov_id = str((knode.get("spec") or {}).get("providerID") or "")
+            inst_id = prov_id.rsplit("/", 1)[-1] if "/" in prov_id else kname
+            labels = (knode.get("metadata") or {}).get("labels") or {}
+            addrs = (knode.get("status") or {}).get("addresses") or []
+            priv_ip = next((a.get("address") for a in addrs if a.get("type") == "InternalIP"), None)
+            pub_ip = next((a.get("address") for a in addrs if a.get("type") == "ExternalIP"), None)
+            stub = {
+                "instanceId": inst_id,
+                "name": kname,
+                "nodegroupName": labels.get("eks.amazonaws.com/nodegroup", "—"),
+                "instanceType": labels.get("node.kubernetes.io/instance-type"),
+                "availabilityZone": labels.get("topology.kubernetes.io/zone"),
+                "privateIpAddress": priv_ip,
+                "publicIpAddress": pub_ip,
+                "state": "running",
+            }
+            merged.append(_enrich_one(stub, knode))
+
+    return merged
+
+
 def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: str, account_id: Optional[str] = None) -> Dict[str, Any]:
     region = connection.region or "us-east-1"
     sess = boto3.Session(
@@ -1035,6 +1420,7 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
                     "networking": {},
                     "nodegroups": [],
                     "workerNodes": [],
+                    "pods": [],
                     "fargateProfiles": [],
                     "addons": [],
                     "updateHistory": [],
@@ -1110,7 +1496,13 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
                         "name": tags.get("Name") or inst.get("InstanceId"),
                         "nodegroupName": tags.get("eks:nodegroup-name", "—"),
                         "instanceType": inst.get("InstanceType"),
+                        "capacityType": "SPOT" if inst.get("InstanceLifecycle") == "spot" else "ON_DEMAND",
                         "availabilityZone": inst.get("Placement", {}).get("AvailabilityZone"),
+                        "subnetId": inst.get("SubnetId"),
+                        "vpcId": inst.get("VpcId"),
+                        "amiId": inst.get("ImageId"),
+                        "architecture": inst.get("Architecture"),
+                        "privateDnsName": inst.get("PrivateDnsName"),
                         "privateIpAddress": inst.get("PrivateIpAddress"),
                         "publicIpAddress": inst.get("PublicIpAddress"),
                         "state": inst.get("State", {}).get("Name", "unknown"),
@@ -1175,20 +1567,27 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
             "kubernetesNetworkConfig": cluster_info.get("kubernetesNetworkConfig", {}),
         }
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    def _fetch_k8s():
+        return _fetch_k8s_runtime_sync(connection, cluster_name, cluster_info, aws_region)
+
+    with ThreadPoolExecutor(max_workers=7) as pool:
         f_ng = pool.submit(_fetch_nodegroups)
         f_ad = pool.submit(_fetch_addons)
         f_fg = pool.submit(_fetch_fargate)
         f_up = pool.submit(_fetch_updates)
         f_net = pool.submit(_fetch_networking)
         f_nodes = pool.submit(_fetch_worker_nodes)
+        f_k8s = pool.submit(_fetch_k8s)
 
         nodegroups = f_ng.result()
         addons = f_ad.result()
         fargate_profiles = f_fg.result()
         updates = f_up.result()
         networking = f_net.result()
-        worker_nodes = f_nodes.result()
+        ec2_nodes = f_nodes.result()
+        k8s_nodes_map, pods, k8s_warning = f_k8s.result()
+
+    worker_nodes = _merge_nodes_and_compute_allocations(ec2_nodes, k8s_nodes_map, pods)
 
     aws_state = {
         "status": cluster_info["status"],
@@ -1231,6 +1630,8 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
         "networking": networking,
         "nodegroups": nodegroups,
         "workerNodes": worker_nodes,
+        "pods": pods,
+        "k8sRuntimeWarning": k8s_warning,
         "fargateProfiles": fargate_profiles,
         "addons": addons,
         "updateHistory": updates,
@@ -1540,6 +1941,7 @@ async def delete_cluster(cluster_name: str, x_user_email: str = Header(...)):
                 "deleted",
                 {"timestamp": datetime.utcnow().isoformat(), "status": "DELETING"}
             )
+            final_state["deleteInitiatedBy"] = "tesserak"
             state_manager.save_cluster_state(x_user_email, cluster_name, final_state)
         
         return {"message": f"Cluster {cluster_name} deletion initiated"}

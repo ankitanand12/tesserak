@@ -132,11 +132,12 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
         setError(null);
 
         const latest = data.latest || versions[0]?.version;
-        if (latest && (!config.environment.kubernetesVersion || !versions.some((v) => v.version === config.environment.kubernetesVersion))) {
+        const latestConfig = configRef.current;
+        if (latest && (!latestConfig.environment.kubernetesVersion || !versions.some((v) => v.version === latestConfig.environment.kubernetesVersion))) {
           onChange({
-            ...config,
+            ...latestConfig,
             environment: {
-              ...config.environment,
+              ...latestConfig.environment,
               kubernetesVersion: latest,
             },
           });
@@ -303,6 +304,7 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
   const handleEnvironmentTypeChange = (value: 'Non-Prod' | 'Prod') => {
     onChange({
       ...config,
+      deletionProtection: value === 'Prod' ? Boolean(config.deletionProtection) : false,
       environment: {
         ...config.environment,
         type: value
@@ -595,6 +597,128 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
                 </Grid>
               )}
             </Box>
+
+            {/* Cluster Access */}
+            <Box sx={{ p: 2, borderRadius: 2, border: '1px solid rgba(15, 23, 42, 0.12)', bgcolor: '#ffffff' }}>
+              <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5, color: '#09090b' }}>
+                Cluster Access
+              </Typography>
+              <Grid container spacing={2} alignItems="center">
+                <Grid item xs={12} sm={6}>
+                  <FormControl fullWidth size="small">
+                    <InputLabel>Cluster Authentication Mode</InputLabel>
+                    <Select
+                      value={config.authenticationMode || 'API_AND_CONFIG_MAP'}
+                      label="Cluster Authentication Mode"
+                      onChange={(e) =>
+                        onChange({
+                          ...config,
+                          authenticationMode: e.target.value as 'API_AND_CONFIG_MAP' | 'API',
+                        })
+                      }
+                    >
+                      <MenuItem value="API_AND_CONFIG_MAP">EKS API and ConfigMap (Recommended)</MenuItem>
+                      <MenuItem value="API">EKS API</MenuItem>
+                    </Select>
+                  </FormControl>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={config.bootstrapClusterAdmin !== false}
+                        onChange={(e) =>
+                          onChange({
+                            ...config,
+                            bootstrapClusterAdmin: e.target.checked,
+                          })
+                        }
+                      />
+                    }
+                    label="Allow cluster admin access"
+                  />
+                </Grid>
+              </Grid>
+              <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
+                Grants Kubernetes cluster-admin to your creating IAM identity and keeps CI/CD kubectl access working without lockouts.
+              </Typography>
+            </Box>
+
+            {/* IP Family & Service IPv4 CIDR */}
+            <Box sx={{ p: 2, borderRadius: 2, border: '1px solid rgba(15, 23, 42, 0.12)', bgcolor: '#ffffff' }}>
+              <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5, color: '#09090b' }}>
+                Kubernetes Network Address Family
+              </Typography>
+              <Grid container spacing={2}>
+                <Grid item xs={12} sm={5}>
+                  <FormControl fullWidth size="small">
+                    <InputLabel>IP Address Family</InputLabel>
+                    <Select
+                      value={config.ipFamily || 'ipv4'}
+                      label="IP Address Family"
+                      onChange={(e) =>
+                        onChange({
+                          ...config,
+                          ipFamily: e.target.value as 'ipv4' | 'ipv6',
+                          serviceIpv4Cidr: e.target.value === 'ipv6' ? '' : config.serviceIpv4Cidr,
+                        })
+                      }
+                    >
+                      <MenuItem value="ipv4">IPv4</MenuItem>
+                      <MenuItem value="ipv6">IPv6</MenuItem>
+                    </Select>
+                  </FormControl>
+                </Grid>
+                {(config.ipFamily || 'ipv4') === 'ipv4' && (
+                  <Grid item xs={12} sm={7}>
+                    <TextField
+                      label="Service IPv4 CIDR (Optional)"
+                      size="small"
+                      value={config.serviceIpv4Cidr || ''}
+                      onChange={(e) =>
+                        onChange({
+                          ...config,
+                          serviceIpv4Cidr: e.target.value,
+                        })
+                      }
+                      placeholder="e.g., 10.100.0.0/16"
+                      helperText="Immutable after creation. Leave empty for AWS default."
+                      fullWidth
+                    />
+                  </Grid>
+                )}
+              </Grid>
+            </Box>
+
+            {/* Deletion Protection (shown when Prod environment is selected) */}
+            {config.environment.type === 'Prod' && (
+              <Box
+                sx={{
+                  p: 2,
+                  borderRadius: 2,
+                  border: '1px solid rgba(217, 119, 6, 0.4)',
+                  bgcolor: '#fffbeb',
+                }}
+              >
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={Boolean(config.deletionProtection)}
+                      onChange={(e) =>
+                        onChange({
+                          ...config,
+                          deletionProtection: e.target.checked,
+                        })
+                      }
+                    />
+                  }
+                  label="Turn on deletion protection (Recommended for Prod)"
+                />
+                <Typography variant="caption" color="text.secondary" display="block">
+                  Prevents accidental deletion of this Production cluster until explicitly turned off.
+                </Typography>
+              </Box>
+            )}
 
             {!config.vpc.isNew && vpcSubnets.length > 0 && (
               <>

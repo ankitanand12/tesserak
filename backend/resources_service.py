@@ -182,10 +182,23 @@ def _inspect_s3_bucket_sync(conn: Any, b: Dict[str, Any], region: str, now: str)
 def _scan_s3_sync(conn: Any, region: str, now: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     try:
         s3 = _thread_client(conn, "s3", region)
-        buckets = s3.list_buckets().get("Buckets", [])[:15]
+        buckets: List[Dict[str, Any]] = []
+        resp = s3.list_buckets()
+        buckets.extend(resp.get("Buckets", []))
+        continuation = resp.get("ContinuationToken")
+        while continuation:
+            resp = s3.list_buckets(ContinuationToken=continuation)
+            buckets.extend(resp.get("Buckets", []))
+            continuation = resp.get("ContinuationToken")
+
         if not buckets:
             return [], []
-        with ThreadPoolExecutor(max_workers=min(8, len(buckets))) as pool:
+        # Newest-first so recently created buckets appear immediately at the top
+        buckets.sort(
+            key=lambda b: b.get("CreationDate").timestamp() if hasattr(b.get("CreationDate"), "timestamp") else 0.0,
+            reverse=True,
+        )
+        with ThreadPoolExecutor(max_workers=min(16, len(buckets))) as pool:
             items = list(pool.map(lambda b: _inspect_s3_bucket_sync(conn, b, region, now), buckets))
         return items, []
     except Exception as exc:
@@ -200,6 +213,12 @@ def _inspect_sqs_queue_sync(conn: Any, q_url: str, region: str, now: str) -> Dic
         AttributeNames=["KmsMasterKeyId", "SqsManagedSseEnabled", "CreatedTimestamp"],
     ).get("Attributes", {})
     enc = bool(attrs.get("KmsMasterKeyId") or attrs.get("SqsManagedSseEnabled") == "true")
+    created_iso = now
+    if attrs.get("CreatedTimestamp"):
+        try:
+            created_iso = datetime.utcfromtimestamp(int(attrs["CreatedTimestamp"])).isoformat() + "+00:00"
+        except (TypeError, ValueError):
+            created_iso = now
     return {
         "id": f"aws-sqs-{q_name}",
         "name": q_name,
@@ -213,7 +232,7 @@ def _inspect_sqs_queue_sync(conn: Any, q_url: str, region: str, now: str) -> Dic
         "status": "Active",
         "driftStatus": "In Sync" if enc else "Drifted",
         "guardrailNotes": ["SSE enabled"] if enc else ["Queue encryption disabled"],
-        "createdAt": now,
+        "createdAt": created_iso,
         "lastSyncAt": now,
         "arn": q_url,
         "source": "aws-live",
@@ -223,14 +242,31 @@ def _inspect_sqs_queue_sync(conn: Any, q_url: str, region: str, now: str) -> Dic
 def _scan_sqs_sync(conn: Any, region: str, now: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     try:
         sqs = _thread_client(conn, "sqs", region)
-        queue_urls = sqs.list_queues().get("QueueUrls", [])[:20]
+        queue_urls: List[str] = []
+        resp = sqs.list_queues()
+        queue_urls.extend(resp.get("QueueUrls", []))
+        next_token = resp.get("NextToken")
+        while next_token:
+            resp = sqs.list_queues(NextToken=next_token)
+            queue_urls.extend(resp.get("QueueUrls", []))
+            next_token = resp.get("NextToken")
         if not queue_urls:
             return [], []
-        with ThreadPoolExecutor(max_workers=min(8, len(queue_urls))) as pool:
+        with ThreadPoolExecutor(max_workers=min(12, len(queue_urls))) as pool:
             items = list(pool.map(lambda q_url: _inspect_sqs_queue_sync(conn, q_url, region, now), queue_urls))
         return items, []
     except Exception as exc:
         return [], [f"SQS list skipped: {exc}"]
+
+
+def _created_sort_key(item: Dict[str, Any]) -> float:
+    raw = item.get("createdAt")
+    if not raw or not isinstance(raw, str):
+        return 0.0
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _discover_live_aws_resources_sync(conn: Any) -> Dict[str, Any]:
@@ -261,6 +297,8 @@ def _discover_live_aws_resources_sync(conn: Any) -> Dict[str, Any]:
             items, warnings = fut.result()
             discovered.extend(items)
             scan_warnings.extend(warnings)
+
+    discovered.sort(key=_created_sort_key, reverse=True)
 
     return {
         "awsConnected": True,

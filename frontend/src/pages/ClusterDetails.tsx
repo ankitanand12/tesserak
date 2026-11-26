@@ -42,7 +42,9 @@ import {
   Hub as NetworkIcon,
   Label as TagIcon,
   Memory as ComputeIcon,
+  OpenInNew as OpenInNewIcon,
   Refresh as RefreshIcon,
+  Search as SearchIcon,
   Security as SecurityIcon,
   Storage as StorageIcon,
   Sync as SyncIcon,
@@ -51,6 +53,13 @@ import {
 } from '@mui/icons-material';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useTesserakAuth } from '../auth/AuthContext';
+import {
+  ClusterPod,
+  ClusterWorkerNode,
+  NodeDetailsDialog,
+  formatClusterDateTime,
+  getPodStatusChipColor,
+} from '../components/Clusters/NodeDetailsDialog';
 import { EKS_AMI_TYPES } from '../components/CreateCluster/ClusterEnvironment';
 import { Perspective3DCard } from '../components/Perspective3DCard';
 import { fetchWithSwr, invalidateSwrCache, readSwrCache } from '../utils/swrCache';
@@ -113,17 +122,9 @@ interface ClusterDetailResponse {
     scalingConfig?: { minSize?: number; desiredSize?: number; maxSize?: number };
     subnets?: string[];
   }>;
-  workerNodes?: Array<{
-    instanceId: string;
-    name?: string;
-    nodegroupName?: string;
-    instanceType?: string;
-    availabilityZone?: string;
-    privateIpAddress?: string;
-    publicIpAddress?: string;
-    state?: string;
-    launchTime?: string;
-  }>;
+  workerNodes?: ClusterWorkerNode[];
+  pods?: ClusterPod[];
+  k8sRuntimeWarning?: string | null;
   fargateProfiles: Array<{
     fargateProfileName: string;
     status?: string;
@@ -251,6 +252,8 @@ export const ClusterDetails: React.FC = () => {
 
   const [deleteNgTarget, setDeleteNgTarget] = useState<string | null>(null);
   const [deleteNgSubmitting, setDeleteNgSubmitting] = useState(false);
+  const [selectedNode, setSelectedNode] = useState<ClusterWorkerNode | null>(null);
+  const [podSearch, setPodSearch] = useState('');
 
   const loadDetails = useCallback(
     async (force: boolean = false) => {
@@ -873,47 +876,237 @@ export const ClusterDetails: React.FC = () => {
               <Divider />
 
               <Box>
-                <Typography variant="subtitle1" sx={{ fontWeight: 700, mb: 1.5, color: '#09090b' }}>
-                  EC2 Worker Nodes ({detail?.workerNodes?.length || 0})
-                </Typography>
+                <Box
+                  sx={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                    gap: 1,
+                    mb: 1.5,
+                  }}
+                >
+                  <Typography variant="subtitle1" sx={{ fontWeight: 700, color: '#09090b' }}>
+                    Nodes ({detail?.workerNodes?.length || 0})
+                  </Typography>
+                  <Typography variant="caption" sx={{ color: '#64748b' }}>
+                    Click any node name to inspect system info, capacity allocation, pods, conditions &amp; raw JSON
+                  </Typography>
+                </Box>
+                {detail?.k8sRuntimeWarning && (
+                  <Alert severity="warning" sx={{ mb: 1.5 }}>
+                    Live Kubernetes API inspection notice: {detail.k8sRuntimeWarning}
+                  </Alert>
+                )}
                 {detail?.workerNodes && detail.workerNodes.length > 0 ? (
                   <TableContainer component={Paper} variant="outlined">
                     <Table size="small">
                       <TableHead>
                         <TableRow sx={{ bgcolor: '#f8fafc' }}>
-                          <TableCell><strong>Instance ID</strong></TableCell>
-                          <TableCell><strong>Node Group</strong></TableCell>
-                          <TableCell><strong>Instance Type</strong></TableCell>
-                          <TableCell><strong>AZ</strong></TableCell>
-                          <TableCell><strong>Private / Public IP</strong></TableCell>
-                          <TableCell><strong>State</strong></TableCell>
+                          <TableCell><strong>Node name</strong></TableCell>
+                          <TableCell><strong>Instance type</strong></TableCell>
+                          <TableCell><strong>Capacity type</strong></TableCell>
+                          <TableCell><strong>Node group</strong></TableCell>
+                          <TableCell><strong>Created</strong></TableCell>
+                          <TableCell><strong>Status</strong></TableCell>
                         </TableRow>
                       </TableHead>
                       <TableBody>
-                        {detail.workerNodes.map((n) => (
-                          <TableRow key={n.instanceId}>
-                            <TableCell sx={{ fontFamily: 'monospace', fontWeight: 700 }}>{n.instanceId}</TableCell>
-                            <TableCell>{n.nodegroupName || '—'}</TableCell>
-                            <TableCell>{n.instanceType || '—'}</TableCell>
-                            <TableCell>{n.availabilityZone || '—'}</TableCell>
-                            <TableCell sx={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>
-                              {n.privateIpAddress || '—'}{n.publicIpAddress ? ` / ${n.publicIpAddress}` : ''}
-                            </TableCell>
-                            <TableCell>
-                              <Chip
-                                size="small"
-                                label={n.state || 'unknown'}
-                                color={n.state === 'running' ? 'success' : 'warning'}
-                              />
-                            </TableCell>
-                          </TableRow>
-                        ))}
+                        {detail.workerNodes.map((n) => {
+                          const nodeLabel = n.nodeName || n.name || n.instanceId;
+                          const nodeStatus = n.k8sStatus || n.state || 'unknown';
+                          return (
+                            <TableRow
+                              key={n.instanceId}
+                              hover
+                              onClick={() => setSelectedNode(n)}
+                              sx={{ cursor: 'pointer' }}
+                            >
+                              <TableCell>
+                                <Button
+                                  size="small"
+                                  variant="text"
+                                  endIcon={<OpenInNewIcon sx={{ fontSize: '14px !important' }} />}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setSelectedNode(n);
+                                  }}
+                                  sx={{
+                                    p: 0,
+                                    minWidth: 0,
+                                    textTransform: 'none',
+                                    fontFamily: 'monospace',
+                                    fontWeight: 700,
+                                    color: '#2563eb',
+                                    '&:hover': { textDecoration: 'underline', bgcolor: 'transparent' },
+                                  }}
+                                >
+                                  {nodeLabel}
+                                </Button>
+                              </TableCell>
+                              <TableCell>{n.instanceType || '—'}</TableCell>
+                              <TableCell>{n.capacityType || 'ON_DEMAND'}</TableCell>
+                              <TableCell>{n.nodegroupName || '—'}</TableCell>
+                              <TableCell>
+                                {formatClusterDateTime(n.createdAt || n.launchTime)}
+                              </TableCell>
+                              <TableCell>
+                                <Chip
+                                  size="small"
+                                  label={nodeStatus}
+                                  color={getPodStatusChipColor(nodeStatus)}
+                                />
+                              </TableCell>
+                            </TableRow>
+                          );
+                        })}
                       </TableBody>
                     </Table>
                   </TableContainer>
                 ) : (
                   <Alert severity="info">No running EC2 worker nodes discovered for this cluster yet.</Alert>
                 )}
+              </Box>
+
+              <Divider />
+
+              <Box>
+                <Box
+                  sx={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                    gap: 1.5,
+                    mb: 1.5,
+                  }}
+                >
+                  <Typography variant="subtitle1" sx={{ fontWeight: 700, color: '#09090b' }}>
+                    Cluster Pods ({detail?.pods?.length || 0})
+                  </Typography>
+                  <TextField
+                    size="small"
+                    placeholder="Filter pods by name, namespace, status, IP..."
+                    value={podSearch}
+                    onChange={(e) => setPodSearch(e.target.value)}
+                    InputProps={{
+                      startAdornment: (
+                        <InputAdornment position="start">
+                          <SearchIcon fontSize="small" color="action" />
+                        </InputAdornment>
+                      ),
+                    }}
+                    sx={{ minWidth: { xs: '100%', sm: 290 } }}
+                  />
+                </Box>
+                {(() => {
+                  const podsList = detail?.pods || [];
+                  const q = podSearch.trim().toLowerCase();
+                  const filteredPods = q
+                    ? podsList.filter(
+                        (p) =>
+                          p.name.toLowerCase().includes(q) ||
+                          p.namespace.toLowerCase().includes(q) ||
+                          p.status.toLowerCase().includes(q) ||
+                          (p.podIp || '').toLowerCase().includes(q) ||
+                          (p.nodeName || '').toLowerCase().includes(q)
+                      )
+                    : podsList;
+
+                  if (filteredPods.length === 0) {
+                    return (
+                      <Alert severity="info">
+                        {podsList.length > 0
+                          ? `No pods match "${podSearch}".`
+                          : 'No Kubernetes pods discovered yet for this cluster.'}
+                      </Alert>
+                    );
+                  }
+
+                  return (
+                    <TableContainer component={Paper} variant="outlined" sx={{ maxHeight: 420 }}>
+                      <Table size="small" stickyHeader>
+                        <TableHead>
+                          <TableRow sx={{ bgcolor: '#f8fafc' }}>
+                            <TableCell><strong>Pod Name</strong></TableCell>
+                            <TableCell><strong>Namespace</strong></TableCell>
+                            <TableCell><strong>Status</strong></TableCell>
+                            <TableCell><strong>Restarts</strong></TableCell>
+                            <TableCell><strong>Created Date</strong></TableCell>
+                            <TableCell><strong>Pod IP</strong></TableCell>
+                            <TableCell><strong>Node</strong></TableCell>
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {filteredPods.map((pod) => {
+                            const matchedNode = (detail?.workerNodes || []).find(
+                              (n) =>
+                                pod.nodeName &&
+                                (n.nodeName === pod.nodeName ||
+                                  n.name === pod.nodeName ||
+                                  n.privateDnsName === pod.nodeName)
+                            );
+                            return (
+                              <TableRow key={`${pod.namespace}/${pod.name}`} hover>
+                                <TableCell sx={{ fontFamily: 'monospace', fontWeight: 700 }}>
+                                  {pod.name}{' '}
+                                  {pod.ready && (
+                                    <Typography
+                                      component="span"
+                                      variant="caption"
+                                      sx={{ color: '#64748b', fontWeight: 600, ml: 0.5 }}
+                                    >
+                                      ({pod.ready})
+                                    </Typography>
+                                  )}
+                                </TableCell>
+                                <TableCell>{pod.namespace}</TableCell>
+                                <TableCell>
+                                  <Chip
+                                    size="small"
+                                    label={pod.status}
+                                    color={getPodStatusChipColor(pod.status)}
+                                  />
+                                </TableCell>
+                                <TableCell>{pod.restarts ?? 0}</TableCell>
+                                <TableCell>{formatClusterDateTime(pod.createdAt)}</TableCell>
+                                <TableCell sx={{ fontFamily: 'monospace', fontSize: '0.82rem' }}>
+                                  {pod.podIp || '—'}
+                                </TableCell>
+                                <TableCell>
+                                  {matchedNode ? (
+                                    <Button
+                                      size="small"
+                                      variant="text"
+                                      onClick={() => setSelectedNode(matchedNode)}
+                                      sx={{
+                                        p: 0,
+                                        minWidth: 0,
+                                        textTransform: 'none',
+                                        fontFamily: 'monospace',
+                                        fontSize: '0.8rem',
+                                        color: '#2563eb',
+                                      }}
+                                    >
+                                      {pod.nodeName}
+                                    </Button>
+                                  ) : (
+                                    <Typography
+                                      variant="caption"
+                                      sx={{ fontFamily: 'monospace', color: '#475569' }}
+                                    >
+                                      {pod.nodeName || '—'}
+                                    </Typography>
+                                  )}
+                                </TableCell>
+                              </TableRow>
+                            );
+                          })}
+                        </TableBody>
+                      </Table>
+                    </TableContainer>
+                  );
+                })()}
               </Box>
 
               <Divider />
@@ -1458,6 +1651,12 @@ export const ClusterDetails: React.FC = () => {
           </Button>
         </DialogActions>
       </Dialog>
+      {/* Clickable AWS EKS Node Inspector Dialog */}
+      <NodeDetailsDialog
+        node={selectedNode}
+        pods={detail?.pods || []}
+        onClose={() => setSelectedNode(null)}
+      />
     </Box>
   );
 };

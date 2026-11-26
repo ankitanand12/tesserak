@@ -28,6 +28,7 @@ from db import (
 )
 from integrations_service import utc_now_iso, verify_integration_credentials
 from pipelines_service import (
+    cleanup_pipeline_deployments_sync,
     list_deployable_clusters,
     run_pipeline_async,
     verify_git_remote,
@@ -1368,9 +1369,57 @@ async def trigger_pipeline(pipeline_id: str, payload: PipelineTriggerRequest, x_
 
 
 @router.delete("/api/pipelines/{pipeline_id}")
-async def delete_pipeline(pipeline_id: str, x_user_email: str = Header(default="demo@tesserak.dev")):
+async def delete_pipeline(
+    pipeline_id: str,
+    cleanup_cluster: bool = True,
+    x_user_email: str = Header(default="demo@tesserak.dev"),
+):
     db = get_db()
     clean_email = normalize_email(x_user_email)
+
+    def _get_pipeline_for_delete():
+        with db.session_scope() as session:
+            row = (
+                session.query(PipelineRecord)
+                .filter(
+                    PipelineRecord.id == pipeline_id,
+                    PipelineRecord.user_email == clean_email,
+                )
+                .first()
+            )
+            if not row:
+                return None, None
+            git_token: Optional[str] = None
+            if row.git_integration_id:
+                integ = (
+                    session.query(IntegrationRecord)
+                    .filter(
+                        IntegrationRecord.id == row.git_integration_id,
+                        IntegrationRecord.user_email == clean_email,
+                    )
+                    .first()
+                )
+                if integ:
+                    git_token = db.decrypt_json(integ.secret_payload_enc).get("token")
+            return _pipeline_to_dict(row), git_token
+
+    pipeline_data, git_token = await asyncio.to_thread(_get_pipeline_for_delete)
+    if not pipeline_data:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    cleanup_result: Dict[str, Any] = {
+        "attempted": False,
+        "cleaned": True,
+        "deletedResources": [],
+    }
+    if cleanup_cluster:
+        aws_conn = await connection_manager.get_valid_connection(x_user_email)
+        cleanup_result = await asyncio.to_thread(
+            cleanup_pipeline_deployments_sync,
+            pipeline_data,
+            git_token,
+            aws_conn,
+        )
 
     def _delete_pipeline():
         with db.session_scope() as session:
@@ -1390,4 +1439,4 @@ async def delete_pipeline(pipeline_id: str, x_user_email: str = Header(default="
     deleted = await asyncio.to_thread(_delete_pipeline)
     if not deleted:
         raise HTTPException(status_code=404, detail="Pipeline not found")
-    return {"status": "deleted", "id": pipeline_id}
+    return {"status": "deleted", "id": pipeline_id, "clusterCleanup": cleanup_result}

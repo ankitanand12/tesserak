@@ -85,6 +85,26 @@ const ClusterPreview: React.FC<Props> = ({ config }) => {
             <Field label="Private Subnets" value={config.privateSubnets.join(', ')} />
           )}
           <Field
+            label="Cluster Access"
+            value={`${
+              (config.authenticationMode || 'API_AND_CONFIG_MAP') === 'API'
+                ? 'EKS API'
+                : 'EKS API and ConfigMap'
+            } · ${config.bootstrapClusterAdmin !== false ? 'Admin Allowed' : 'Admin Disallowed'}`}
+          />
+          <Field
+            label="Network IP Family"
+            value={`${(config.ipFamily || 'ipv4').toUpperCase()}${
+              config.serviceIpv4Cidr ? ` · Service CIDR: ${config.serviceIpv4Cidr}` : ' · AWS Auto Service CIDR'
+            }`}
+          />
+          {config.environment.type === 'Prod' && (
+            <Field
+              label="Deletion Protection"
+              value={config.deletionProtection ? 'Enabled' : 'Disabled'}
+            />
+          )}
+          <Field
             label="Cluster & Flow Logs"
             value={config.enableClusterLogs ? 'Enabled' : 'Disabled'}
           />

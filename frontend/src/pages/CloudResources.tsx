@@ -4,6 +4,7 @@ import {
   Box,
   Button,
   Chip,
+  CircularProgress,
   Dialog,
   DialogActions,
   DialogContent,
@@ -12,6 +13,7 @@ import {
   FormControlLabel,
   Grid,
   IconButton,
+  InputAdornment,
   InputLabel,
   MenuItem,
   Select,
@@ -33,11 +35,13 @@ import {
   Delete as DeleteIcon,
   Lock as LockIcon,
   Refresh as RefreshIcon,
+  Search as SearchIcon,
   Storage as StorageIcon,
   SyncProblem as SyncProblemIcon,
 } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
 import { useTesserakAuth } from '../auth/AuthContext';
+import { ConfirmDeleteDialog } from '../components/ConfirmDeleteDialog';
 import { Perspective3DCard } from '../components/Perspective3DCard';
 import { CloudResource } from '../types/platform';
 import { fetchWithSwr, invalidateSwrCache, readSwrCache } from '../utils/swrCache';
@@ -67,10 +71,14 @@ export const CloudResources: React.FC = () => {
   const [accountId, setAccountId] = useState<string | null>(() => cachedRes?.accountId ?? null);
   const [awsRegion, setAwsRegion] = useState<string | null>(() => cachedRes?.awsRegion ?? null);
   const [loading, setLoading] = useState(() => cachedRes === undefined);
+  const [syncing, setSyncing] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [modalError, setModalError] = useState('');
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<CloudResource | null>(null);
+  const [deletingResource, setDeletingResource] = useState(false);
 
   const [name, setName] = useState('');
   const [serviceType, setServiceType] = useState('S3 Bucket');
@@ -236,12 +244,14 @@ export const CloudResources: React.FC = () => {
     }
   };
 
-  const handleDelete = async (resItem: CloudResource) => {
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget) return;
+    setDeletingResource(true);
     setError('');
     setSuccessMsg('');
     try {
       const res = await fetch(
-        `http://localhost:8000/api/resources/${encodeURIComponent(resItem.id)}?environment=${encodeURIComponent(resItem.environment)}`,
+        `http://localhost:8000/api/resources/${encodeURIComponent(deleteTarget.id)}?environment=${encodeURIComponent(deleteTarget.environment)}`,
         {
           method: 'DELETE',
           headers: { 'x-user-email': userEmail },
@@ -253,17 +263,31 @@ export const CloudResources: React.FC = () => {
         return;
       }
       setSuccessMsg(data.message || 'Deleted cleanly.');
+      setDeleteTarget(null);
       invalidateSwrCache(userEmail, 'resources');
       invalidateSwrCache(userEmail, 'overview');
       invalidateSwrCache(userEmail, 'guardrails');
       await fetchResources(true);
     } catch {
       setError('Delete request failed');
+    } finally {
+      setDeletingResource(false);
     }
   };
 
   const driftedCount = resources.filter((r) => r.driftStatus === 'Drifted').length;
   const pendingCount = resources.filter((r) => r.status === 'Pending Approval').length;
+  const searchNeedle = searchQuery.trim().toLowerCase();
+  const filteredResources = searchNeedle
+    ? resources.filter(
+        (r) =>
+          r.name.toLowerCase().includes(searchNeedle) ||
+          r.serviceType.toLowerCase().includes(searchNeedle) ||
+          r.region.toLowerCase().includes(searchNeedle) ||
+          r.environment.toLowerCase().includes(searchNeedle) ||
+          (r.status || '').toLowerCase().includes(searchNeedle)
+      )
+    : resources;
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
@@ -300,11 +324,22 @@ export const CloudResources: React.FC = () => {
         <Box sx={{ display: 'flex', gap: 1 }}>
           <Button
             variant="outlined"
-            startIcon={<RefreshIcon />}
-            onClick={() => fetchResources(true)}
+            disabled={syncing}
+            startIcon={syncing ? <CircularProgress size={16} color="inherit" /> : <RefreshIcon />}
+            onClick={async () => {
+              setSyncing(true);
+              setSuccessMsg('');
+              invalidateSwrCache(userEmail, 'resources');
+              try {
+                await fetchResources(true);
+                setSuccessMsg('Live AWS inventory synchronized.');
+              } finally {
+                setSyncing(false);
+              }
+            }}
             sx={{ borderColor: '#09090b', color: '#09090b' }}
           >
-            Sync AWS
+            {syncing ? 'Syncing...' : 'Sync AWS'}
           </Button>
           <Button
             variant="contained"
@@ -409,6 +444,8 @@ export const CloudResources: React.FC = () => {
             display: 'flex',
             justifyContent: 'space-between',
             alignItems: 'center',
+            flexWrap: 'wrap',
+            gap: 1.5,
           }}
         >
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -416,7 +453,36 @@ export const CloudResources: React.FC = () => {
             <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
               Live AWS Cloud Inventory
             </Typography>
+            <Chip
+              size="small"
+              label={
+                searchNeedle
+                  ? `${filteredResources.length} of ${resources.length}`
+                  : `${resources.length}`
+              }
+              sx={{ bgcolor: 'rgba(59,130,246,0.2)', color: '#93c5fd', fontWeight: 700 }}
+            />
           </Box>
+          <TextField
+            size="small"
+            placeholder="Search resources, service, region..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            InputProps={{
+              startAdornment: (
+                <InputAdornment position="start">
+                  <SearchIcon sx={{ color: '#94a3b8', fontSize: 18 }} />
+                </InputAdornment>
+              ),
+            }}
+            sx={{
+              minWidth: { xs: '100%', sm: 280 },
+              bgcolor: 'rgba(255,255,255,0.08)',
+              borderRadius: 1.5,
+              '& input': { color: '#ffffff', fontSize: '0.85rem' },
+              '& fieldset': { borderColor: 'rgba(148,163,184,0.3)' },
+            }}
+          />
         </Box>
 
         <TableContainer>
@@ -440,16 +506,18 @@ export const CloudResources: React.FC = () => {
                     Querying live AWS services...
                   </TableCell>
                 </TableRow>
-              ) : resources.length === 0 ? (
+              ) : filteredResources.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={6} align="center" sx={{ py: 4, color: '#64748b' }}>
-                    {awsConnected
+                    {resources.length > 0
+                      ? `No resources match "${searchQuery}".`
+                      : awsConnected
                       ? 'No RDS, ElastiCache, S3, or SQS resources found in this AWS account yet.'
                       : 'Connect an AWS IAM account in Integrations to discover live resources.'}
                   </TableCell>
                 </TableRow>
               ) : (
-                resources.map((res) => (
+                filteredResources.map((res) => (
                   <TableRow key={res.id} hover>
                     <TableCell>
                       <Typography variant="body2" sx={{ fontWeight: 700, color: '#09090b' }}>
@@ -521,7 +589,11 @@ export const CloudResources: React.FC = () => {
                           </Tooltip>
                         )}
                         <Tooltip title="Delete Resource (checked by Guardrails)">
-                          <IconButton size="small" onClick={() => handleDelete(res)}>
+                          <IconButton
+                            size="small"
+                            aria-label={`Delete ${res.name}`}
+                            onClick={() => setDeleteTarget(res)}
+                          >
                             <DeleteIcon fontSize="small" sx={{ color: '#475569' }} />
                           </IconButton>
                         </Tooltip>
@@ -638,6 +710,20 @@ export const CloudResources: React.FC = () => {
           </DialogActions>
         </form>
       </Dialog>
+
+      <ConfirmDeleteDialog
+        open={Boolean(deleteTarget)}
+        title="Delete AWS Resource?"
+        description={
+          <>
+            This will permanently delete <strong>{deleteTarget?.name}</strong> ({deleteTarget?.serviceType} in{' '}
+            {deleteTarget?.region}). Active Guardrail deletion protections will be evaluated.
+          </>
+        }
+        loading={deletingResource}
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={handleConfirmDelete}
+      />
     </Box>
   );
 };

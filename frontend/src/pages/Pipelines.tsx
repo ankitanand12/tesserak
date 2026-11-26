@@ -1,8 +1,9 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Alert,
   Box,
   Button,
+  Checkbox,
   Chip,
   CircularProgress,
   Dialog,
@@ -11,6 +12,7 @@ import {
   DialogTitle,
   Divider,
   FormControl,
+  FormControlLabel,
   Grid,
   IconButton,
   InputLabel,
@@ -31,6 +33,7 @@ import {
 } from '@mui/icons-material';
 import { useLocation } from 'react-router-dom';
 import { useTesserakAuth } from '../auth/AuthContext';
+import { ConfirmDeleteDialog } from '../components/ConfirmDeleteDialog';
 import { Perspective3DCard } from '../components/Perspective3DCard';
 import { ClusterTarget, IntegrationItem, PipelineItem } from '../types/platform';
 import { fetchWithSwr, invalidateSwrCache, readSwrCache } from '../utils/swrCache';
@@ -57,11 +60,17 @@ export const Pipelines: React.FC = () => {
   const [selectedLogPipelineId, setSelectedLogPipelineId] = useState<string | null>(
     requestedPipelineId || cachedPip?.pipelines?.[0]?.id || null
   );
+  const hasAutoSelectedLogRef = useRef<boolean>(
+    Boolean(requestedPipelineId || (cachedPip?.pipelines?.length ?? 0) > 0)
+  );
   const [createOpen, setCreateOpen] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [modalError, setModalError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<PipelineItem | null>(null);
+  const [cleanupClusterOnDelete, setCleanupClusterOnDelete] = useState(true);
+  const [deletingPipeline, setDeletingPipeline] = useState(false);
 
   const [name, setName] = useState('');
   const [repositoryUrl, setRepositoryUrl] = useState('');
@@ -105,23 +114,25 @@ export const Pipelines: React.FC = () => {
         );
 
         setPipelines(bundle.pipelines);
-        if (bundle.pipelines.length > 0 && !selectedLogPipelineId) {
+        if (bundle.pipelines.length > 0 && !hasAutoSelectedLogRef.current) {
+          hasAutoSelectedLogRef.current = true;
           setSelectedLogPipelineId(bundle.pipelines[0].id);
         }
         setClusterTargets(bundle.clusterTargets);
-        if (bundle.clusterTargets.length > 0 && !targetCluster) {
-          setTargetCluster(bundle.clusterTargets[0].id);
+        if (bundle.clusterTargets.length > 0) {
+          setTargetCluster((prev) => prev || bundle.clusterTargets[0].id);
         }
         setGitIntegrations(bundle.gitIntegrations);
       } catch {
         setError('Unable to reach backend CI/CD runner');
       }
     },
-    [userEmail, selectedLogPipelineId, targetCluster]
+    [userEmail]
   );
 
   useEffect(() => {
     if (requestedPipelineId) {
+      hasAutoSelectedLogRef.current = true;
       setSelectedLogPipelineId(requestedPipelineId);
     }
   }, [requestedPipelineId]);
@@ -178,6 +189,7 @@ export const Pipelines: React.FC = () => {
       setRepositoryUrl('');
       setDockerfilePath('');
       setImageTag('');
+      hasAutoSelectedLogRef.current = true;
       setSelectedLogPipelineId(data.id);
       setNotice(`Git verified (${data.verifiedRemoteSha}). Pipeline "${data.name}" ready to run.`);
       invalidateSwrCache(userEmail, 'pipelines');
@@ -207,6 +219,7 @@ export const Pipelines: React.FC = () => {
         setError(data.detail || 'Failed to trigger pipeline run');
         return;
       }
+      hasAutoSelectedLogRef.current = true;
       setSelectedLogPipelineId(pipeline.id);
       setNotice(`Executing "${pipeline.name}" on backend (git clone → scan → kubectl apply)...`);
       invalidateSwrCache(userEmail, 'pipelines');
@@ -217,16 +230,45 @@ export const Pipelines: React.FC = () => {
     }
   };
 
-  const handleDelete = async (pipelineId: string) => {
-    const res = await fetch(`http://localhost:8000/api/pipelines/${pipelineId}`, {
-      method: 'DELETE',
-      headers: { 'x-user-email': userEmail },
-    });
-    if (res.ok) {
-      setNotice('Pipeline removed.');
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget) return;
+    setDeletingPipeline(true);
+    setError('');
+    setNotice('');
+    try {
+      const res = await fetch(
+        `http://localhost:8000/api/pipelines/${encodeURIComponent(deleteTarget.id)}?cleanup_cluster=${cleanupClusterOnDelete}`,
+        {
+          method: 'DELETE',
+          headers: { 'x-user-email': userEmail },
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.detail || 'Failed to remove pipeline');
+        return;
+      }
+      const deletedRes: string[] = data?.clusterCleanup?.deletedResources || [];
+      const cleanupErr: string | undefined = data?.clusterCleanup?.error;
+      if (deletedRes.length > 0) {
+        setNotice(
+          `Pipeline "${deleteTarget.name}" removed and deleted from cluster: ${deletedRes.join(', ')}.`
+        );
+      } else if (cleanupErr) {
+        setNotice(
+          `Pipeline "${deleteTarget.name}" removed (cluster cleanup notice: ${cleanupErr}).`
+        );
+      } else {
+        setNotice(`Pipeline "${deleteTarget.name}" removed.`);
+      }
+      setDeleteTarget(null);
       invalidateSwrCache(userEmail, 'pipelines');
       invalidateSwrCache(userEmail, 'overview');
       await loadPipelines(true);
+    } catch {
+      setError('Failed to delete pipeline');
+    } finally {
+      setDeletingPipeline(false);
     }
   };
 
@@ -371,8 +413,12 @@ export const Pipelines: React.FC = () => {
                         <Button
                           size="small"
                           variant="outlined"
+                          aria-expanded={isExpanded}
                           startIcon={<TerminalIcon />}
-                          onClick={() => setSelectedLogPipelineId(isExpanded ? null : pip.id)}
+                          onClick={() => {
+                            hasAutoSelectedLogRef.current = true;
+                            setSelectedLogPipelineId((prev) => (prev === pip.id ? null : pip.id));
+                          }}
                           sx={{ borderColor: 'rgba(15,23,42,0.22)', color: '#09090b' }}
                         >
                           {isExpanded ? 'Hide Logs' : 'Execution Logs'}
@@ -386,7 +432,14 @@ export const Pipelines: React.FC = () => {
                         >
                           {isRunning ? 'Running...' : 'Run Pipeline'}
                         </Button>
-                        <IconButton size="small" onClick={() => handleDelete(pip.id)}>
+                        <IconButton
+                          size="small"
+                          aria-label={`Delete ${pip.name}`}
+                          onClick={() => {
+                            setCleanupClusterOnDelete(true);
+                            setDeleteTarget(pip);
+                          }}
+                        >
                           <DeleteIcon fontSize="small" sx={{ color: '#64748b' }} />
                         </IconButton>
                       </Box>
@@ -633,6 +686,31 @@ export const Pipelines: React.FC = () => {
           </DialogActions>
         </form>
       </Dialog>
+
+      <ConfirmDeleteDialog
+        open={Boolean(deleteTarget)}
+        title="Delete CI/CD Pipeline?"
+        description={
+          <>
+            Are you sure you want to delete pipeline <strong>{deleteTarget?.name}</strong>?
+          </>
+        }
+        loading={deletingPipeline}
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={handleConfirmDelete}
+      >
+        {deleteTarget && (
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={cleanupClusterOnDelete}
+                onChange={(e) => setCleanupClusterOnDelete(e.target.checked)}
+              />
+            }
+            label={`Also delete all deployments/resources created in ${deleteTarget.targetCluster} (${deleteTarget.namespace})`}
+          />
+        )}
+      </ConfirmDeleteDialog>
     </Box>
   );
 };
