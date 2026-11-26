@@ -2,6 +2,7 @@ from typing import Dict, List, Optional, Tuple
 from pydantic import BaseModel
 from datetime import datetime
 import asyncio
+import os
 import boto3
 from botocore.config import Config
 import time
@@ -205,12 +206,76 @@ class ConnectionManager:
                 return conn
         return None
 
-    async def get_aws_client(self, user_email: str, service: str = 'eks', region: Optional[str] = None) -> Optional[boto3.client]:
-        """Get a boto3 client using valid credentials."""
-        conn = await self.get_valid_connection(user_email)
+    async def get_connection_for_account(
+        self,
+        user_email: str,
+        account_id: Optional[str] = None,
+    ) -> Optional[Connection]:
+        """Strictly resolve the user's valid AWS connector matching `account_id` when supplied."""
+        clean_acct = (account_id or "").strip()
+        if not clean_acct:
+            return await self.get_valid_connection(user_email)
+
+        connections = await self.list_connections(user_email)
+        sorted_conns = sorted(
+            connections,
+            key=lambda x: x.lastUpdated or x.createdAt or "",
+            reverse=True,
+        )
+        for conn in sorted_conns:
+            is_valid, _, verified_acct = await self.test_connection(conn, use_cache=True)
+            if is_valid and verified_acct == clean_acct:
+                return conn
+        return None
+
+    @staticmethod
+    def get_platform_catalog_connection() -> Optional[Connection]:
+        """Optional read-only platform IAM fallback for global AWS catalog endpoints."""
+        ak = os.getenv("TESSERAK_CATALOG_AWS_ACCESS_KEY_ID", "").strip()
+        sk = os.getenv("TESSERAK_CATALOG_AWS_SECRET_ACCESS_KEY", "").strip()
+        if not ak or not sk:
+            return None
+        region = os.getenv("TESSERAK_CATALOG_AWS_REGION", "us-east-1").strip() or "us-east-1"
+        return Connection(
+            id="platform_catalog",
+            accessKey=ak,
+            secretKey=sk,
+            region=region,
+            accountName="Platform Read-Only Catalog",
+            type="aws",
+            status="connected",
+            createdAt="",
+            createdBy="system",
+            lastUpdated="",
+        )
+
+    async def get_catalog_connection(
+        self,
+        user_email: str,
+        account_id: Optional[str] = None,
+    ) -> Optional[Connection]:
+        """Resolve optional platform catalog IAM key first, else user's valid connector."""
+        platform_conn = self.get_platform_catalog_connection()
+        if platform_conn:
+            return platform_conn
+        if account_id:
+            matched = await self.get_connection_for_account(user_email, account_id)
+            if matched:
+                return matched
+        return await self.get_valid_connection(user_email)
+
+    async def get_aws_client(
+        self,
+        user_email: str,
+        service: str = 'eks',
+        region: Optional[str] = None,
+        account_id: Optional[str] = None,
+    ) -> Optional[boto3.client]:
+        """Get a boto3 client using valid credentials strictly scoped when `account_id` is given."""
+        conn = await self.get_connection_for_account(user_email, account_id)
         if not conn:
             return None
-            
+
         return boto3.client(
             service,
             aws_access_key_id=conn.accessKey,

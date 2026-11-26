@@ -312,14 +312,28 @@ def _get_eks_supported_versions_sync(conn: Any, region: Optional[str] = None) ->
     return payload
 
 
+async def _resolve_account_connection(user_email: str, account_id: Optional[str] = None) -> Any:
+    """Resolve connector strictly scoped to `account_id` when supplied, raising HTTP 400 on miss."""
+    conn = await connection_manager.get_connection_for_account(user_email, account_id)
+    if not conn:
+        detail = (
+            f"No valid AWS IAM connector found matching AWS account {account_id}."
+            if account_id
+            else "No valid AWS connection found. Please add AWS credentials in Integrations."
+        )
+        raise HTTPException(status_code=400, detail=detail)
+    return conn
+
+
 @app.get("/api/aws/eks-versions", dependencies=[Depends(require_auth_if_configured)])
 async def get_eks_versions(
     region: Optional[str] = None,
+    account_id: Optional[str] = None,
     x_user_email: str = Header(...),
 ):
-    conn = await connection_manager.get_valid_connection(x_user_email)
+    conn = await connection_manager.get_catalog_connection(x_user_email, account_id)
     if not conn:
-        raise HTTPException(status_code=400, detail="No valid AWS connection found")
+        raise HTTPException(status_code=400, detail="No valid AWS connection or platform catalog credentials found")
     try:
         result = await asyncio.to_thread(_get_eks_supported_versions_sync, conn, region)
         target_region = region or conn.region or "us-east-1"
@@ -418,13 +432,14 @@ def _fetch_all_addon_versions_sync(conn: Any, eks_version: str, region: Optional
 async def get_addon_versions(
     eks_version: str,
     region: Optional[str] = None,
+    account_id: Optional[str] = None,
     x_user_email: str = Header(...),
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Get available versions for AWS & Community EKS addons in parallel."""
     try:
-        conn = await connection_manager.get_valid_connection(x_user_email)
+        conn = await connection_manager.get_catalog_connection(x_user_email, account_id)
         if not conn:
-            raise HTTPException(status_code=400, detail="No active AWS connection found")
+            raise HTTPException(status_code=400, detail="No active AWS connection or catalog credentials found")
         return await asyncio.to_thread(_fetch_all_addon_versions_sync, conn, eks_version, region)
     except HTTPException:
         raise
@@ -597,9 +612,7 @@ def _create_vpc_sync(conn: Any, payload: VpcCreateRequest) -> Dict[str, Any]:
 
 @app.post("/api/vpc", dependencies=[Depends(require_auth_if_configured)])
 async def create_vpc(payload: VpcCreateRequest, x_user_email: str = Header(...)):
-    conn = await connection_manager.get_valid_connection(x_user_email)
-    if not conn:
-        raise HTTPException(status_code=400, detail="No valid AWS connection found.")
+    conn = await _resolve_account_connection(x_user_email, payload.accountId)
     try:
         return await asyncio.to_thread(_create_vpc_sync, conn, payload)
     except Exception as e:
@@ -842,12 +855,7 @@ async def _finalize_cluster_addons(
 @app.post("/clusters", response_model=ClusterResponse, dependencies=[Depends(require_auth_if_configured)])
 async def create_cluster(cluster: ClusterRequest, x_user_email: str = Header(...)):
     try:
-        conn = await connection_manager.get_valid_connection(x_user_email)
-        if not conn:
-            raise HTTPException(
-                status_code=400,
-                detail="No valid AWS connection found. Please add AWS credentials in Integrations.",
-            )
+        conn = await _resolve_account_connection(x_user_email, cluster.accountId)
 
         account_id, region, aws_cluster = await asyncio.to_thread(
             _create_eks_cluster_sync,
@@ -1050,23 +1058,22 @@ def _list_clusters_sync(connection: Any, x_user_email: str, account_id: Optional
 
 
 @app.get("/clusters", response_model=List[ClusterResponse], dependencies=[Depends(require_auth_if_configured)])
-async def list_clusters(refresh: bool = False, x_user_email: str = Header(...)):
+async def list_clusters(
+    refresh: bool = False,
+    account_id: Optional[str] = None,
+    x_user_email: str = Header(...),
+):
     try:
-        cache_key = x_user_email.strip().lower()
+        cache_key = f"{x_user_email.strip().lower()}::{(account_id or 'default').strip()}"
         if not refresh:
             cached = _CLUSTER_LIST_CACHE.get(cache_key)
             if cached and cached[0] > time.monotonic():
                 return cached[1]
 
-        connection = await connection_manager.get_valid_connection(x_user_email)
-        if not connection:
-            raise HTTPException(
-                status_code=400,
-                detail="No valid AWS connection found. Please add AWS credentials in the Connectors section.",
-            )
+        connection = await _resolve_account_connection(x_user_email, account_id)
 
-        _, _, account_id = await connection_manager.test_connection(connection, use_cache=True)
-        clusters = await asyncio.to_thread(_list_clusters_sync, connection, x_user_email, account_id)
+        _, _, resolved_account_id = await connection_manager.test_connection(connection, use_cache=True)
+        clusters = await asyncio.to_thread(_list_clusters_sync, connection, x_user_email, resolved_account_id)
         _CLUSTER_LIST_CACHE[cache_key] = (time.monotonic() + 20.0, clusters)
         return clusters
     except HTTPException:
@@ -1650,21 +1657,20 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
 
 
 @app.get("/clusters/{cluster_name}", dependencies=[Depends(require_auth_if_configured)])
-async def get_cluster_details(cluster_name: str, x_user_email: str = Header(...)):
+async def get_cluster_details(
+    cluster_name: str,
+    account_id: Optional[str] = None,
+    x_user_email: str = Header(...),
+):
     try:
-        connection = await connection_manager.get_valid_connection(x_user_email)
-        if not connection:
-            raise HTTPException(
-                status_code=400,
-                detail="No valid AWS connection found. Please add AWS credentials in Integrations.",
-            )
-        _, _, account_id = await connection_manager.test_connection(connection, use_cache=True)
+        connection = await _resolve_account_connection(x_user_email, account_id)
+        _, _, resolved_account_id = await connection_manager.test_connection(connection, use_cache=True)
         return await asyncio.to_thread(
             _get_cluster_details_sync,
             connection,
             x_user_email,
             cluster_name,
-            account_id,
+            resolved_account_id,
         )
     except HTTPException:
         raise
@@ -1828,12 +1834,11 @@ def _create_nodegroup_sync(
 async def create_cluster_nodegroup(
     cluster_name: str,
     payload: NodeGroupCreateRequest,
+    account_id: Optional[str] = None,
     x_user_email: str = Header(...),
 ):
     try:
-        connection = await connection_manager.get_valid_connection(x_user_email)
-        if not connection:
-            raise HTTPException(status_code=400, detail="No valid AWS connection found.")
+        connection = await _resolve_account_connection(x_user_email, account_id)
         return await asyncio.to_thread(_create_nodegroup_sync, connection, cluster_name, payload, x_user_email)
     except HTTPException:
         raise
@@ -1846,14 +1851,13 @@ async def scale_cluster_nodegroup(
     cluster_name: str,
     nodegroup_name: str,
     payload: NodeGroupScaleRequest,
+    account_id: Optional[str] = None,
     x_user_email: str = Header(...),
 ):
     if payload.minSize > payload.desiredSize or payload.desiredSize > payload.maxSize:
         raise HTTPException(status_code=400, detail="Scaling config must satisfy minSize <= desiredSize <= maxSize.")
     try:
-        connection = await connection_manager.get_valid_connection(x_user_email)
-        if not connection:
-            raise HTTPException(status_code=400, detail="No valid AWS connection found.")
+        connection = await _resolve_account_connection(x_user_email, account_id)
 
         def _scale_sync():
             eks = boto3.client(
@@ -1886,12 +1890,11 @@ async def scale_cluster_nodegroup(
 async def delete_cluster_nodegroup(
     cluster_name: str,
     nodegroup_name: str,
+    account_id: Optional[str] = None,
     x_user_email: str = Header(...),
 ):
     try:
-        connection = await connection_manager.get_valid_connection(x_user_email)
-        if not connection:
-            raise HTTPException(status_code=400, detail="No valid AWS connection found.")
+        connection = await _resolve_account_connection(x_user_email, account_id)
 
         def _delete_ng_sync():
             eks = boto3.client(
@@ -1913,14 +1916,17 @@ async def delete_cluster_nodegroup(
 
 
 @app.delete("/clusters/{cluster_name}", dependencies=[Depends(require_auth_if_configured)])
-async def delete_cluster(cluster_name: str, x_user_email: str = Header(...)):
+async def delete_cluster(
+    cluster_name: str,
+    account_id: Optional[str] = None,
+    x_user_email: str = Header(...),
+):
     try:
-        # Get AWS client with user's credentials
-        eks_client = await connection_manager.get_aws_client(x_user_email)
+        eks_client = await connection_manager.get_aws_client(x_user_email, account_id=account_id)
         if not eks_client:
             raise HTTPException(
                 status_code=400,
-                detail="No valid AWS connection found. Please add AWS credentials in the Connectors section."
+                detail=f"No valid AWS connection found{' for account ' + account_id if account_id else ''}. Please add AWS credentials in Integrations.",
             )
 
         # Get current state before deletion
@@ -1960,13 +1966,17 @@ async def delete_cluster(cluster_name: str, x_user_email: str = Header(...)):
 
 
 @app.post("/clusters/{cluster_name}/sync", dependencies=[Depends(require_auth_if_configured)])
-async def sync_cluster_state(cluster_name: str, x_user_email: str = Header(...)):
+async def sync_cluster_state(
+    cluster_name: str,
+    account_id: Optional[str] = None,
+    x_user_email: str = Header(...),
+):
     try:
-        eks_client = await connection_manager.get_aws_client(x_user_email)
+        eks_client = await connection_manager.get_aws_client(x_user_email, account_id=account_id)
         if not eks_client:
             raise HTTPException(
                 status_code=400,
-                detail="No valid AWS connection found. Please add AWS credentials in the Connectors section."
+                detail=f"No valid AWS connection found{' for account ' + account_id if account_id else ''}. Please add AWS credentials in Integrations.",
             )
 
         cluster_info = await asyncio.to_thread(lambda: eks_client.describe_cluster(name=cluster_name)['cluster'])
@@ -2078,9 +2088,7 @@ async def get_aws_regions(account_id: str, x_user_email: str = Header(...)):
         if cached and cached[0] > time.monotonic():
             return cached[1]
 
-        connection = await connection_manager.get_valid_connection(x_user_email)
-        if not connection:
-            raise HTTPException(status_code=400, detail="No active connection found")
+        connection = await _resolve_account_connection(x_user_email, account_id)
 
         def _fetch_regions_sync():
             client = boto3.client(
@@ -2109,9 +2117,7 @@ async def get_aws_vpcs(account_id: str, region: str, x_user_email: str = Header(
         if cached and cached[0] > time.monotonic():
             return cached[1]
 
-        connection = await connection_manager.get_valid_connection(x_user_email)
-        if not connection:
-            raise HTTPException(status_code=400, detail="No active connection found")
+        connection = await _resolve_account_connection(x_user_email, account_id)
 
         def _fetch_vpcs_sync():
             client = boto3.client(
@@ -2153,9 +2159,7 @@ async def get_aws_availability_zones(account_id: str, region: str, x_user_email:
         if cached and cached[0] > time.monotonic():
             return cached[1]
 
-        connection = await connection_manager.get_valid_connection(x_user_email)
-        if not connection:
-            raise HTTPException(status_code=400, detail="No active connection found")
+        connection = await _resolve_account_connection(x_user_email, account_id)
 
         def _fetch_zones_sync():
             client = boto3.client(
@@ -2198,9 +2202,7 @@ async def get_aws_vpc_subnets(account_id: str, region: str, vpc_id: str, x_user_
         if cached and cached[0] > time.monotonic():
             return cached[1]
 
-        connection = await connection_manager.get_valid_connection(x_user_email)
-        if not connection:
-            raise HTTPException(status_code=400, detail="No active connection found")
+        connection = await _resolve_account_connection(x_user_email, account_id)
 
         def _fetch_subnets_sync():
             client = boto3.client(
@@ -2312,9 +2314,12 @@ async def get_eks_recommended_ami(
     x_user_email: str = Header(...),
 ):
     try:
-        connection = await connection_manager.get_valid_connection(x_user_email)
+        connection = await connection_manager.get_catalog_connection(x_user_email, account_id)
         if not connection:
-            raise HTTPException(status_code=400, detail="No active connection found")
+            raise HTTPException(
+                status_code=400,
+                detail="No active connection or platform catalog credentials found",
+            )
         return await asyncio.to_thread(_get_eks_ami_sync, connection, region, ami_type, kubernetes_version)
     except HTTPException:
         raise
@@ -2458,31 +2463,42 @@ def _filter_instance_types_for_ami(catalog: List[Dict[str, Any]], ami_type: str)
     ]
 
 
+def _get_cached_ec2_catalog_only(region: str) -> Optional[Tuple[List[Dict[str, Any]], str]]:
+    clean_region = (region or "us-east-1").strip()
+    mem_key = f"ec2_instance_types:{clean_region}"
+    db_key = f"ec2_instance_types:{clean_region}"
+
+    cached = _EKS_META_CACHE.get(mem_key)
+    if cached and cached[0] > time.monotonic():
+        return cached[1], "memory-cache"
+
+    try:
+        db = get_db()
+        with db.session_scope() as session:
+            row = (
+                session.query(AwsCatalogCacheRecord)
+                .filter(AwsCatalogCacheRecord.cache_key == db_key)
+                .first()
+            )
+            if row and row.updated_at:
+                age_sec = (datetime.utcnow() - row.updated_at).total_seconds()
+                if age_sec < _EC2_CATALOG_TTL_SECONDS and isinstance(row.payload_json, list):
+                    _EKS_META_CACHE[mem_key] = (time.monotonic() + 3600.0, row.payload_json)
+                    return row.payload_json, "db-cache"
+    except Exception as db_exc:
+        logger.warning(f"EC2 catalog DB cache read skipped: {db_exc}")
+    return None
+
+
 def _load_ec2_catalog_sync(connection: Any, region: str, refresh: bool = False) -> Tuple[List[Dict[str, Any]], str]:
     clean_region = (region or getattr(connection, "region", None) or "us-east-1").strip()
     mem_key = f"ec2_instance_types:{clean_region}"
     db_key = f"ec2_instance_types:{clean_region}"
 
     if not refresh:
-        cached = _EKS_META_CACHE.get(mem_key)
-        if cached and cached[0] > time.monotonic():
-            return cached[1], "memory-cache"
-
-        try:
-            db = get_db()
-            with db.session_scope() as session:
-                row = (
-                    session.query(AwsCatalogCacheRecord)
-                    .filter(AwsCatalogCacheRecord.cache_key == db_key)
-                    .first()
-                )
-                if row and row.updated_at:
-                    age_sec = (datetime.utcnow() - row.updated_at).total_seconds()
-                    if age_sec < _EC2_CATALOG_TTL_SECONDS and isinstance(row.payload_json, list):
-                        _EKS_META_CACHE[mem_key] = (time.monotonic() + 3600.0, row.payload_json)
-                        return row.payload_json, "db-cache"
-        except Exception as db_exc:
-            logger.warning(f"EC2 catalog DB cache read skipped: {db_exc}")
+        cached_hit = _get_cached_ec2_catalog_only(clean_region)
+        if cached_hit:
+            return cached_hit
 
     ec2 = boto3.client(
         "ec2",
@@ -2549,9 +2565,26 @@ async def get_eks_compatible_instance_types(
     x_user_email: str = Header(...),
 ):
     try:
-        connection = await connection_manager.get_valid_connection(x_user_email)
+        if not refresh:
+            cached_hit = await asyncio.to_thread(_get_cached_ec2_catalog_only, region)
+            if cached_hit:
+                catalog, source = cached_hit
+                compatible = _filter_instance_types_for_ami(catalog, ami_type)
+                return {
+                    "region": region,
+                    "amiType": ami_type,
+                    "source": source,
+                    "totalCatalogCount": len(catalog),
+                    "count": len(compatible),
+                    "instanceTypes": compatible,
+                }
+
+        connection = await connection_manager.get_catalog_connection(x_user_email, account_id)
         if not connection:
-            raise HTTPException(status_code=400, detail="No active connection found")
+            raise HTTPException(
+                status_code=400,
+                detail="No active connection or platform catalog credentials found",
+            )
         catalog, source = await asyncio.to_thread(_load_ec2_catalog_sync, connection, region, refresh)
         compatible = _filter_instance_types_for_ami(catalog, ami_type)
         return {

@@ -345,6 +345,69 @@ class RegressionFixesTest(unittest.TestCase):
         self.assertEqual(src2, "memory-cache")
         self.assertEqual(fake_ec2.get_paginator.call_count, 1)
 
+    def test_account_scoped_connector_lookup_and_platform_catalog_fallback(self):
+        import os
+
+        mgr = backend_main.connection_manager
+        conn_dev = backend_main.Connection(
+            id="aws_dev",
+            accessKey="AKIADEV",
+            secretKey="SECDEV",
+            region="us-east-1",
+            accountName="Dev",
+            type="aws",
+            status="connected",
+            createdAt="2026-11-26T00:00:00",
+            createdBy="user@tesserak.dev",
+            lastUpdated="2026-11-26T01:00:00",
+        )
+        conn_prod = backend_main.Connection(
+            id="aws_prod",
+            accessKey="AKIAPROD",
+            secretKey="SECPROD",
+            region="us-west-2",
+            accountName="Prod",
+            type="aws",
+            status="connected",
+            createdAt="2026-11-26T00:00:00",
+            createdBy="user@tesserak.dev",
+            lastUpdated="2026-11-26T02:00:00",
+        )
+
+        async def fake_test_conn(conn, use_cache=False):
+            if conn.accessKey == "AKIADEV":
+                return True, "ok", "111111111111"
+            if conn.accessKey == "AKIAPROD":
+                return True, "ok", "222222222222"
+            return False, "bad", None
+
+        async def _run():
+            with patch.object(mgr, "list_connections", return_value=[conn_prod, conn_dev]), patch.object(
+                mgr, "test_connection", side_effect=fake_test_conn
+            ):
+                matched_dev = await mgr.get_connection_for_account("user@tesserak.dev", "111111111111")
+                matched_prod = await mgr.get_connection_for_account("user@tesserak.dev", "222222222222")
+                missing = await mgr.get_connection_for_account("user@tesserak.dev", "999999999999")
+                self.assertEqual(matched_dev.id, "aws_dev")
+                self.assertEqual(matched_prod.id, "aws_prod")
+                self.assertIsNone(missing)
+
+            with patch.object(mgr, "list_connections", return_value=[]), patch.dict(
+                os.environ,
+                {
+                    "TESSERAK_CATALOG_AWS_ACCESS_KEY_ID": "AKIACATALOG",
+                    "TESSERAK_CATALOG_AWS_SECRET_ACCESS_KEY": "SECCATALOG",
+                    "TESSERAK_CATALOG_AWS_REGION": "us-east-1",
+                },
+            ):
+                cat_conn = await mgr.get_catalog_connection("user@tesserak.dev", None)
+                self.assertIsNotNone(cat_conn)
+                self.assertEqual(cat_conn.id, "platform_catalog")
+                self.assertEqual(cat_conn.accessKey, "AKIACATALOG")
+
+        import asyncio
+        asyncio.run(_run())
+
 
 if __name__ == "__main__":
     unittest.main()
