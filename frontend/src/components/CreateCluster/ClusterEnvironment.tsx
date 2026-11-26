@@ -27,6 +27,8 @@ import {
 import CloseIcon from '@mui/icons-material/Close';
 import { useTesserakAuth } from '../../auth/AuthContext';
 import { ClusterConfig } from '../../pages/CreateCluster';
+import { InstanceTypeSelect } from './InstanceTypeSelect';
+import { NumericCountField } from './NumericCountField';
 
 export const EKS_AMI_TYPES = [
   {
@@ -340,8 +342,8 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
           label="Environment Type"
           error={!config.environment.type}
         >
-          <MenuItem value="Non-Prod">Non-Production</MenuItem>
-          <MenuItem value="Prod">Production</MenuItem>
+          <MenuItem value="Non-Prod" onClick={() => setOpen(true)}>Non-Production</MenuItem>
+          <MenuItem value="Prod" onClick={() => setOpen(true)}>Production</MenuItem>
         </Select>
       </FormControl>
 
@@ -350,8 +352,15 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
         onClose={() => {
           setOpen(false);
         }}
-        maxWidth="sm" 
+        maxWidth="lg"
         fullWidth
+        PaperProps={{
+          sx: {
+            width: '92vw',
+            maxWidth: 1080,
+            minHeight: '78vh',
+          },
+        }}
       >
         <DialogTitle sx={{ 
           display: 'flex', 
@@ -527,7 +536,7 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
               />
               {config.createNodeGroup !== false && (
                 <Grid container spacing={1.75} sx={{ mt: 0.5 }}>
-                  <Grid item xs={12} sm={6}>
+                  <Grid item xs={12} sm={4}>
                     <TextField
                       label="Node Group Name"
                       size="small"
@@ -537,16 +546,18 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
                       fullWidth
                     />
                   </Grid>
-                  <Grid item xs={6} sm={3}>
-                    <TextField
-                      label="Instance Type"
-                      size="small"
+                  <Grid item xs={12} sm={5}>
+                    <InstanceTypeSelect
+                      accountId={config.accountId}
+                      region={config.region}
+                      userEmail={userEmail}
+                      amiType={activeAmiType}
                       value={config.instanceType || 't3.medium'}
-                      onChange={(e) => onChange({ ...config, instanceType: e.target.value })}
-                      fullWidth
+                      onChange={(nextType) => onChange({ ...config, instanceType: nextType })}
+                      size="small"
                     />
                   </Grid>
-                  <Grid item xs={6} sm={3}>
+                  <Grid item xs={12} sm={3}>
                     <FormControl fullWidth size="small">
                       <InputLabel>Capacity</InputLabel>
                       <Select
@@ -562,36 +573,30 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
                     </FormControl>
                   </Grid>
                   <Grid item xs={4} sm={4}>
-                    <TextField
+                    <NumericCountField
                       label="Min Nodes"
-                      type="number"
-                      size="small"
-                      value={config.minNodes ?? 1}
-                      onChange={(e) => onChange({ ...config, minNodes: Math.max(0, Number(e.target.value)) })}
-                      inputProps={{ min: 0 }}
-                      fullWidth
+                      value={config.minNodes}
+                      min={0}
+                      fallbackValue={1}
+                      onChange={(val) => onChange({ ...config, minNodes: val })}
                     />
                   </Grid>
                   <Grid item xs={4} sm={4}>
-                    <TextField
+                    <NumericCountField
                       label="Desired Nodes"
-                      type="number"
-                      size="small"
-                      value={config.desiredNodes ?? 2}
-                      onChange={(e) => onChange({ ...config, desiredNodes: Math.max(1, Number(e.target.value)) })}
-                      inputProps={{ min: 1 }}
-                      fullWidth
+                      value={config.desiredNodes}
+                      min={1}
+                      fallbackValue={2}
+                      onChange={(val) => onChange({ ...config, desiredNodes: val })}
                     />
                   </Grid>
                   <Grid item xs={4} sm={4}>
-                    <TextField
+                    <NumericCountField
                       label="Max Nodes"
-                      type="number"
-                      size="small"
-                      value={config.maxNodes ?? 4}
-                      onChange={(e) => onChange({ ...config, maxNodes: Math.max(1, Number(e.target.value)) })}
-                      inputProps={{ min: 1 }}
-                      fullWidth
+                      value={config.maxNodes}
+                      min={1}
+                      fallbackValue={4}
+                      onChange={(val) => onChange({ ...config, maxNodes: val })}
                     />
                   </Grid>
                 </Grid>
@@ -724,8 +729,10 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
               <>
                 <Autocomplete
                   multiple
+                  filterSelectedOptions
                   loading={loadingSubnets}
-                  options={vpcSubnets}
+                  options={vpcSubnets.filter((s) => !(config.privateSubnets || []).includes(s.id))}
+                  isOptionEqualToValue={(opt, val) => opt.id === val.id}
                   getOptionLabel={(s) => `${s.name} (${s.id}) · ${s.cidr} · ${s.availabilityZone}`}
                   value={vpcSubnets.filter((s) => (config.publicSubnets || []).includes(s.id))}
                   onChange={(_, selected) =>
@@ -744,8 +751,10 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
                 />
                 <Autocomplete
                   multiple
+                  filterSelectedOptions
                   loading={loadingSubnets}
-                  options={vpcSubnets}
+                  options={vpcSubnets.filter((s) => !(config.publicSubnets || []).includes(s.id))}
+                  isOptionEqualToValue={(opt, val) => opt.id === val.id}
                   getOptionLabel={(s) => `${s.name} (${s.id}) · ${s.cidr} · ${s.availabilityZone}`}
                   value={vpcSubnets.filter((s) => (config.privateSubnets || []).includes(s.id))}
                   onChange={(_, selected) =>
@@ -768,6 +777,7 @@ const ClusterEnvironment: React.FC<Props> = ({ config, onChange }) => {
             <FormControl fullWidth required>
               <Autocomplete
                 multiple
+                filterSelectedOptions
                 options={availableZones}
                 value={config.environment.availabilityZones}
                 onChange={(_: any, newValue: string[]) => {

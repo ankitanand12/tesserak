@@ -253,6 +253,98 @@ class RegressionFixesTest(unittest.TestCase):
         )
         self.assertTrue(any("delete" in c and "--ignore-not-found=true" in c for c in cmds))
 
+    def test_ec2_instance_types_filter_by_ami_and_use_cache(self):
+        raw_catalog = [
+            {
+                "InstanceType": "t3.medium",
+                "VCpuInfo": {"DefaultVCpus": 2},
+                "MemoryInfo": {"SizeInMiB": 4096},
+                "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]},
+                "CurrentGeneration": True,
+                "FreeTierEligible": False,
+                "BareMetal": False,
+            },
+            {
+                "InstanceType": "t4g.medium",
+                "VCpuInfo": {"DefaultVCpus": 2},
+                "MemoryInfo": {"SizeInMiB": 4096},
+                "ProcessorInfo": {"SupportedArchitectures": ["arm64"]},
+                "CurrentGeneration": True,
+                "FreeTierEligible": True,
+                "BareMetal": False,
+            },
+            {
+                "InstanceType": "g5.xlarge",
+                "VCpuInfo": {"DefaultVCpus": 4},
+                "MemoryInfo": {"SizeInMiB": 16384},
+                "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]},
+                "GpuInfo": {"Gpus": [{"Manufacturer": "NVIDIA", "Name": "A10G", "Count": 1}]},
+                "CurrentGeneration": True,
+                "BareMetal": False,
+            },
+            {
+                "InstanceType": "g5g.xlarge",
+                "VCpuInfo": {"DefaultVCpus": 4},
+                "MemoryInfo": {"SizeInMiB": 8192},
+                "ProcessorInfo": {"SupportedArchitectures": ["arm64"]},
+                "GpuInfo": {"Gpus": [{"Manufacturer": "NVIDIA", "Name": "T4G", "Count": 1}]},
+                "CurrentGeneration": True,
+                "BareMetal": False,
+            },
+            {
+                "InstanceType": "inf2.xlarge",
+                "VCpuInfo": {"DefaultVCpus": 4},
+                "MemoryInfo": {"SizeInMiB": 16384},
+                "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]},
+                "NeuronInfo": {"NeuronDevices": [{"Name": "Inferentia2", "Count": 1}]},
+                "CurrentGeneration": True,
+                "BareMetal": False,
+            },
+        ]
+        serialized = backend_main._sort_instance_types(
+            [backend_main._serialize_ec2_instance_type(x) for x in raw_catalog]
+        )
+
+        self.assertEqual(
+            [t["instanceType"] for t in backend_main._filter_instance_types_for_ami(serialized, "amazon-linux-2023/x86_64/standard")],
+            ["t3.medium"],
+        )
+        self.assertEqual(
+            [t["instanceType"] for t in backend_main._filter_instance_types_for_ami(serialized, "amazon-linux-2023/arm64/standard")],
+            ["t4g.medium"],
+        )
+        self.assertEqual(
+            [t["instanceType"] for t in backend_main._filter_instance_types_for_ami(serialized, "amazon-linux-2023/x86_64/nvidia")],
+            ["g5.xlarge"],
+        )
+        self.assertEqual(
+            [t["instanceType"] for t in backend_main._filter_instance_types_for_ami(serialized, "amazon-linux-2023/arm64/nvidia")],
+            ["g5g.xlarge"],
+        )
+        self.assertEqual(
+            [t["instanceType"] for t in backend_main._filter_instance_types_for_ami(serialized, "amazon-linux-2023/x86_64/neuron")],
+            ["inf2.xlarge"],
+        )
+
+        # Verify cache avoids repeated AWS API pagination calls
+        fake_paginator = MagicMock()
+        fake_paginator.paginate.return_value = [{"InstanceTypes": raw_catalog}]
+        fake_ec2 = MagicMock()
+        fake_ec2.get_paginator.return_value = fake_paginator
+        conn = SimpleNamespace(accessKey="AKIA_TEST", secretKey="SECRET", region="us-west-2")
+
+        backend_main._EKS_META_CACHE.pop("ec2_instance_types:us-west-2", None)
+        with patch.object(backend_main.boto3, "client", return_value=fake_ec2), patch.object(
+            backend_main, "get_db", side_effect=RuntimeError("skip db in unit test")
+        ):
+            cat1, src1 = backend_main._load_ec2_catalog_sync(conn, "us-west-2", refresh=True)
+            cat2, src2 = backend_main._load_ec2_catalog_sync(conn, "us-west-2", refresh=False)
+
+        self.assertEqual(len(cat1), 5)
+        self.assertEqual(src1, "aws-live")
+        self.assertEqual(src2, "memory-cache")
+        self.assertEqual(fake_ec2.get_paginator.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

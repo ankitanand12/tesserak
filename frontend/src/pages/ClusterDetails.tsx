@@ -61,6 +61,8 @@ import {
   getPodStatusChipColor,
 } from '../components/Clusters/NodeDetailsDialog';
 import { EKS_AMI_TYPES } from '../components/CreateCluster/ClusterEnvironment';
+import { InstanceTypeSelect } from '../components/CreateCluster/InstanceTypeSelect';
+import { NumericCountField } from '../components/CreateCluster/NumericCountField';
 import { Perspective3DCard } from '../components/Perspective3DCard';
 import { fetchWithSwr, invalidateSwrCache, readSwrCache } from '../utils/swrCache';
 
@@ -1496,12 +1498,15 @@ export const ClusterDetails: React.FC = () => {
 
             <Grid container spacing={2}>
               <Grid item xs={12} sm={6}>
-                <Autocomplete
-                  freeSolo
-                  options={['t3.medium', 't3.large', 'm5.large', 'm6i.large', 'c6i.large', 't4g.medium', 'm7g.large', 'g5.xlarge']}
+                <InstanceTypeSelect
+                  accountId={detail?.accountId}
+                  region={detail?.region}
+                  userEmail={userEmail}
+                  amiType={ngAmiType}
                   value={ngInstanceType}
-                  onInputChange={(_, v) => setNgInstanceType(v)}
-                  renderInput={(params) => <TextField {...params} label="Instance Type" required />}
+                  onChange={setNgInstanceType}
+                  size="medium"
+                  required
                 />
               </Grid>
               <Grid item xs={12} sm={6}>
@@ -1521,49 +1526,50 @@ export const ClusterDetails: React.FC = () => {
 
             <Grid container spacing={2}>
               <Grid item xs={6} sm={3}>
-                <TextField
+                <NumericCountField
                   label="Min Nodes"
-                  type="number"
+                  size="medium"
                   value={ngMinSize}
-                  onChange={(e) => setNgMinSize(Math.max(0, Number(e.target.value)))}
-                  inputProps={{ min: 0 }}
-                  fullWidth
+                  min={0}
+                  fallbackValue={1}
+                  onChange={setNgMinSize}
                 />
               </Grid>
               <Grid item xs={6} sm={3}>
-                <TextField
+                <NumericCountField
                   label="Desired"
-                  type="number"
+                  size="medium"
                   value={ngDesiredSize}
-                  onChange={(e) => setNgDesiredSize(Math.max(0, Number(e.target.value)))}
-                  inputProps={{ min: 0 }}
-                  fullWidth
+                  min={0}
+                  fallbackValue={2}
+                  onChange={setNgDesiredSize}
                 />
               </Grid>
               <Grid item xs={6} sm={3}>
-                <TextField
+                <NumericCountField
                   label="Max Nodes"
-                  type="number"
+                  size="medium"
                   value={ngMaxSize}
-                  onChange={(e) => setNgMaxSize(Math.max(1, Number(e.target.value)))}
-                  inputProps={{ min: 1 }}
-                  fullWidth
+                  min={1}
+                  fallbackValue={4}
+                  onChange={setNgMaxSize}
                 />
               </Grid>
               <Grid item xs={6} sm={3}>
-                <TextField
+                <NumericCountField
                   label="Disk (GB)"
-                  type="number"
+                  size="medium"
                   value={ngDiskSize}
-                  onChange={(e) => setNgDiskSize(Math.max(20, Number(e.target.value)))}
-                  inputProps={{ min: 20 }}
-                  fullWidth
+                  min={20}
+                  fallbackValue={20}
+                  onChange={setNgDiskSize}
                 />
               </Grid>
             </Grid>
 
             <Autocomplete
               multiple
+              filterSelectedOptions
               options={(detail?.networking.subnets || []).map((s) => s.subnetId)}
               value={ngSubnets}
               onChange={(_, vals) => setNgSubnets(vals)}
@@ -1590,35 +1596,29 @@ export const ClusterDetails: React.FC = () => {
             Scale Node Group: {scaleTarget?.nodegroupName}
           </DialogTitle>
           <DialogContent sx={{ pt: '20px !important', display: 'flex', flexDirection: 'column', gap: 2 }}>
-            <TextField
+            <NumericCountField
               label="Min Size"
-              type="number"
+              size="medium"
               value={scaleTarget?.minSize ?? 1}
-              onChange={(e) =>
-                scaleTarget && setScaleTarget({ ...scaleTarget, minSize: Math.max(0, Number(e.target.value)) })
-              }
-              inputProps={{ min: 0 }}
-              fullWidth
+              min={0}
+              fallbackValue={1}
+              onChange={(val) => scaleTarget && setScaleTarget({ ...scaleTarget, minSize: val })}
             />
-            <TextField
+            <NumericCountField
               label="Desired Size"
-              type="number"
+              size="medium"
               value={scaleTarget?.desiredSize ?? 2}
-              onChange={(e) =>
-                scaleTarget && setScaleTarget({ ...scaleTarget, desiredSize: Math.max(0, Number(e.target.value)) })
-              }
-              inputProps={{ min: 0 }}
-              fullWidth
+              min={0}
+              fallbackValue={2}
+              onChange={(val) => scaleTarget && setScaleTarget({ ...scaleTarget, desiredSize: val })}
             />
-            <TextField
+            <NumericCountField
               label="Max Size"
-              type="number"
+              size="medium"
               value={scaleTarget?.maxSize ?? 4}
-              onChange={(e) =>
-                scaleTarget && setScaleTarget({ ...scaleTarget, maxSize: Math.max(1, Number(e.target.value)) })
-              }
-              inputProps={{ min: 1 }}
-              fullWidth
+              min={1}
+              fallbackValue={4}
+              onChange={(val) => scaleTarget && setScaleTarget({ ...scaleTarget, maxSize: val })}
             />
           </DialogContent>
           <DialogActions sx={{ px: 3, pb: 2.5 }}>

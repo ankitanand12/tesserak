@@ -42,6 +42,14 @@ class SettingRecord(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class AwsCatalogCacheRecord(Base):
+    __tablename__ = "aws_catalog_cache"
+
+    cache_key = Column(String(128), primary_key=True)
+    payload_json = Column(JSON, nullable=False)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class UserRecord(Base):
     __tablename__ = "users"
 
@@ -178,6 +186,14 @@ class PipelineRecord(Base):
     stages_json = Column(JSON, nullable=False, default=list)
     recent_runs_json = Column(JSON, nullable=False, default=list)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class MetadataCacheRecord(Base):
+    __tablename__ = "metadata_cache"
+
+    cache_key = Column(String(128), primary_key=True)
+    payload_json = Column(JSON, nullable=False)
+    updated_at = Column(String(64), nullable=False)
 
 
 def normalize_email(email: Optional[str]) -> str:

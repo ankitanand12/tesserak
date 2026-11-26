@@ -262,4 +262,110 @@ describe('CreateCluster wizard fixes', () => {
     expect(screen.getByLabelText(/Service IPv4 CIDR \(Optional\)/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/Turn on deletion protection/i)).toBeInTheDocument();
   });
+
+  test('supports compatible AMI instance type dropdown with vCPU/Memory, free-edit Desired Nodes, and excludes selected subnets', async () => {
+    const fetchMock = jest.fn((url: RequestInfo | URL) => {
+      const s = url.toString();
+      if (s.includes('/api/aws/eks-versions')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            versions: [{ version: '1.37', status: 'STANDARD_SUPPORT', isLatest: true }],
+            latest: '1.37',
+          }),
+        } as Response);
+      }
+      if (s.includes('/api/aws/zones/')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => [{ name: 'us-east-1a' }, { name: 'us-east-1b' }],
+        } as Response);
+      }
+      if (s.includes('/api/aws/subnets/')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => [
+            { id: 'subnet-pub-a', name: 'public-a', cidr: '10.42.128.0/20', availabilityZone: 'us-east-1a', isPublic: true },
+            { id: 'subnet-pub-b', name: 'public-b', cidr: '10.42.144.0/20', availabilityZone: 'us-east-1b', isPublic: true },
+            { id: 'subnet-priv-a', name: 'private-a', cidr: '10.42.0.0/20', availabilityZone: 'us-east-1a', isPublic: false },
+          ],
+        } as Response);
+      }
+      if (s.includes('/api/aws/eks-ami/')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ amiId: 'ami-00975b531d8dc8286', kubernetesVersion: '1.37', region: 'us-east-1' }),
+        } as Response);
+      }
+      if (s.includes('/api/aws/eks-instance-types/')) {
+        const isArm = s.includes('arm64');
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            region: 'us-east-1',
+            source: 'memory-cache',
+            instanceTypes: isArm
+              ? [
+                  { instanceType: 't4g.medium', family: 't4g', vcpus: 2, memoryGiB: 4, currentGeneration: true },
+                  { instanceType: 'm7g.large', family: 'm7g', vcpus: 2, memoryGiB: 8, currentGeneration: true },
+                ]
+              : [
+                  { instanceType: 't3.medium', family: 't3', vcpus: 2, memoryGiB: 4, currentGeneration: true },
+                  { instanceType: 'm6i.large', family: 'm6i', vcpus: 2, memoryGiB: 8, currentGeneration: true },
+                ],
+          }),
+        } as Response);
+      }
+      return Promise.resolve({ ok: true, json: async () => [] } as Response);
+    });
+    global.fetch = fetchMock as any;
+
+    const Wrapper: React.FC = () => {
+      const [cfg, setCfg] = React.useState<ClusterConfig>({
+        ...baseConfig,
+        desiredNodes: 2,
+        minNodes: 1,
+        maxNodes: 4,
+        environment: { ...baseConfig.environment, kubernetesVersion: '1.37' },
+      });
+      return <ClusterEnvironment config={cfg} onChange={setCfg} />;
+    };
+
+    render(<Wrapper />);
+
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    fireEvent.click(screen.getByRole('option', { name: 'Non-Production' }));
+
+    // 1. Instance type shows vCPU/Memory details & dropdown options
+    const instanceInput = await screen.findByLabelText(/Instance Type/i);
+    await waitFor(() => {
+      expect(screen.getByText(/2 vCPU · 4 GiB Memory/i)).toBeInTheDocument();
+    });
+    fireEvent.mouseDown(instanceInput);
+    expect(await screen.findByText(/m6i\.large/i)).toBeInTheDocument();
+
+    // 2. Desired Nodes allows Backspace clear ('') and typing '5' without snapping to '1'
+    const desiredInput = screen.getByLabelText('Desired Nodes') as HTMLInputElement;
+    fireEvent.focus(desiredInput);
+    fireEvent.change(desiredInput, { target: { value: '' } });
+    expect(desiredInput.value).toBe('');
+    fireEvent.change(desiredInput, { target: { value: '5' } });
+    fireEvent.blur(desiredInput);
+    expect(desiredInput.value).toBe('5');
+
+    // 3. Selecting a public subnet removes it from both Public & Private subnet dropdown lists
+    const publicSubnetsInput = screen.getByLabelText(/Public Subnets \(Optional\)/i);
+    fireEvent.mouseDown(publicSubnetsInput);
+    fireEvent.click(await screen.findByText(/public-a \(subnet-pub-a\)/i));
+
+    fireEvent.mouseDown(publicSubnetsInput);
+    expect(screen.queryByRole('option', { name: /public-a \(subnet-pub-a\)/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('option', { name: /public-b \(subnet-pub-b\)/i })).toBeInTheDocument();
+    fireEvent.keyDown(publicSubnetsInput, { key: 'Escape' });
+
+    const privateSubnetsInput = screen.getByLabelText(/Private Subnets \(Optional\)/i);
+    fireEvent.mouseDown(privateSubnetsInput);
+    expect(screen.queryByRole('option', { name: /public-a \(subnet-pub-a\)/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('option', { name: /private-a \(subnet-priv-a\)/i })).toBeInTheDocument();
+  });
 });

@@ -1,6 +1,6 @@
 from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pydantic import BaseModel
 import asyncio
 import boto3
@@ -22,7 +22,7 @@ from auth import require_auth_if_configured
 from state_manager import StateManager
 from state_management import StateData
 from connections import ConnectionManager, Connection, ConnectionBase
-from db import get_db
+from db import AwsCatalogCacheRecord, get_db
 from pipelines_service import (
     _cli_env as _pip_cli_env,
     build_eks_cli_env,
@@ -321,7 +321,10 @@ async def get_eks_versions(
     if not conn:
         raise HTTPException(status_code=400, detail="No valid AWS connection found")
     try:
-        return await asyncio.to_thread(_get_eks_supported_versions_sync, conn, region)
+        result = await asyncio.to_thread(_get_eks_supported_versions_sync, conn, region)
+        target_region = region or conn.region or "us-east-1"
+        asyncio.create_task(_warm_ec2_instance_catalog(conn, target_region))
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch AWS EKS versions: {str(e)}")
 
@@ -2317,6 +2320,252 @@ async def get_eks_recommended_ami(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch recommended EKS AMI: {str(e)}")
+
+
+_EC2_CATALOG_TTL_SECONDS = 86400  # 24 hours persistent DB cache per AWS region
+_EC2_WARMING_REGIONS: set[str] = set()
+_PREFERRED_FAMILY_ORDER = {
+    "t3": 0,
+    "t3a": 1,
+    "t4g": 2,
+    "t2": 3,
+    "m6i": 4,
+    "m7i": 5,
+    "m6a": 6,
+    "m5": 7,
+    "m6g": 8,
+    "m7g": 9,
+    "c6i": 10,
+    "c7i": 11,
+    "c5": 12,
+    "c6g": 13,
+    "c7g": 14,
+    "r6i": 15,
+    "r7i": 16,
+    "r5": 17,
+    "r6g": 18,
+    "r7g": 19,
+    "g5": 20,
+    "g4dn": 21,
+    "g6": 22,
+    "g5g": 23,
+    "p4d": 24,
+    "p5": 25,
+    "inf2": 26,
+    "inf1": 27,
+    "trn1": 28,
+}
+_SIZE_ORDER = {
+    "nano": 0,
+    "micro": 1,
+    "small": 2,
+    "medium": 3,
+    "large": 4,
+    "xlarge": 5,
+    "2xlarge": 6,
+    "3xlarge": 7,
+    "4xlarge": 8,
+    "6xlarge": 9,
+    "8xlarge": 10,
+    "9xlarge": 11,
+    "12xlarge": 12,
+    "16xlarge": 13,
+    "18xlarge": 14,
+    "24xlarge": 15,
+    "32xlarge": 16,
+    "48xlarge": 17,
+}
+
+
+def _serialize_ec2_instance_type(item: Dict[str, Any]) -> Dict[str, Any]:
+    itype = str(item.get("InstanceType") or "")
+    parts = itype.split(".", 1)
+    family = parts[0] if parts else itype
+    size_label = parts[1] if len(parts) > 1 else ""
+    vcpus = int((item.get("VCpuInfo") or {}).get("DefaultVCpus") or 0)
+    mem_mib = int((item.get("MemoryInfo") or {}).get("SizeInMiB") or 0)
+    memory_gib = round(mem_mib / 1024.0, 2)
+    if memory_gib.is_integer():
+        memory_gib = int(memory_gib)
+    archs = list((item.get("ProcessorInfo") or {}).get("SupportedArchitectures") or [])
+    gpus = list((item.get("GpuInfo") or {}).get("Gpus") or [])
+    neurons = list((item.get("NeuronInfo") or {}).get("NeuronDevices") or [])
+
+    if any(g.get("Manufacturer") == "NVIDIA" for g in gpus):
+        category = "nvidia"
+    elif neurons or item.get("NeuronInfo"):
+        category = "neuron"
+    elif gpus:
+        category = "other-gpu"
+    else:
+        category = "standard"
+
+    gpu_summary = ""
+    if gpus:
+        g0 = gpus[0]
+        gcount = sum(int(g.get("Count") or 1) for g in gpus)
+        gpu_summary = f"{gcount}x {g0.get('Manufacturer', '')} {g0.get('Name', '')}".strip()
+    elif neurons:
+        n0 = neurons[0]
+        ncount = sum(int(n.get("Count") or 1) for n in neurons)
+        gpu_summary = f"{ncount}x AWS {n0.get('Name', 'Neuron')}".strip()
+
+    return {
+        "instanceType": itype,
+        "family": family,
+        "size": size_label,
+        "vcpus": vcpus,
+        "memoryGiB": memory_gib,
+        "architectures": archs,
+        "category": category,
+        "accelerator": gpu_summary or None,
+        "currentGeneration": bool(item.get("CurrentGeneration", True)),
+        "freeTierEligible": bool(item.get("FreeTierEligible", False)),
+        "bareMetal": bool(item.get("BareMetal", False)),
+    }
+
+
+def _sort_instance_types(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        items,
+        key=lambda t: (
+            bool(t.get("bareMetal")),
+            not bool(t.get("currentGeneration")),
+            _PREFERRED_FAMILY_ORDER.get(str(t.get("family")), 999),
+            str(t.get("family")),
+            _SIZE_ORDER.get(str(t.get("size")), 99),
+            t.get("vcpus", 0),
+            str(t.get("instanceType")),
+        ),
+    )
+
+
+def _filter_instance_types_for_ami(catalog: List[Dict[str, Any]], ami_type: str) -> List[Dict[str, Any]]:
+    clean_ami = (ami_type or "amazon-linux-2023/x86_64/standard").strip().lower()
+    want_arm = "/arm64/" in clean_ami
+    want_arch = "arm64" if want_arm else "x86_64"
+    if clean_ami.endswith("/nvidia"):
+        want_cat = "nvidia"
+    elif clean_ami.endswith("/neuron"):
+        want_cat = "neuron"
+    else:
+        want_cat = "standard"
+
+    return [
+        t
+        for t in catalog
+        if want_arch in (t.get("architectures") or []) and t.get("category") == want_cat
+    ]
+
+
+def _load_ec2_catalog_sync(connection: Any, region: str, refresh: bool = False) -> Tuple[List[Dict[str, Any]], str]:
+    clean_region = (region or getattr(connection, "region", None) or "us-east-1").strip()
+    mem_key = f"ec2_instance_types:{clean_region}"
+    db_key = f"ec2_instance_types:{clean_region}"
+
+    if not refresh:
+        cached = _EKS_META_CACHE.get(mem_key)
+        if cached and cached[0] > time.monotonic():
+            return cached[1], "memory-cache"
+
+        try:
+            db = get_db()
+            with db.session_scope() as session:
+                row = (
+                    session.query(AwsCatalogCacheRecord)
+                    .filter(AwsCatalogCacheRecord.cache_key == db_key)
+                    .first()
+                )
+                if row and row.updated_at:
+                    age_sec = (datetime.utcnow() - row.updated_at).total_seconds()
+                    if age_sec < _EC2_CATALOG_TTL_SECONDS and isinstance(row.payload_json, list):
+                        _EKS_META_CACHE[mem_key] = (time.monotonic() + 3600.0, row.payload_json)
+                        return row.payload_json, "db-cache"
+        except Exception as db_exc:
+            logger.warning(f"EC2 catalog DB cache read skipped: {db_exc}")
+
+    ec2 = boto3.client(
+        "ec2",
+        aws_access_key_id=connection.accessKey,
+        aws_secret_access_key=connection.secretKey,
+        region_name=clean_region,
+        config=Config(connect_timeout=5, read_timeout=30, retries={"max_attempts": 2}),
+    )
+    paginator = ec2.get_paginator("describe_instance_types")
+    serialized: List[Dict[str, Any]] = []
+    for page in paginator.paginate(PaginationConfig={"PageSize": 100}):
+        for raw in page.get("InstanceTypes", []):
+            serialized.append(_serialize_ec2_instance_type(raw))
+
+    catalog = _sort_instance_types(serialized)
+    _EKS_META_CACHE[mem_key] = (time.monotonic() + 3600.0, catalog)
+
+    try:
+        db = get_db()
+        with db.session_scope() as session:
+            existing = (
+                session.query(AwsCatalogCacheRecord)
+                .filter(AwsCatalogCacheRecord.cache_key == db_key)
+                .first()
+            )
+            if existing:
+                existing.payload_json = catalog
+                existing.updated_at = datetime.utcnow()
+            else:
+                session.add(
+                    AwsCatalogCacheRecord(
+                        cache_key=db_key,
+                        payload_json=catalog,
+                        updated_at=datetime.utcnow(),
+                    )
+                )
+    except Exception as db_exc:
+        logger.warning(f"EC2 catalog DB cache write skipped: {db_exc}")
+
+    return catalog, "aws-live"
+
+
+async def _warm_ec2_instance_catalog(connection: Any, region: str) -> None:
+    clean_region = (region or "us-east-1").strip()
+    mem_key = f"ec2_instance_types:{clean_region}"
+    cached = _EKS_META_CACHE.get(mem_key)
+    if (cached and cached[0] > time.monotonic()) or clean_region in _EC2_WARMING_REGIONS:
+        return
+    _EC2_WARMING_REGIONS.add(clean_region)
+    try:
+        await asyncio.to_thread(_load_ec2_catalog_sync, connection, clean_region, False)
+    except Exception as exc:
+        logger.debug(f"Background EC2 catalog warm skipped for {clean_region}: {exc}")
+    finally:
+        _EC2_WARMING_REGIONS.discard(clean_region)
+
+
+@app.get("/api/aws/eks-instance-types/{account_id}/{region}", dependencies=[Depends(require_auth_if_configured)])
+async def get_eks_compatible_instance_types(
+    account_id: str,
+    region: str,
+    ami_type: str = "amazon-linux-2023/x86_64/standard",
+    refresh: bool = False,
+    x_user_email: str = Header(...),
+):
+    try:
+        connection = await connection_manager.get_valid_connection(x_user_email)
+        if not connection:
+            raise HTTPException(status_code=400, detail="No active connection found")
+        catalog, source = await asyncio.to_thread(_load_ec2_catalog_sync, connection, region, refresh)
+        compatible = _filter_instance_types_for_ami(catalog, ami_type)
+        return {
+            "region": region,
+            "amiType": ami_type,
+            "source": source,
+            "totalCatalogCount": len(catalog),
+            "count": len(compatible),
+            "instanceTypes": compatible,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch EC2 instance types: {str(e)}")
 
 
 from tesserak_router import public_router as tesserak_public_router, router as tesserak_router
