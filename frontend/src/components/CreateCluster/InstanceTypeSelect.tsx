@@ -94,12 +94,20 @@ export const InstanceTypeSelect: React.FC<InstanceTypeSelectProps> = ({
   );
 
   const [options, setOptions] = useState<Ec2InstanceTypeOption[]>(fallbackOptions);
+  const [inputText, setInputText] = useState<string>(value || '');
   const [loading, setLoading] = useState(false);
   const [catalogSource, setCatalogSource] = useState<string>('');
+  const isEditingRef = useRef(false);
   const latestAmiRef = useRef(activeAmi);
   latestAmiRef.current = activeAmi;
   const latestValueRef = useRef(value);
   latestValueRef.current = value;
+
+  useEffect(() => {
+    if (!isEditingRef.current) {
+      setInputText(value || '');
+    }
+  }, [value]);
 
   const loadInstanceTypes = useCallback(
     async (forceRefresh: boolean = false) => {
@@ -165,50 +173,75 @@ export const InstanceTypeSelect: React.FC<InstanceTypeSelectProps> = ({
     loadInstanceTypes(false);
   }, [loadInstanceTypes]);
 
-  const selectedOption = useMemo(() => {
-    return (
-      options.find((opt) => opt.instanceType === value) ||
-      (value ? { instanceType: value, family: value.split('.')[0] || '', vcpus: 0, memoryGiB: 0 } : null)
-    );
+  const selectedOption = useMemo<Ec2InstanceTypeOption | string | null>(() => {
+    if (!value) return null;
+    return options.find((opt) => opt.instanceType === value) ?? value;
   }, [options, value]);
+
+  const matchedSpec = useMemo(
+    () => options.find((opt) => opt.instanceType === value) || null,
+    [options, value]
+  );
 
   return (
     <Autocomplete<Ec2InstanceTypeOption, false, false, true>
       freeSolo
+      clearOnEscape
+      selectOnFocus
       size={size}
       loading={loading}
       options={options}
       value={selectedOption}
+      inputValue={inputText}
       filterOptions={(opts, state) => {
         const q = state.inputValue.trim().toLowerCase();
-        const filtered = q
-          ? opts.filter(
-              (o) =>
-                o.instanceType.toLowerCase().includes(q) ||
-                o.family.toLowerCase().includes(q) ||
-                `${o.vcpus} vcpu`.includes(q) ||
-                `${o.memoryGiB} gib`.includes(q) ||
-                (o.accelerator || '').toLowerCase().includes(q)
-            )
-          : opts;
-        return filtered.slice(0, 120);
+        if (!q) {
+          return opts.slice(0, 150);
+        }
+        const prefixMatches: Ec2InstanceTypeOption[] = [];
+        const otherMatches: Ec2InstanceTypeOption[] = [];
+        for (const o of opts) {
+          const itLower = o.instanceType.toLowerCase();
+          if (itLower.startsWith(q)) {
+            prefixMatches.push(o);
+          } else if (
+            itLower.includes(q) ||
+            o.family.toLowerCase().includes(q) ||
+            `${o.vcpus} vcpu`.includes(q) ||
+            `${o.memoryGiB} gib`.includes(q) ||
+            (o.accelerator || '').toLowerCase().includes(q)
+          ) {
+            otherMatches.push(o);
+          }
+        }
+        return [...prefixMatches, ...otherMatches].slice(0, 300);
       }}
       getOptionLabel={(opt) => (typeof opt === 'string' ? opt : opt.instanceType)}
       isOptionEqualToValue={(opt, val) =>
         opt.instanceType === (typeof val === 'string' ? val : val.instanceType)
       }
       onChange={(_, newVal) => {
+        isEditingRef.current = false;
         if (!newVal) {
+          setInputText('');
           onChange('');
-        } else if (typeof newVal === 'string') {
-          onChange(newVal.trim());
         } else {
-          onChange(newVal.instanceType);
+          const next = (typeof newVal === 'string' ? newVal : newVal.instanceType).trim();
+          setInputText(next);
+          onChange(next);
         }
       }}
       onInputChange={(_, newInput, reason) => {
         if (reason === 'input') {
-          onChange(newInput.trim());
+          isEditingRef.current = true;
+          setInputText(newInput);
+        } else if (reason === 'clear') {
+          isEditingRef.current = false;
+          setInputText('');
+          onChange('');
+        } else if (reason === 'reset') {
+          isEditingRef.current = false;
+          setInputText(value || '');
         }
       }}
       renderOption={(props, opt) => (
@@ -247,9 +280,17 @@ export const InstanceTypeSelect: React.FC<InstanceTypeSelectProps> = ({
           label="Instance Type"
           required={required}
           placeholder="Search type, vCPU, or GiB..."
+          onBlur={() => {
+            isEditingRef.current = false;
+            const trimmed = inputText.trim();
+            if (trimmed !== value) {
+              setInputText(trimmed);
+              onChange(trimmed);
+            }
+          }}
           helperText={
-            selectedOption && selectedOption.vcpus > 0
-              ? `${selectedOption.vcpus} vCPU · ${selectedOption.memoryGiB} GiB Memory (${options.length} compatible)`
+            matchedSpec && matchedSpec.vcpus > 0
+              ? `${matchedSpec.vcpus} vCPU · ${matchedSpec.memoryGiB} GiB Memory (${options.length} compatible)`
               : `${options.length} AWS types for AMI`
           }
           InputProps={{

@@ -336,13 +336,22 @@ describe('CreateCluster wizard fixes', () => {
     fireEvent.mouseDown(screen.getByRole('combobox'));
     fireEvent.click(screen.getByRole('option', { name: 'Non-Production' }));
 
-    // 1. Instance type shows vCPU/Memory details & dropdown options
-    const instanceInput = await screen.findByLabelText(/Instance Type/i);
+    // 1. Instance type shows vCPU/Memory details, allows full clearing + prefix search
+    const instanceInput = (await screen.findByLabelText(/Instance Type/i)) as HTMLInputElement;
     await waitFor(() => {
       expect(screen.getByText(/2 vCPU · 4 GiB Memory/i)).toBeInTheDocument();
     });
-    fireEvent.mouseDown(instanceInput);
+    expect(instanceInput.value).toBe('t3.medium');
+
+    // Clear input completely via backspace/change and verify it stays empty while searching
+    fireEvent.focus(instanceInput);
+    fireEvent.change(instanceInput, { target: { value: '' } });
+    expect(instanceInput.value).toBe('');
+    fireEvent.change(instanceInput, { target: { value: 'm6i' } });
+    expect(instanceInput.value).toBe('m6i');
     expect(await screen.findByText(/m6i\.large/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByText(/m6i\.large/i));
+    expect(instanceInput.value).toBe('m6i.large');
 
     // 2. Desired Nodes allows Backspace clear ('') and typing '5' without snapping to '1'
     const desiredInput = screen.getByLabelText('Desired Nodes') as HTMLInputElement;

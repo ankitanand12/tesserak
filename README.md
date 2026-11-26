@@ -1,367 +1,177 @@
-# Tesserak | EKS Cluster Manager
+# Tesserak | EKS & Cloud Internal Developer Platform
 
-**Tesserak** is a multi-dimensional control plane for managing Kubernetes and cloud infrastructure. Starting with AWS EKS cluster provisioning, health monitoring, AWS credential connectors, and local-to-cloud state synchronization, it is built to scale cleanly toward multi-cloud, Terraform, CI/CD, and broader cloud infrastructure workflows.
+Tesserak is a full-stack Kubernetes and AWS cloud internal developer platform (IDP) for provisioning Amazon EKS clusters, discovering and remediating cloud resources, enforcing policy guardrails, and running GitOps CI/CD pipelines from a unified interface.
 
-## Features
+---
 
-- Create new EKS clusters with customizable settings
-- View and monitor existing clusters and their status
-- Delete clusters with proper state management
-- Modern UI with Material Design
-- Multi-region support
-- AWS resource discovery (VPCs, Availability Zones)
-- Connection management for AWS credentials
-- State synchronization between local and AWS
+## Key Capabilities
 
-## Tech Stack
+### 1. Amazon EKS Cluster Lifecycle & State Reconciliation
+- **Multi-Step Launch Wizard (`/create-cluster`)**:
+  - **Basic Details (`ClusterBasicDetails`)**: Cluster name, AWS account selector, region discovery, Kubernetes version selector, and EKS Cluster Access controls (`bootstrapClusterCreatorAdminPermissions`, `authenticationMode`).
+  - **Environment & Networking (`ClusterEnvironment`)**: VPC discovery and inline VPC creation (`POST /api/vpc`), public/private subnet selection (`filterSelectedOptions` prevents duplicate picks), IPv4/IPv6 and custom Service IPv4 CIDR configuration, Production-conditional Deletion Protection (`deletionProtection`), and Initial Managed Node Group setup.
+  - **EC2 Instance Type Selector (`InstanceTypeSelect`) & Node Sizing (`NumericCountField`)**: Searchable AMI-compatible EC2 instance selector displaying vCPU count, memory (GiB), architecture, and GPU badges; full input clearing and prefix-prioritized filtering; free-typing numeric count fields for min/desired/max node counts.
+  - **Add-ons & Preview (`ClusterAddons`, `ClusterPreview`)**: Add-on version discovery per Kubernetes version and stacked configuration summary before launch.
+- **Background Reconciliation & Audit Retention (`/clusters`)**:
+  - Polls live AWS EKS cluster state every 60 seconds, detects state drift (`Synced`, `Needs Sync`, `Missing / Deleted`), and triggers one-click state synchronization (`POST /clusters/{cluster_name}/sync`).
+  - Retains deleted clusters for **7 days** (`DELETED_CLUSTER_RETENTION_DAYS = 7`) for audit history before pruning.
+- **Cluster Deep Inspection (`/clusters/:clusterName`, `NodeDetailsDialog`)**:
+  - Inspects VPC/networking, access mode, nodegroups (create, scale, delete), merged EC2 + Kubernetes nodes, and running pods via `kubectl get nodes,pods -A -o json`, with a paginated node-level pod inspector (`NodeDetailsDialog`).
 
-### Backend
-- Python FastAPI for API development
-- Boto3 for AWS service integration
-- Pydantic for data validation
-- Uvicorn ASGI server
-- State management system for cluster tracking
+### 2. Multi-Account Connector Scoping & Hybrid AWS Catalog Caching
+- **Strict Account Scoping (`backend/connections.py`)**: Account-scoped AWS endpoints (`/api/aws/regions/{account_id}`, `/vpcs`, `/zones`, `/subnets`, `POST /api/vpc`, and `/clusters*`) resolve the authenticated user's specific AWS connector matching `account_id`.
+- **Hybrid Memory + PostgreSQL Catalog Cache (`backend/db.py` `aws_catalog_cache`)**:
+  - EC2 instance types per region are cached in memory and persisted in PostgreSQL (`AwsCatalogCacheRecord`) so subsequent opens load immediately without re-querying AWS.
+  - Optional platform read-only catalog credentials (`TESSERAK_CATALOG_AWS_ACCESS_KEY_ID`, `TESSERAK_CATALOG_AWS_SECRET_ACCESS_KEY`, `TESSERAK_CATALOG_AWS_REGION`) can power catalog APIs (`/api/aws/eks-versions`, `/addon-versions`, `/eks-ami`, `/eks-instance-types`) alongside user connectors.
 
-### Frontend
-- React with TypeScript for type-safe development
-- Material-UI components for modern UI
-- Axios for API communication
-- React Router for navigation
-- Context API for state management
+### 3. Cloud Resources Discovery & Drift Remediation (`/resources`)
+- Discovers live AWS S3 buckets (paginated), SQS queues, ElastiCache Redis, and RDS instances.
+- Supports blueprint provisioning, encryption/public-access drift checks, and remediation actions.
+
+### 4. GitOps CI/CD Pipelines (`/pipelines`)
+- Executes real `git ls-remote` verification, `git clone`, optional Docker build, Guardrail manifest scan, `kubectl apply`, and `kubectl rollout status` pod readiness checks.
+- Provides collapsible stdout/stderr trace logs and cleans up deployed Kubernetes resources when deleting a pipeline (`?cleanup_cluster=true` default).
+
+### 5. Guardrails, Integrations & Safety Confirmations
+- **Guardrails (`/guardrails`)**: Policy rule management and resource approval workflows (`tesserak_router.py`).
+- **Integrations (`/integrations`)**: AWS IAM connectors and third-party tool connections stored in PostgreSQL (`AwsConnectionRecord`, `IntegrationRecord`) with Fernet-based secret encryption.
+- **Safe Destructive Actions (`ConfirmDeleteDialog`)**: Consistent confirmation dialog across cluster, nodegroup, pipeline, resource, connector, and integration deletions.
+- **Authentication & Clean URLs**: Auth0 SSO integration (`@auth0/auth0-react` / `auth0-fastapi-api`) plus individual/organization email workspace sign-in, routed cleanly with React Router `BrowserRouter`.
+
+---
+
+## Architecture & Repository Layout
+
+```text
+tesserak/
+├── README.md
+├── PROJECT_CONTEXT.md
+├── GEMINI.md
+├── CHANGELOG.md
+├── backend/
+│   ├── main.py                  # FastAPI entry point, EKS/VPC/Catalog APIs
+│   ├── tesserak_router.py       # Overview, Resources, Guardrails, Approvals, Pipelines APIs
+│   ├── db.py                    # SQLAlchemy models & PostgreSQL DatabaseManager
+│   ├── connections.py           # AWS IAM connector storage, STS validation, catalog lookup
+│   ├── auth.py                  # Auth0 / user session identity resolution
+│   ├── state_manager.py         # Local DB cluster state persistence
+│   ├── state_management.py      # Live AWS EKS state inspection
+│   ├── resources_service.py     # AWS S3/SQS/RDS/Redis discovery & drift checks
+│   ├── pipelines_service.py     # Subprocess Git/Docker/kubectl CI/CD runner & cleanup
+│   ├── integrations_service.py  # Platform integrations service
+│   ├── migrate_json_to_pg.py    # Legacy JSON-to-PostgreSQL migration utility
+│   ├── test_fixes.py            # Backend unit & regression tests
+│   ├── requirements.txt
+│   └── .env.example
+└── frontend/
+    ├── package.json
+    ├── tsconfig.json
+    ├── public/
+    └── src/
+        ├── App.tsx              # obsidianBlueTheme, Layout shell, BrowserRouter routes
+        ├── auth/AuthContext.tsx # Auth0 + local session provider
+        ├── pages/               # Dashboard, Clusters, ClusterDetails, CreateCluster,
+        │                        # CloudResources, Pipelines, Guardrails, Integrations,
+        │                        # Settings, Profile (+ legacy route alias pages)
+        ├── components/          # Reusable UI primitives & feature modules
+        │   ├── Auth/            # AuthPage
+        │   ├── Clusters/        # NodeDetailsDialog
+        │   ├── Connectors/      # ConnectorForm, ConnectorList
+        │   └── CreateCluster/   # ClusterBasicDetails, ClusterEnvironment, ClusterAddons,
+        │                        # ClusterPreview, InstanceTypeSelect, NumericCountField
+        ├── types/               # cluster.ts, platform.ts, user.ts
+        └── utils/               # dateUtils.ts, imageUtils.ts, regionMapping.ts, swrCache.ts
+```
+
+---
 
 ## Prerequisites
 
-### Common Requirements (All Operating Systems)
+- **Python**: 3.9+
+- **Node.js & npm**: Node 18+ recommended
+- **PostgreSQL**: Local or remote instance (default: `postgresql://tesserak:tesserak123@localhost:5432/tesserak`)
+- **CLI Tools (for CI/CD pipelines & pod inspection)**: `git`, `docker`, `aws`, `kubectl`
 
-1. **AWS Account & Credentials**
-   - Active AWS Account
-   - AWS Access Key and Secret Key with EKS permissions
-   - Configured IAM Role for EKS cluster creation
+---
 
-2. **Git**
-   - Windows: Download and install from [Git for Windows](https://gitforwindows.org/)
-   - macOS: Install via Homebrew: `brew install git`
-   - Ubuntu: `sudo apt-get update && sudo apt-get install git`
+## Getting Started
 
-3. **Node.js & npm**
-   - Download and install Node.js (v14 or higher) from [official website](https://nodejs.org/)
-   - npm comes bundled with Node.js
-   - Ubuntu Alternative: Use NodeSource repository:
-     ```bash
-     curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-     sudo apt-get install -y nodejs
-     ```
+### 1. Environment Configuration
 
-4. **Python**
-   - Python 3.9 or higher required
-   - Windows: Download from [Python.org](https://www.python.org/downloads/windows/)
-   - macOS: Install via Homebrew: `brew install python@3.11`
-   - Ubuntu: 
-     ```bash
-     sudo apt-get update
-     sudo apt-get install python3.11 python3.11-venv python3-pip
-     ```
+Copy the environment templates and fill in any optional Auth0 or catalog credentials:
 
-### Windows-specific Requirements
-
-1. **Windows Terminal** (Recommended)
-   - Install from Microsoft Store or [GitHub Releases](https://github.com/microsoft/terminal/releases)
-
-2. **Visual Studio Build Tools** (If needed for Python packages)
-   - Download and install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-   - Select "Desktop development with C++" workload
-
-### macOS-specific Requirements
-
-1. **Xcode Command Line Tools**
-   ```bash
-   xcode-select --install
-   ```
-
-2. **Homebrew**
-   ```bash
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-   ```
-
-### Ubuntu-specific Requirements
-
-1. **System Dependencies**
-   ```bash
-   sudo apt-get update
-   sudo apt-get install -y \
-       build-essential \
-       libssl-dev \
-       libffi-dev \
-       python3-dev
-   ```
-
-2. **Python Virtual Environment Support**
-   ```bash
-   sudo apt-get install -y python3.11-venv
-   ```
-
-## Installation & Setup
-
-### Backend Setup
-
-#### Windows
-1. Clone the repository
-   ```cmd
-   git clone <repository-url>
-   cd technoworld
-   ```
-
-2. Create and activate virtual environment
-   ```cmd
-   python -m venv .venv
-   .venv\Scripts\activate
-   ```
-
-3. Install dependencies
-   ```cmd
-   cd backend
-   pip install -r requirements.txt
-   ```
-
-#### macOS
-1. Clone the repository
-   ```bash
-   git clone <repository-url>
-   cd technoworld
-   ```
-
-2. Create and activate virtual environment
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
-
-3. Install dependencies
-   ```bash
-   cd backend
-   pip install -r requirements.txt
-   ```
-
-#### Ubuntu/Linux
-1. Clone the repository
-   ```bash
-   git clone <repository-url>
-   cd technoworld
-   ```
-
-2. Create and activate virtual environment
-   ```bash
-   python3.11 -m venv .venv
-   source .venv/bin/activate
-   ```
-
-3. Install dependencies
-   ```bash
-   cd backend
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-
-### Frontend Setup
-
-The frontend setup is identical for both Windows and macOS:
-
-1. Navigate to frontend directory
-   ```bash
-   cd frontend
-   ```
-
-2. Install dependencies
-   ```bash
-   npm install
-   ```
-
-## Configuration
-
-1. **Backend Environment Variables**
-   Create a `.env` file in the `backend` directory:
-   ```env
-   EKS_CLUSTER_ROLE_ARN=arn:aws:iam::<your-account-id>:role/<your-eks-role>
-   SUBNET_IDS=subnet-xxx,subnet-yyy,subnet-zzz
-   ```
-
-2. **AWS Credentials**
-   You'll need to add your AWS credentials through the application's UI in the Connectors section.
-
-## Running the Application
-
-### Windows
-
-1. Start Backend (in one terminal)
-   ```cmd
-   cd technoworld
-   .venv\Scripts\activate
-   cd backend
-   uvicorn main:app --reload
-   ```
-
-2. Start Frontend (in another terminal)
-   ```cmd
-   cd technoworld/frontend
-   npm start
-   ```
-
-### macOS
-
-1. Start Backend (in one terminal)
-   ```bash
-   cd technoworld
-   source .venv/bin/activate
-   cd backend
-   uvicorn main:app --reload
-   ```
-
-2. Start Frontend (in another terminal)
-   ```bash
-   cd technoworld/frontend
-   npm start
-   ```
-
-### Ubuntu/Linux
-
-1. Start Backend (in one terminal)
-   ```bash
-   cd technoworld
-   source .venv/bin/activate
-   cd backend
-   uvicorn main:app --reload
-   ```
-
-2. Start Frontend (in another terminal)
-   ```bash
-   cd technoworld/frontend
-   npm start
-   ```
-
-Note for Linux users: If you encounter permission issues:
 ```bash
-# Fix npm global permissions
-mkdir ~/.npm-global
-npm config set prefix '~/.npm-global'
-export PATH=~/.npm-global/bin:$PATH
-# Add the above PATH line to your ~/.profile or ~/.bashrc
+cp backend/.env.example backend/.env
+cp frontend/.env.example frontend/.env
+```
 
-The application will be available at:
-- Frontend: http://localhost:3000
-- Backend API: http://localhost:8000
-- API Documentation: http://localhost:8000/docs
+Key backend variables (`backend/.env`):
+- `DATABASE_URL`: PostgreSQL connection string (defaults to `postgresql://tesserak:tesserak123@localhost:5432/tesserak`).
+- `TESSERAK_ENCRYPTION_KEY`: Optional custom Fernet key for encrypting stored AWS/integration secrets.
+- `TESSERAK_CATALOG_AWS_ACCESS_KEY_ID`, `TESSERAK_CATALOG_AWS_SECRET_ACCESS_KEY`, `TESSERAK_CATALOG_AWS_REGION`: Optional read-only IAM credentials used for global AWS catalog endpoints (`eks-versions`, `addon-versions`, `eks-ami`, `eks-instance-types`).
+- `AUTH0_DOMAIN`, `AUTH0_AUDIENCE`: Optional Auth0 API verification settings.
 
-## Troubleshooting
+### 2. Start the Backend (`http://localhost:8000`)
 
-### Common Issues
+```bash
+cd backend
+pip install -r requirements.txt
+python3 -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
 
-1. **Port Already in Use**
-   - Windows: 
-     ```cmd
-     netstat -ano | findstr 8000
-     taskkill /PID <PID> /F
-     ```
-   - macOS/Linux:
-     ```bash
-     lsof -i :8000
-     kill -9 <PID>
-     ```
+Interactive OpenAPI documentation is available at `http://localhost:8000/docs`.
 
-2. **Python Virtual Environment Issues**
-   - Windows: Make sure to use the correct activation script in `\.venv\Scripts\`
-   - macOS/Linux: 
-     ```bash
-     # Fix permissions
-     chmod -R 755 .venv/
-     # If using different Python versions
-     python3.11 -m venv .venv --clear
-     ```
+### 3. Start the Frontend (`http://localhost:3000`)
 
-3. **Linux-specific Issues**
-   - Package installation permission errors:
-     ```bash
-     sudo apt-get update
-     sudo apt-get install -y python3-pip
-     ```
-   - Node.js permission errors:
-     ```bash
-     sudo chown -R $USER:$GROUP ~/.npm
-     sudo chown -R $USER:$GROUP ~/.config
-     ```
-   - System dependencies:
-     ```bash
-     sudo apt-get install -y \
-         build-essential \
-         python3-dev \
-         libffi-dev \
-         libssl-dev
-     ```
+Use `--legacy-peer-deps` because `@mui/lab` peer ranges predate React 19:
 
-3. **Node.js Dependencies Issues**
-   ```bash
-   rm -rf node_modules package-lock.json
-   npm install
-   ```
+```bash
+cd frontend
+npm install --legacy-peer-deps
+BROWSER=none npm start
+```
 
-4. **AWS Credential Issues**
-   - Verify credentials in the Connectors section
-   - Ensure IAM user has appropriate permissions
-   - Check region settings
+Open `http://localhost:3000` in your browser.
 
-### Getting Help
+---
 
-If you encounter any issues:
-1. Check the console logs in both frontend and backend terminals
-2. Verify all prerequisites are correctly installed
-3. Ensure all environment variables are properly set
-4. Check AWS IAM permissions
+## Verification & Testing
 
-## AWS IAM Requirements
+### Backend Unit & Regression Tests
 
-The AWS credentials used should have permissions for:
-- EKS cluster creation and management
-- VPC and subnet access
-- EC2 operations for node groups
-- IAM role and policy management
+```bash
+python3 -m unittest backend.test_fixes -v
+```
 
-## API Endpoints
+### Frontend TypeScript Check & Jest Suite
 
-Major endpoints available:
-- `GET /clusters`: List all EKS clusters
-- `POST /clusters`: Create a new cluster
-- `DELETE /clusters/{cluster_name}`: Delete a cluster
-- `GET /api/aws/regions/{account_id}`: List AWS regions
-- `GET /api/aws/vpcs/{account_id}/{region}`: List VPCs in a region
-- `GET /api/aws/zones/{account_id}/{region}`: List availability zones
-- `POST /api/connections`: Manage AWS connections
+```bash
+cd frontend
+npx tsc --noEmit
+CI=true npm test -- --watchAll=false
+```
 
-## Security Best Practices
+---
 
-1. **AWS Credentials**
-   - Never commit AWS credentials to version control
-   - Use IAM roles with least privilege principle
-   - Regularly rotate access keys
-   - Use separate IAM users for different environments
+## API Overview
 
-2. **Environment Variables**
-   - Keep sensitive data in `.env` files
-   - Never commit `.env` files
-   - Use different environment files for development/production
-
-3. **General Security**
-   - Keep all dependencies updated
-   - Follow AWS security best practices
-   - Implement proper authentication
-   - Use HTTPS in production
-
-## Development Notes
-
-- The backend uses FastAPI for efficient API development
-- Frontend is built with React and TypeScript for type safety
-- AWS SDK (boto3) is used for AWS operations
-- State management tracks local and AWS cluster states
-- Multi-region support with dynamic resource discovery
-
-## License
-
-[Add your license information here]
+| Method & Path | Purpose |
+| :--- | :--- |
+| `GET /` / `GET /api/auth/status` | Service health & Auth0 status |
+| `GET /api/overview` | Platform overview counters and recent activity |
+| `GET /api/aws/eks-versions` | Supported EKS Kubernetes versions (hybrid cached) |
+| `GET /api/aws/addon-versions/{eks_version}` | Default add-on versions for a Kubernetes release |
+| `GET /api/aws/eks-ami/{account_id}/{region}` | Recommended EKS AMI ID via SSM Parameter Store |
+| `GET /api/aws/eks-instance-types/{account_id}/{region}` | Cached/live EC2 instance catalog compatible with AMI type |
+| `GET /api/aws/regions/{account_id}` | Regions for the selected AWS connector |
+| `GET /api/aws/vpcs/{account_id}/{region}` | VPCs in account/region |
+| `GET /api/aws/zones/{account_id}/{region}` | Availability Zones in account/region |
+| `GET /api/aws/subnets/{account_id}/{region}/{vpc_id}` | Subnets for a VPC |
+| `POST /api/vpc` | Create VPC + subnets + Internet Gateway |
+| `POST /api/connections` / `GET /api/connections` / `POST /api/connections/test` / `DELETE /api/connections/{connection_id}` | Manage and test AWS IAM connectors |
+| `GET /clusters` / `POST /clusters` / `GET /clusters/{cluster_name}` / `POST /clusters/{cluster_name}/sync` / `DELETE /clusters/{cluster_name}` | EKS cluster CRUD, reconciliation, and 7-day soft-delete audit list |
+| `POST /clusters/{cluster_name}/nodegroups` / `PATCH /clusters/{cluster_name}/nodegroups` / `DELETE /clusters/{cluster_name}/nodegroups` | Managed node group creation, scaling, and deletion |
+| `GET /api/resources` / `POST /api/resources` / `DELETE /api/resources/{id}` / `POST /api/resources/{id}/drift-check` | Live AWS resource discovery, provisioning, and drift remediation |
+| `GET /api/guardrails*` / `POST /api/approvals/{id}/decision` | Policy guardrails & approval queue |
+| `GET /api/pipelines` / `POST /api/pipelines` / `POST /api/pipelines/{id}/trigger` / `DELETE /api/pipelines/{id}` | GitOps pipeline CRUD, execution, and cluster cleanup |
+| `GET /api/integrations` / `POST /api/integrations` / `POST /api/integrations/{id}/test` / `DELETE /api/integrations/{id}` | Third-party integrations |
