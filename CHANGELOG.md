@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [v1.0.0] - 2026-11-27
+
 ### Added
 - **2026-11-27** — Strict `account_id`-scoped connector lookup (`ConnectionManager.get_connection_for_account`, `_resolve_account_connection`) and optional read-only platform catalog fallback (`get_platform_catalog_connection`, `get_catalog_connection`, `TESSERAK_CATALOG_AWS_*`) across AWS/EKS endpoints (`backend/connections.py`, `backend/main.py`, `backend/.env.example`, `backend/test_fixes.py`).
 - **2026-11-27** — Persistent feature catalog documenting all backend endpoints, frontend routes, database models, and configuration (`docs/FEATURES.md`).
