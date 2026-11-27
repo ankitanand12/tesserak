@@ -28,19 +28,34 @@ You can enable or disable **Repo Documenter** anytime from the **Customizations*
 
 The full plugin (hooks + skills) is Antigravity-specific. For other AI coding agents, the **documentation policy rules** are installed as instruction files each agent reads natively.
 
-### One-Command Install (All IDEs at Once)
+### Install Only for the IDE You Use
 
-From inside any Git repository:
-
-```bash
-bash /path/to/repo-documenter/setup.sh
-```
-
-Or with an explicit repo path (and optional `--with-git-hooks` to track manual commits):
+Pass `--target <ide>` so only that IDE's files are created in your repo (no extra folders or root files):
 
 ```bash
-bash /path/to/repo-documenter/setup.sh --with-git-hooks /path/to/your-repo
+# Antigravity only (.agents/plugins/repo-documenter/)
+bash /path/to/repo-documenter/setup.sh --target antigravity /path/to/your-repo
+
+# VS Code GitHub Copilot only (.github/copilot-instructions.md)
+bash /path/to/repo-documenter/setup.sh --target copilot /path/to/your-repo
+
+# Claude Code only (CLAUDE.md + .claude/settings.json + .claude/hooks/)
+bash /path/to/repo-documenter/setup.sh --target claude /path/to/your-repo
+
+# Cursor only (.cursor/rules/repo-documenter.mdc)
+bash /path/to/repo-documenter/setup.sh --target cursor /path/to/your-repo
+
+# Windsurf only (.windsurfrules)
+bash /path/to/repo-documenter/setup.sh --target windsurf /path/to/your-repo
+
+# Gemini CLI only (GEMINI.md)
+bash /path/to/repo-documenter/setup.sh --target gemini /path/to/your-repo
+
+# All IDEs at once
+bash /path/to/repo-documenter/setup.sh --target all /path/to/your-repo
 ```
+
+Add `--with-git-hooks` to any command above if you also want local `.git/hooks/post-commit` & `post-merge` tracking for manual commits.
 
 ### What Gets Installed
 
