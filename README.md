@@ -92,7 +92,7 @@ tesserak/
 - **Python**: 3.9+
 - **Node.js & npm**: Node 18+ recommended
 - **PostgreSQL**: Local or remote instance (default: `postgresql://tesserak:tesserak123@localhost:5432/tesserak`)
-- **CLI Tools (for CI/CD pipelines & pod inspection)**: `git`, `docker`, `aws`, `kubectl`
+- **CLI Tools (for CI/CD pipelines, pod inspection & community add-ons)**: `git`, `docker`, `aws`, `kubectl`, `helm`
 
 ---
 
@@ -172,7 +172,8 @@ CI=true npm test -- --watchAll=false
 | `POST /api/vpc` | Create VPC + subnets + Internet Gateway |
 | `POST /api/connections` / `GET /api/connections` / `POST /api/connections/test` / `DELETE /api/connections/{connection_id}` | Manage and test AWS IAM connectors |
 | `GET /clusters` / `POST /clusters` / `GET /clusters/{cluster_name}` / `POST /clusters/{cluster_name}/sync` / `DELETE /clusters/{cluster_name}` | EKS cluster CRUD, reconciliation, and 7-day soft-delete audit list |
-| `POST /clusters/{cluster_name}/nodegroups` / `PATCH /clusters/{cluster_name}/nodegroups` / `DELETE /clusters/{cluster_name}/nodegroups` | Managed node group creation, scaling, and deletion |
+| `POST /clusters/{cluster_name}/nodegroups` / `PATCH /clusters/{cluster_name}/nodegroups/{nodegroup_name}` / `DELETE /clusters/{cluster_name}/nodegroups/{nodegroup_name}` | Managed node group creation, scaling, and deletion |
+| `POST /clusters/{cluster_name}/pods/{namespace}/{pod_name}/restart` / `DELETE /clusters/{cluster_name}/pods/{namespace}/{pod_name}` | Restart or delete a live Kubernetes pod in an EKS cluster |
 | `GET /api/resources` / `POST /api/resources` / `DELETE /api/resources/{id}` / `POST /api/resources/{id}/drift-check` | Live AWS resource discovery, provisioning, and drift remediation |
 | `GET /api/guardrails*` / `POST /api/approvals/{id}/decision` | Policy guardrails & approval queue |
 | `GET /api/pipelines` / `POST /api/pipelines` / `POST /api/pipelines/{id}/trigger` / `DELETE /api/pipelines/{id}` | GitOps pipeline CRUD, execution, and cluster cleanup |

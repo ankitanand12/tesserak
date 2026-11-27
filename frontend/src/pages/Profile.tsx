@@ -97,12 +97,18 @@ const Profile: React.FC<ProfileProps> = ({ email }) => {
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (!active || !data || !data.email) return;
+        const merged = {
+          ...data,
+          avatarUrl: (data.avatarUrl || '').trim() || sessionUser?.avatarUrl || '',
+        };
         setFormData((prev) => ({
           ...prev,
-          ...data,
+          ...merged,
+          avatarUrl: merged.avatarUrl || prev.avatarUrl || '',
           mobile: data.mobile || prev.mobile || { countryCode: '+1', number: '' },
         }));
-        writeUserCache(effectiveEmail, data);
+        writeUserCache(effectiveEmail, merged);
+        window.dispatchEvent(new Event('tesserak-profile-updated'));
       })
       .catch(() => null);
 
@@ -168,6 +174,7 @@ const Profile: React.FC<ProfileProps> = ({ email }) => {
         avatarUrl: compressedImage,
       }));
       writeUserCache(effectiveEmail, { avatarUrl: compressedImage });
+      window.dispatchEvent(new Event('tesserak-profile-updated'));
 
       const res = await fetch('http://localhost:8000/api/profile', {
         method: 'PUT',
@@ -218,6 +225,7 @@ const Profile: React.FC<ProfileProps> = ({ email }) => {
                 <Avatar
                   src={formData.avatarUrl}
                   alt={displayName}
+                  imgProps={{ referrerPolicy: 'no-referrer' }}
                   sx={{
                     width: 116,
                     height: 116,

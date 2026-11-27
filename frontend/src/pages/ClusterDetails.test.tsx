@@ -71,7 +71,17 @@ const sampleClusterDetail = {
         cidrBlock: '10.0.1.0/24',
         availabilityZone: 'us-east-1a',
         mapPublicIpOnLaunch: false,
+        isPublic: false,
         availableIpAddressCount: 248,
+      },
+      {
+        subnetId: 'subnet-222bbb',
+        name: 'public-a',
+        cidrBlock: '10.0.2.0/24',
+        availabilityZone: 'us-east-1a',
+        mapPublicIpOnLaunch: true,
+        isPublic: true,
+        availableIpAddressCount: 240,
       },
     ],
     securityGroups: [
@@ -94,14 +104,23 @@ const sampleClusterDetail = {
   nodegroups: [
     {
       nodegroupName: 'ng-workers',
+      nodegroupArn: 'arn:aws:eks:us-east-1:162655485574:nodegroup/tesserak/ng-workers/ng-123',
       status: 'ACTIVE',
       instanceTypes: ['t3.medium'],
       amiType: 'AL2023_x86_64_STANDARD',
       capacityType: 'ON_DEMAND',
       diskSize: 20,
       version: '1.34',
+      releaseVersion: '1.34.1-20261119',
+      nodeRole: 'arn:aws:iam::162655485574:role/tesserak-node-role',
       scalingConfig: { minSize: 1, desiredSize: 2, maxSize: 4 },
-      subnets: ['subnet-111aaa'],
+      subnets: ['subnet-111aaa', 'subnet-222bbb'],
+      resources: { autoScalingGroups: [{ name: 'eks-ng-workers-asg-1' }] },
+      labels: { workload: 'general' },
+      taints: [{ key: 'dedicated', value: 'gpu', effect: 'NO_SCHEDULE' }],
+      updateConfig: { maxUnavailable: 1, updateStrategy: 'DEFAULT' },
+      tags: { ManagedBy: 'Tesserak' },
+      updateHistory: [{ id: 'ng-upd-1', type: 'VersionUpdate', status: 'Successful', createdAt: '2026-11-25T13:05:00Z' }],
     },
   ],
   workerNodes: [
@@ -166,8 +185,26 @@ const sampleClusterDetail = {
       ready: '1/1',
       restarts: 0,
       podIp: '10.0.1.88',
+      hostIp: '10.0.1.42',
       nodeName: 'ip-10-0-1-42.ec2.internal',
       createdAt: '2026-11-25T13:10:00Z',
+      lastTransitionTime: '2026-11-25T13:10:30Z',
+      controlledBy: [{ kind: 'ReplicaSet', name: 'demo-app-rs-abc' }],
+      qosClass: 'Burstable',
+      serviceAccountName: 'default',
+      conditions: [{ type: 'Ready', status: 'True', lastTransitionTime: '2026-11-25T13:10:30Z' }],
+      containers: [
+        {
+          name: 'demo-app',
+          image: 'nginx:1.26.1',
+          ready: true,
+          started: true,
+          restartCount: 0,
+          state: { status: 'Running', startedAt: '2026-11-25T13:10:25Z' },
+          ports: [{ containerPort: 80, protocol: 'TCP' }],
+        },
+      ],
+      raw: { kind: 'Pod', metadata: { name: 'demo-app-pod-1', namespace: 'default' } },
     },
   ],
   fargateProfiles: [],
@@ -177,6 +214,20 @@ const sampleClusterDetail = {
       addonVersion: 'v1.22.4-eksbuild.14',
       status: 'ACTIVE',
       health: { issues: [] },
+    },
+  ],
+  communityAddons: [
+    {
+      id: 'ingress-nginx',
+      name: 'Ingress NGINX',
+      releaseName: 'ingress-nginx',
+      namespace: 'ingress-nginx',
+      chart: 'ingress-nginx',
+      version: '4.12.1',
+      requestedVersion: '4.12.1',
+      status: 'NOT_INSTALLED',
+      source: 'requested',
+      details: 'Selected during setup; click Install via Helm to deploy onto cluster.',
     },
   ],
   updateHistory: [
@@ -430,5 +481,120 @@ describe('ClusterDetails page', () => {
 
     fireEvent.click(within(dialog).getByRole('button', { name: 'Raw view' }));
     expect(within(dialog).getByText(/RAW KUBERNETES NODE/i)).toBeInTheDocument();
+  });
+
+  test('displays Public/Private subnet labels when adding nodegroup and opens Node Group & Pod details with Restart/Delete', async () => {
+    const fetchMock = jest.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/aws/eks-ami/162655485574/us-east-1')) {
+        return {
+          ok: true,
+          json: async () => ({ amiId: 'ami-0134recommended', kubernetesVersion: '1.34' }),
+        } as Response;
+      }
+      if (url.includes('/pods/default/demo-app-pod-1/restart') && init?.method === 'POST') {
+        return {
+          ok: true,
+          json: async () => ({
+            status: 'restarting',
+            message: 'Pod "demo-app-pod-1" in namespace "default" restart triggered.',
+          }),
+        } as Response;
+      }
+      if (url.includes('/community-addons') && init?.method === 'POST') {
+        return {
+          ok: true,
+          json: async () => ({
+            id: 'ingress-nginx',
+            name: 'Ingress NGINX',
+            namespace: 'ingress-nginx',
+            status: 'installed',
+          }),
+        } as Response;
+      }
+      if (url.includes('/pods/default/demo-app-pod-1') && init?.method === 'DELETE') {
+        return {
+          ok: true,
+          json: async () => ({
+            status: 'deleting',
+            message: 'Pod "demo-app-pod-1" in namespace "default" deletion requested.',
+          }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => sampleClusterDetail,
+      } as Response;
+    });
+    global.fetch = fetchMock as any;
+
+    render(<ClusterDetails />);
+    fireEvent.click(await screen.findByRole('tab', { name: /Compute & Add-ons/i }));
+
+    // 1. Add Node Group dialog labels Public/Private worker subnets clearly
+    fireEvent.click(screen.getByRole('button', { name: 'Add Node Group' }));
+    const ngDialog = await screen.findByRole('dialog');
+    expect(within(ngDialog).getByText('private-a (subnet-111aaa) · Private')).toBeInTheDocument();
+    expect(within(ngDialog).getByText('public-a (subnet-222bbb) · Public')).toBeInTheDocument();
+    fireEvent.click(within(ngDialog).getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+    // 2. Clickable Node Group details modal with AWS EKS tabs
+    fireEvent.click(screen.getByRole('button', { name: 'ng-workers' }));
+    const ngDetails = await screen.findByRole('dialog');
+    expect(within(ngDetails).getByText('Node group configuration')).toBeInTheDocument();
+    expect(
+      within(ngDetails).getByText('arn:aws:eks:us-east-1:162655485574:nodegroup/tesserak/ng-workers/ng-123')
+    ).toBeInTheDocument();
+    expect(within(ngDetails).getByText('Private')).toBeInTheDocument();
+    expect(within(ngDetails).getByText('Public')).toBeInTheDocument();
+
+    fireEvent.click(within(ngDetails).getByRole('tab', { name: /Kubernetes labels/i }));
+    expect(within(ngDetails).getByText('workload')).toBeInTheDocument();
+    fireEvent.click(within(ngDetails).getByRole('tab', { name: /Kubernetes taints/i }));
+    expect(within(ngDetails).getByText('dedicated')).toBeInTheDocument();
+    fireEvent.click(within(ngDetails).getByRole('tab', { name: /Update history/i }));
+    expect(within(ngDetails).getByText('ng-upd-1')).toBeInTheDocument();
+    fireEvent.click(within(ngDetails).getByRole('tab', { name: /Tags/i }));
+    expect(within(ngDetails).getByText('ManagedBy')).toBeInTheDocument();
+    fireEvent.click(within(ngDetails).getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+    // 3. Clickable Pod details modal with containers, raw view, Restart & Delete actions
+    fireEvent.click(screen.getByRole('button', { name: 'demo-app-pod-1' }));
+    const podDetails = await screen.findByRole('dialog');
+    expect(within(podDetails).getByText('ReplicaSet/demo-app-rs-abc')).toBeInTheDocument();
+    expect(within(podDetails).getByText('Containers (1)')).toBeInTheDocument();
+    expect(within(podDetails).getByText('nginx:1.26.1')).toBeInTheDocument();
+
+    fireEvent.click(within(podDetails).getByRole('button', { name: 'Raw view' }));
+    expect(within(podDetails).getByText(/RAW KUBERNETES POD MANIFEST/i)).toBeInTheDocument();
+    fireEvent.click(within(podDetails).getByRole('button', { name: 'Structured view' }));
+
+    // Trigger Restart Pod with confirmation
+    fireEvent.click(within(podDetails).getByRole('button', { name: 'Restart Pod' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Confirm Restart Pod' }));
+    expect(
+      await screen.findByText('Pod "demo-app-pod-1" in namespace "default" restart triggered.')
+    ).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+    // Trigger Delete Pod from table row with confirmation
+    fireEvent.click(screen.getByRole('button', { name: 'Delete pod demo-app-pod-1' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Confirm Delete Pod' }));
+    expect(
+      await screen.findByText('Pod "demo-app-pod-1" in namespace "default" deletion requested.')
+    ).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+    // 4. Community / Helm Add-ons section renders requested Ingress NGINX & allows Helm install
+    expect(screen.getByText('Community / Helm Add-ons (1)')).toBeInTheDocument();
+    expect(screen.getByText('Ingress NGINX')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Install via Helm' }));
+    expect(
+      await screen.findByText(
+        'Installed community add-on "Ingress NGINX" via Helm in namespace "ingress-nginx".'
+      )
+    ).toBeInTheDocument();
   });
 });

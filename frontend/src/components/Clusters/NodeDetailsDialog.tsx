@@ -106,9 +106,40 @@ export interface ClusterWorkerNode {
   rawNode?: Record<string, any>;
 }
 
+export interface ClusterPodContainerState {
+  status?: string;
+  reason?: string;
+  message?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  exitCode?: number;
+}
+
+export interface ClusterPodContainer {
+  name?: string;
+  isInit?: boolean;
+  image?: string;
+  imagePullPolicy?: string;
+  imageId?: string;
+  containerId?: string;
+  ready?: boolean;
+  started?: boolean;
+  restartCount?: number;
+  state?: ClusterPodContainerState | null;
+  lastState?: ClusterPodContainerState | null;
+  ports?: Array<{ containerPort?: number; protocol?: string; name?: string }>;
+  requests?: Record<string, string>;
+  limits?: Record<string, string>;
+  volumeMounts?: Array<{ name?: string; mountPath?: string; readOnly?: boolean }>;
+  envNames?: string[];
+  command?: string[];
+  args?: string[];
+}
+
 export interface ClusterPod {
   name: string;
   namespace: string;
+  uid?: string | null;
   status: string;
   phase?: string;
   ready?: string;
@@ -117,12 +148,25 @@ export interface ClusterPod {
   hostIp?: string | null;
   nodeName?: string | null;
   createdAt?: string | null;
-  containers?: Array<{
-    name?: string;
-    image?: string;
-    requests?: Record<string, string>;
-    limits?: Record<string, string>;
+  lastTransitionTime?: string | null;
+  controlledBy?: Array<{ kind?: string; name?: string; uid?: string }>;
+  qosClass?: string | null;
+  serviceAccountName?: string | null;
+  restartPolicy?: string | null;
+  terminationGracePeriodSeconds?: number | null;
+  labels?: Record<string, string>;
+  annotations?: Record<string, string>;
+  conditions?: Array<{
+    type?: string;
+    status?: string;
+    reason?: string;
+    message?: string;
+    lastTransitionTime?: string;
   }>;
+  volumes?: Array<{ name?: string; source?: string }>;
+  containers?: ClusterPodContainer[];
+  initContainers?: ClusterPodContainer[];
+  raw?: Record<string, any>;
 }
 
 export const getPodStatusChipColor = (
@@ -268,9 +312,10 @@ interface NodeDetailsDialogProps {
   node: ClusterWorkerNode | null;
   pods: ClusterPod[];
   onClose: () => void;
+  onSelectPod?: (pod: ClusterPod) => void;
 }
 
-export const NodeDetailsDialog: React.FC<NodeDetailsDialogProps> = ({ node, pods, onClose }) => {
+export const NodeDetailsDialog: React.FC<NodeDetailsDialogProps> = ({ node, pods, onClose, onSelectPod }) => {
   const [viewMode, setViewMode] = useState<'structured' | 'raw'>('structured');
   const [copiedJson, setCopiedJson] = useState(false);
   const [podsPage, setPodsPage] = useState(1);
@@ -646,8 +691,29 @@ export const NodeDetailsDialog: React.FC<NodeDetailsDialogProps> = ({ node, pods
                     </TableHead>
                     <TableBody>
                       {pagedNodePods.map((pod) => (
-                        <TableRow key={`${pod.namespace}/${pod.name}`}>
-                          <TableCell sx={{ fontFamily: 'monospace', fontWeight: 700 }}>{pod.name}</TableCell>
+                        <TableRow key={`${pod.namespace}/${pod.name}`} hover>
+                          <TableCell sx={{ fontFamily: 'monospace', fontWeight: 700 }}>
+                            {onSelectPod ? (
+                              <Button
+                                size="small"
+                                variant="text"
+                                onClick={() => onSelectPod(pod)}
+                                sx={{
+                                  p: 0,
+                                  minWidth: 0,
+                                  textTransform: 'none',
+                                  fontFamily: 'monospace',
+                                  fontWeight: 700,
+                                  color: '#2563eb',
+                                  textAlign: 'left',
+                                }}
+                              >
+                                {pod.name}
+                              </Button>
+                            ) : (
+                              pod.name
+                            )}
+                          </TableCell>
                           <TableCell>{pod.namespace}</TableCell>
                           <TableCell>
                             <Chip

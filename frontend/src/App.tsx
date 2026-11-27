@@ -182,11 +182,13 @@ const Layout: React.FC<LayoutProps> = ({
     document.title = title;
   }, [location.pathname]);
 
+  const { sessionUser } = useTesserakAuth();
   const users = JSON.parse(localStorage.getItem('users') || '{}');
   const userProfile = users[currentUser] || { firstName: currentUser.split('@')[0], lastName: '' };
+  const avatarSrc = sessionUser?.avatarUrl || userProfile.avatarUrl || undefined;
   const initials =
-    ((userProfile.firstName?.[0] || currentUser[0] || 'T') +
-      (userProfile.lastName?.[0] || '')).toUpperCase();
+    ((sessionUser?.firstName?.[0] || userProfile.firstName?.[0] || currentUser[0] || 'T') +
+      (sessionUser?.lastName?.[0] || userProfile.lastName?.[0] || '')).toUpperCase();
 
   const handleNav = (path: string) => {
     navigate(path);
@@ -320,7 +322,8 @@ const Layout: React.FC<LayoutProps> = ({
             </Typography>
             <IconButton onClick={(e) => setAnchorEl(e.currentTarget)} sx={{ p: 0.4 }}>
               <Avatar
-                src={userProfile.avatarUrl}
+                src={avatarSrc}
+                imgProps={{ referrerPolicy: 'no-referrer' }}
                 sx={{
                   width: 36,
                   height: 36,

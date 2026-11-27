@@ -229,16 +229,28 @@ const ClusterTable: React.FC<ClusterTableProps> = ({
                       />
                     </TableCell>
                     <TableCell>
-                      <Chip
-                        size="small"
-                        label={syncMeta.label}
-                        sx={{
-                          bgcolor: syncMeta.bg,
-                          color: syncMeta.color,
-                          fontWeight: 700,
-                          fontSize: '0.73rem',
-                        }}
-                      />
+                      <Tooltip
+                        title={
+                          cluster.stateDifferences && cluster.stateDifferences.length > 0
+                            ? cluster.stateDifferences.join(', ')
+                            : syncMeta.label === 'AWS Only'
+                            ? 'Exists on AWS EKS; click Sync to track in Tesserak state'
+                            : syncMeta.label === 'Needs Sync'
+                            ? 'Local state differs from AWS EKS; click Sync to reconcile'
+                            : ''
+                        }
+                      >
+                        <Chip
+                          size="small"
+                          label={syncMeta.label}
+                          sx={{
+                            bgcolor: syncMeta.bg,
+                            color: syncMeta.color,
+                            fontWeight: 700,
+                            fontSize: '0.73rem',
+                          }}
+                        />
+                      </Tooltip>
                     </TableCell>
                     <TableCell sx={{ whiteSpace: 'nowrap' }}>
                       {new Date(cluster.createdAt).toLocaleDateString()}

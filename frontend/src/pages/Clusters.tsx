@@ -160,11 +160,8 @@ const ClustersContent: React.FC<ClustersContentProps> = ({
     () => clusters.filter((c) => c.stateStatus === 'differences_found').length,
     [clusters]
   );
-  const missingCount = useMemo(
-    () =>
-      clusters.filter(
-        (c) => c.stateStatus === 'missing_local' || c.stateStatus === 'deleted'
-      ).length,
+  const awsOnlyCount = useMemo(
+    () => clusters.filter((c) => c.stateStatus === 'missing_local').length,
     [clusters]
   );
   const activeCount = useMemo(
@@ -200,15 +197,15 @@ const ClustersContent: React.FC<ClustersContentProps> = ({
 
   const healthData = [
     { name: 'Synced', value: syncedCount },
-    { name: 'Needs Sync', value: diffCount },
-    { name: 'Missing / Deleted', value: missingCount },
+    { name: 'Needs Sync', value: diffCount + awsOnlyCount },
+    { name: 'Missing / Deleted', value: deletedCount },
   ];
 
   const filterChips: Array<{ id: ClusterFilter; label: string; count: number }> = [
     { id: 'all', label: 'All', count: clusters.length },
     { id: 'active', label: 'Active', count: activeCount },
     { id: 'synced', label: 'Synced', count: syncedCount },
-    { id: 'drift', label: 'Needs Sync', count: diffCount + clusters.filter((c) => c.stateStatus === 'missing_local').length },
+    { id: 'drift', label: 'Needs Sync', count: diffCount + awsOnlyCount },
     { id: 'deleted', label: 'Deleted', count: deletedCount },
   ];
 

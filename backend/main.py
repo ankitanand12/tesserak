@@ -56,50 +56,113 @@ _CLUSTER_LIST_CACHE: Dict[str, tuple[float, List[Any]]] = {}
 _COMMUNITY_ADDON_REPOS = {
     "ingress-nginx": {
         "repo": "kubernetes/ingress-nginx",
+        "helm_repo_name": "ingress-nginx",
+        "helm_repo_url": "https://kubernetes.github.io/ingress-nginx",
+        "chart": "ingress-nginx",
+        "release": "ingress-nginx",
+        "namespace": "ingress-nginx",
         "fallback": ["4.12.1", "4.11.5", "4.11.3", "4.10.6"],
     },
     "external-dns": {
         "repo": "kubernetes-sigs/external-dns",
+        "helm_repo_name": "external-dns",
+        "helm_repo_url": "https://kubernetes-sigs.github.io/external-dns",
+        "chart": "external-dns",
+        "release": "external-dns",
+        "namespace": "external-dns",
         "fallback": ["0.20.0", "0.19.0", "0.18.0", "0.17.0", "0.16.0"],
     },
     "cert-manager": {
         "repo": "cert-manager/cert-manager",
+        "helm_repo_name": "jetstack",
+        "helm_repo_url": "https://charts.jetstack.io",
+        "chart": "cert-manager",
+        "release": "cert-manager",
+        "namespace": "cert-manager",
+        "set_args": ["crds.enabled=true"],
         "fallback": ["1.19.1", "1.18.2", "1.17.2", "1.16.3", "1.15.3"],
     },
     "metrics-server": {
         "repo": "kubernetes-sigs/metrics-server",
-        "fallback": ["0.8.0", "0.7.2", "0.7.1", "0.7.0", "0.6.4"],
+        "helm_repo_name": "metrics-server",
+        "helm_repo_url": "https://kubernetes-sigs.github.io/metrics-server",
+        "chart": "metrics-server",
+        "release": "metrics-server",
+        "namespace": "kube-system",
+        "fallback": ["3.12.2", "3.12.1", "3.12.0"],
     },
     "argo-cd": {
         "repo": "argoproj/argo-cd",
-        "fallback": ["2.14.8", "2.14.5", "2.13.4", "2.12.11"],
+        "helm_repo_name": "argo",
+        "helm_repo_url": "https://argoproj.github.io/argo-helm",
+        "chart": "argo-cd",
+        "release": "argo-cd",
+        "namespace": "argocd",
+        "fallback": ["7.8.23", "7.8.13", "7.7.16"],
     },
     "argo-workflow": {
         "repo": "argoproj/argo-workflows",
-        "fallback": ["3.6.5", "3.6.2", "3.5.14"],
+        "helm_repo_name": "argo",
+        "helm_repo_url": "https://argoproj.github.io/argo-helm",
+        "chart": "argo-workflows",
+        "release": "argo-workflows",
+        "namespace": "argo",
+        "fallback": ["0.45.10", "0.45.4", "0.42.10"],
     },
     "reloader": {
         "repo": "stakater/Reloader",
-        "fallback": ["1.4.1", "1.3.0", "1.2.1", "1.1.0"],
+        "helm_repo_name": "stakater",
+        "helm_repo_url": "https://stakater.github.io/stakater-charts",
+        "chart": "reloader",
+        "release": "reloader",
+        "namespace": "reloader",
+        "fallback": ["2.2.21", "1.4.1", "1.3.0", "1.2.1"],
     },
     "cluster-proportional-autoscaler": {
         "repo": "kubernetes-sigs/cluster-proportional-autoscaler",
+        "helm_repo_name": "cpa",
+        "helm_repo_url": "https://kubernetes-sigs.github.io/cluster-proportional-autoscaler",
+        "chart": "cluster-proportional-autoscaler",
+        "release": "cluster-proportional-autoscaler",
+        "namespace": "kube-system",
         "fallback": ["1.9.0", "1.8.8", "1.8.6"],
     },
     "cluster-autoscaler": {
         "repo": "kubernetes/autoscaler",
-        "fallback": ["1.32.1", "1.31.2", "1.30.3"],
+        "helm_repo_name": "autoscaler",
+        "helm_repo_url": "https://kubernetes.github.io/autoscaler",
+        "chart": "cluster-autoscaler",
+        "release": "cluster-autoscaler",
+        "namespace": "kube-system",
+        "needs_cluster_region": True,
+        "fallback": ["9.60.1", "9.46.6", "9.43.2"],
     },
     "karpenter": {
         "repo": "aws/karpenter-provider-aws",
+        "oci_chart": "oci://public.ecr.aws/karpenter/karpenter",
+        "chart": "karpenter",
+        "release": "karpenter",
+        "namespace": "karpenter",
+        "needs_cluster_name": True,
         "fallback": ["1.3.3", "1.2.4", "1.1.5", "1.0.9"],
     },
     "aws-load-balancer-controller": {
         "repo": "kubernetes-sigs/aws-load-balancer-controller",
-        "fallback": ["2.12.0", "2.11.0", "2.10.1"],
+        "helm_repo_name": "eks",
+        "helm_repo_url": "https://aws.github.io/eks-charts",
+        "chart": "aws-load-balancer-controller",
+        "release": "aws-load-balancer-controller",
+        "namespace": "kube-system",
+        "needs_cluster_name": True,
+        "fallback": ["1.12.0", "1.11.0", "1.10.1"],
     },
     "grafana-stack": {
         "repo": "prometheus-community/helm-charts",
+        "helm_repo_name": "prometheus-community",
+        "helm_repo_url": "https://prometheus-community.github.io/helm-charts",
+        "chart": "kube-prometheus-stack",
+        "release": "grafana-stack",
+        "namespace": "monitoring",
         "fallback": ["70.4.2", "69.8.2", "68.4.4"],
     },
     "ops-agent": {
@@ -463,11 +526,215 @@ async def install_aws_addon(eks_client, cluster_name: str, addon: AddonModel, ek
     except Exception as e:
         return {"status": "error", "details": str(e), "usedVersion": compatible_version}
 
-async def install_community_addon(cluster_name: str, addon: AddonModel) -> dict:
+def _resolve_helm_binary() -> Optional[str]:
+    found = shutil.which("helm")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/helm", "/usr/local/bin/helm"):
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _isolated_helm_env(conn: Any, kc_path: Path, region: str, base_dir: Path) -> Dict[str, str]:
+    docker_dir = base_dir / "docker"
+    cache_dir = base_dir / "helm_cache"
+    cfg_dir = base_dir / "helm_config"
+    data_dir = base_dir / "helm_data"
+    for d in (docker_dir, cache_dir, cfg_dir, data_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    docker_cfg = docker_dir / "config.json"
+    if not docker_cfg.exists():
+        docker_cfg.write_text("{}")
+    return _pip_cli_env({
+        **build_eks_cli_env(conn, kc_path, region),
+        "DOCKER_CONFIG": str(docker_dir),
+        "HELM_CACHE_HOME": str(cache_dir),
+        "HELM_CONFIG_HOME": str(cfg_dir),
+        "HELM_DATA_HOME": str(data_dir),
+    })
+
+
+def _install_community_addon_sync(
+    conn: Any,
+    region: str,
+    cluster_name: str,
+    addon: AddonModel,
+    cluster_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Install or upgrade a Kubernetes community add-on via Helm CLI."""
+    cfg = _COMMUNITY_ADDON_REPOS.get(addon.id)
+    if not cfg or (not cfg.get("helm_repo_url") and not cfg.get("oci_chart")):
+        return {
+            "id": addon.id,
+            "name": addon.name or addon.id,
+            "status": "unsupported",
+            "version": addon.version,
+            "details": f'"{addon.id}" does not have an official Helm chart repository mapping.',
+        }
+
+    helm_bin = _resolve_helm_binary()
+    if not helm_bin:
+        return {
+            "id": addon.id,
+            "name": addon.name or cfg.get("release", addon.id),
+            "status": "failed",
+            "version": addon.version,
+            "details": "Helm CLI is not installed on the backend host.",
+        }
+
+    if not cluster_info:
+        eks_client = boto3.client(
+            "eks",
+            aws_access_key_id=conn.accessKey,
+            aws_secret_access_key=conn.secretKey,
+            region_name=region,
+            config=AWS_FAST_CFG,
+        )
+        cluster_info = eks_client.describe_cluster(name=cluster_name).get("cluster", {})
+
+    endpoint = cluster_info.get("endpoint")
+    ca_data = (cluster_info.get("certificateAuthority") or {}).get("data")
+    if not endpoint or not ca_data:
+        return {
+            "id": addon.id,
+            "name": addon.name or addon.id,
+            "status": "failed",
+            "version": addon.version,
+            "details": f"Cluster '{cluster_name}' API endpoint is not ready yet.",
+        }
+
+    release = cfg.get("release") or addon.id
+    namespace = cfg.get("namespace") or "kube-system"
+    chart = cfg.get("chart") or addon.id
+    tmpdir = tempfile.mkdtemp(prefix="tesserak_helm_")
+    try:
+        tmp_path = Path(tmpdir)
+        kc_path = tmp_path / "kubeconfig"
+        kc_path.write_text(build_eks_kubeconfig_yaml(cluster_name, endpoint, ca_data, region))
+        env = _isolated_helm_env(conn, kc_path, region, tmp_path)
+
+        if cfg.get("oci_chart"):
+            chart_ref = str(cfg["oci_chart"])
+        else:
+            repo_name = str(cfg["helm_repo_name"])
+            repo_url = str(cfg["helm_repo_url"])
+            add_proc = subprocess.run(
+                [helm_bin, "repo", "add", repo_name, repo_url, "--force-update"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+                check=False,
+            )
+            if add_proc.returncode != 0:
+                return {
+                    "id": addon.id,
+                    "name": addon.name or release,
+                    "namespace": namespace,
+                    "status": "failed",
+                    "version": addon.version,
+                    "details": (add_proc.stderr or add_proc.stdout or "helm repo add failed").strip(),
+                }
+            subprocess.run(
+                [helm_bin, "repo", "update", repo_name],
+                capture_output=True,
+                text=True,
+                timeout=45,
+                env=env,
+                check=False,
+            )
+            chart_ref = f"{repo_name}/{chart}"
+
+        base_cmd = [
+            helm_bin,
+            "upgrade",
+            "--install",
+            release,
+            chart_ref,
+            "--kubeconfig",
+            str(kc_path),
+            "--namespace",
+            namespace,
+            "--create-namespace",
+            "--timeout",
+            "5m",
+        ]
+        for s_arg in cfg.get("set_args", []):
+            base_cmd.extend(["--set", s_arg])
+        if cfg.get("needs_cluster_name"):
+            flag = "settings.clusterName" if addon.id == "karpenter" else "clusterName"
+            base_cmd.extend(["--set", f"{flag}={cluster_name}"])
+        if cfg.get("needs_cluster_region"):
+            base_cmd.extend([
+                "--set", f"autoDiscovery.clusterName={cluster_name}",
+                "--set", f"awsRegion={region}",
+            ])
+
+        req_ver = (addon.version or "").strip().lstrip("v")
+        cmd = list(base_cmd) + (["--version", req_ver] if req_ver else [])
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env, check=False)
+
+        # Retry without pinned --version if GitHub release app tag didn't match Helm chart semver
+        if proc.returncode != 0 and req_ver:
+            err_l = (proc.stderr or proc.stdout or "").lower()
+            if "not found" in err_l or "chart" in err_l:
+                proc = subprocess.run(base_cmd, capture_output=True, text=True, timeout=180, env=env, check=False)
+
+        if proc.returncode != 0:
+            err_msg = (proc.stderr or proc.stdout or "Helm install failed").strip().splitlines()
+            return {
+                "id": addon.id,
+                "name": addon.name or release,
+                "releaseName": release,
+                "namespace": namespace,
+                "chart": chart,
+                "status": "failed",
+                "version": addon.version,
+                "details": err_msg[-1] if err_msg else "Helm install failed",
+            }
+
+        return {
+            "id": addon.id,
+            "name": addon.name or release,
+            "releaseName": release,
+            "namespace": namespace,
+            "chart": chart,
+            "status": "installed",
+            "version": addon.version or "latest",
+            "details": (proc.stdout or "Helm release installed").strip().splitlines()[0] if proc.stdout else "Installed",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "id": addon.id,
+            "name": addon.name or release,
+            "namespace": namespace,
+            "status": "failed",
+            "version": addon.version,
+            "details": f"Timed out installing {release} via Helm.",
+        }
+    except Exception as exc:
+        return {
+            "id": addon.id,
+            "name": addon.name or release,
+            "namespace": namespace,
+            "status": "failed",
+            "version": addon.version,
+            "details": str(exc),
+        }
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+async def install_community_addon(
+    conn: Any,
+    region: str,
+    cluster_name: str,
+    addon: AddonModel,
+    cluster_info: Optional[Dict[str, Any]] = None,
+) -> dict:
     """Install a community addon using Helm."""
-    # TODO: Implement Helm-based installation
-    # For now, return success without actual installation
-    return {"status": "success", "details": "Community add-on installation not yet implemented"}
+    return await asyncio.to_thread(_install_community_addon_sync, conn, region, cluster_name, addon, cluster_info)
 
 class VpcSelection(BaseModel):
     id: Optional[str] = ""
@@ -545,6 +812,12 @@ class NodeGroupScaleRequest(BaseModel):
     desiredSize: int = 2
     maxSize: int = 4
 
+class CommunityAddonInstallRequest(BaseModel):
+    addonId: str
+    name: Optional[str] = None
+    version: Optional[str] = None
+
+
 class ClusterResponse(BaseModel):
     name: str
     status: str
@@ -553,6 +826,7 @@ class ClusterResponse(BaseModel):
     version: str
     endpoint: Optional[str] = None
     stateStatus: str
+    stateDifferences: List[str] = []
     createdAt: datetime
     deletedAt: Optional[datetime] = None
     deletedBy: Optional[str] = None  # 'aws-console' or 'tool'
@@ -831,6 +1105,9 @@ async def _finalize_cluster_addons(
                 WaiterConfig={"Delay": 30, "MaxAttempts": 40},
             )
         )
+        cluster_info = await asyncio.to_thread(
+            lambda: eks_client.describe_cluster(name=cluster_name)["cluster"]
+        )
         if nodegroup_req:
             try:
                 await asyncio.to_thread(
@@ -841,13 +1118,54 @@ async def _finalize_cluster_addons(
                     user_email,
                     region,
                 )
+                has_community = any(a.type != "aws" for a in addons)
+                if has_community:
+                    try:
+                        await asyncio.to_thread(
+                            lambda: eks_client.get_waiter("nodegroup_active").wait(
+                                clusterName=cluster_name,
+                                nodegroupName=nodegroup_req.nodegroupName,
+                                WaiterConfig={"Delay": 20, "MaxAttempts": 30},
+                            )
+                        )
+                    except Exception as wait_exc:
+                        logger.warning(f"Nodegroup waiter ended early for {cluster_name}: {wait_exc}")
             except Exception as ng_exc:
                 logger.warning(f"Initial nodegroup creation skipped/failed for {cluster_name}: {ng_exc}")
+
+        community_results: List[Dict[str, Any]] = []
         for addon in addons:
             if addon.type == "aws":
                 await install_aws_addon(eks_client, cluster_name, addon, eks_version)
             else:
-                await install_community_addon(cluster_name, addon)
+                res = await install_community_addon(conn, region, cluster_name, addon, cluster_info)
+                community_results.append(res)
+
+        if user_email:
+            try:
+                ng_names = await asyncio.to_thread(
+                    lambda: eks_client.list_nodegroups(clusterName=cluster_name).get("nodegroups", [])
+                )
+                live_ngs = await asyncio.to_thread(
+                    lambda: [eks_client.describe_nodegroup(clusterName=cluster_name, nodegroupName=n)["nodegroup"] for n in ng_names[:20]]
+                )
+                curr = state_manager.get_cluster_state(user_email, cluster_name)
+                base_state = dict(curr.get("state", curr)) if curr else {"name": cluster_name, "region": region}
+                updated = state_data.record_state_change(
+                    base_state,
+                    "finalize_addons",
+                    {
+                        "status": cluster_info.get("status", "ACTIVE"),
+                        "version": cluster_info.get("version", eks_version),
+                        "endpoint": cluster_info.get("endpoint"),
+                        "nodeGroups": live_ngs,
+                        "communityAddons": community_results,
+                    },
+                )
+                state_manager.save_cluster_state(user_email, cluster_name, updated)
+                invalidate_cluster_list_cache(user_email)
+            except Exception as sync_exc:
+                logger.warning(f"Post-finalize local state sync skipped for {cluster_name}: {sync_exc}")
     except Exception as exc:
         logger.warning(f"Background addon/nodegroup finalization skipped/failed for {cluster_name}: {exc}")
 
@@ -984,18 +1302,26 @@ def _list_clusters_sync(connection: Any, x_user_email: str, account_id: Optional
         )
         try:
             cluster_info = local_eks.describe_cluster(name=cname)["cluster"]
+            try:
+                ng_names = local_eks.list_nodegroups(clusterName=cname).get("nodegroups", [])
+            except Exception:
+                ng_names = []
             aws_state = {
                 "status": cluster_info["status"],
                 "endpoint": cluster_info.get("endpoint"),
                 "version": cluster_info.get("version"),
+                "nodeGroups": [{"nodegroupName": n} for n in ng_names],
                 "aws_response": cluster_info,
             }
+            differences: List[str] = []
             if state.get("_aws_only"):
                 state_status = "missing_local"
+                differences = ["Cluster exists on AWS EKS; click Sync to import into local state"]
             else:
                 try:
                     comparison = state_manager.compare_with_aws_state(x_user_email, cname, aws_state)
                     state_status = comparison["status"]
+                    differences = comparison.get("differences", [])
                     if state_status == "in_sync":
                         state_status = "synced"
                 except Exception:
@@ -1015,6 +1341,7 @@ def _list_clusters_sync(connection: Any, x_user_email: str, account_id: Optional
                 version=cluster_info["version"],
                 endpoint=cluster_info.get("endpoint"),
                 stateStatus=state_status,
+                stateDifferences=differences,
                 createdAt=created_at_val,
                 deletedAt=None,
                 deletedBy=None,
@@ -1147,26 +1474,100 @@ def _derive_pod_display_status(pod: Dict[str, Any]) -> str:
     return str(status.get("phase") or "Unknown")
 
 
+def _parse_container_state(raw_state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not raw_state:
+        return None
+    if "running" in raw_state:
+        r = raw_state["running"] or {}
+        return {"status": "Running", "startedAt": r.get("startedAt")}
+    if "waiting" in raw_state:
+        w = raw_state["waiting"] or {}
+        return {"status": "Waiting", "reason": w.get("reason"), "message": w.get("message")}
+    if "terminated" in raw_state:
+        t = raw_state["terminated"] or {}
+        return {
+            "status": "Terminated",
+            "reason": t.get("reason"),
+            "message": t.get("message"),
+            "exitCode": t.get("exitCode"),
+            "startedAt": t.get("startedAt"),
+            "finishedAt": t.get("finishedAt"),
+        }
+    return None
+
+
+def _build_container_details(
+    specs: List[Dict[str, Any]],
+    statuses: List[Dict[str, Any]],
+    *,
+    is_init: bool = False,
+) -> List[Dict[str, Any]]:
+    status_by_name = {s.get("name"): s for s in (statuses or []) if s.get("name")}
+    out: List[Dict[str, Any]] = []
+    for c in specs or []:
+        cname = c.get("name") or ""
+        cs = status_by_name.get(cname, {})
+        res = c.get("resources") or {}
+        out.append({
+            "name": cname,
+            "isInit": is_init,
+            "image": cs.get("image") or c.get("image"),
+            "imagePullPolicy": c.get("imagePullPolicy"),
+            "imageId": cs.get("imageID"),
+            "containerId": cs.get("containerID"),
+            "ready": bool(cs.get("ready", False)),
+            "started": bool(cs.get("started", False)),
+            "restartCount": int(cs.get("restartCount") or 0),
+            "state": _parse_container_state(cs.get("state")),
+            "lastState": _parse_container_state(cs.get("lastState")),
+            "ports": c.get("ports") or [],
+            "requests": res.get("requests") or {},
+            "limits": res.get("limits") or {},
+            "volumeMounts": c.get("volumeMounts") or [],
+            "envNames": [e.get("name") for e in (c.get("env") or []) if e.get("name")],
+            "command": c.get("command") or [],
+            "args": c.get("args") or [],
+        })
+    return out
+
+
 def _extract_pod_summary(pod: Dict[str, Any]) -> Dict[str, Any]:
     meta = pod.get("metadata", {}) or {}
     spec = pod.get("spec", {}) or {}
     status = pod.get("status", {}) or {}
     c_statuses = status.get("containerStatuses") or []
+    init_statuses = status.get("initContainerStatuses") or []
     total_containers = len(spec.get("containers") or [])
     ready_containers = sum(1 for c in c_statuses if c.get("ready"))
     restarts = sum(int(c.get("restartCount") or 0) for c in c_statuses)
-    containers = []
-    for c in spec.get("containers") or []:
-        res = c.get("resources") or {}
-        containers.append({
-            "name": c.get("name"),
-            "image": c.get("image"),
-            "requests": res.get("requests") or {},
-            "limits": res.get("limits") or {},
-        })
+
+    conditions = status.get("conditions") or []
+    ready_cond = next((cond for cond in conditions if cond.get("type") == "Ready"), None)
+    last_transition = (ready_cond or {}).get("lastTransitionTime") or max(
+        (str(cond.get("lastTransitionTime") or "") for cond in conditions),
+        default="",
+    ) or None
+
+    controlled_by = [
+        {"kind": ref.get("kind"), "name": ref.get("name"), "uid": ref.get("uid")}
+        for ref in (meta.get("ownerReferences") or [])
+        if ref.get("kind") or ref.get("name")
+    ]
+    volumes = [
+        {
+            "name": v.get("name"),
+            "source": next((k for k in v.keys() if k != "name"), "volume"),
+        }
+        for v in (spec.get("volumes") or [])
+    ]
+
+    raw_meta = {k: v for k, v in meta.items() if k != "managedFields"}
+    raw_clean = {"kind": pod.get("kind") or "Pod", "apiVersion": pod.get("apiVersion") or "v1", "metadata": raw_meta, "spec": spec, "status": status}
+
     return {
         "name": meta.get("name") or "",
         "namespace": meta.get("namespace") or "default",
+        "uid": meta.get("uid"),
         "status": _derive_pod_display_status(pod),
         "phase": status.get("phase") or "Unknown",
         "ready": f"{ready_containers}/{total_containers}" if total_containers else "0/0",
@@ -1175,7 +1576,19 @@ def _extract_pod_summary(pod: Dict[str, Any]) -> Dict[str, Any]:
         "hostIp": status.get("hostIP"),
         "nodeName": spec.get("nodeName"),
         "createdAt": meta.get("creationTimestamp"),
-        "containers": containers,
+        "lastTransitionTime": last_transition,
+        "controlledBy": controlled_by,
+        "qosClass": status.get("qosClass"),
+        "serviceAccountName": spec.get("serviceAccountName") or spec.get("serviceAccount"),
+        "restartPolicy": spec.get("restartPolicy"),
+        "terminationGracePeriodSeconds": spec.get("terminationGracePeriodSeconds"),
+        "labels": meta.get("labels") or {},
+        "annotations": meta.get("annotations") or {},
+        "conditions": conditions,
+        "volumes": volumes,
+        "containers": _build_container_details(spec.get("containers") or [], c_statuses, is_init=False),
+        "initContainers": _build_container_details(spec.get("initContainers") or [], init_statuses, is_init=True),
+        "raw": raw_clean,
     }
 
 
@@ -1457,7 +1870,22 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
         if not ng_names:
             return []
         local_eks = boto3.client("eks", aws_access_key_id=connection.accessKey, aws_secret_access_key=connection.secretKey, region_name=region, config=AWS_FAST_CFG)
-        return [local_eks.describe_nodegroup(clusterName=cluster_name, nodegroupName=n)["nodegroup"] for n in ng_names[:20]]
+        results = []
+        for n in ng_names[:20]:
+            ng = local_eks.describe_nodegroup(clusterName=cluster_name, nodegroupName=n)["nodegroup"]
+            ng_updates = []
+            try:
+                upd_ids = local_eks.list_updates(name=cluster_name, nodegroupName=n).get("updateIds", [])
+                for uid in upd_ids[:10]:
+                    ng_updates.append(
+                        local_eks.describe_update(name=cluster_name, nodegroupName=n, updateId=uid)["update"]
+                    )
+                ng_updates.sort(key=lambda u: str(u.get("createdAt", "")), reverse=True)
+            except Exception:
+                ng_updates = []
+            ng["updateHistory"] = ng_updates
+            results.append(ng)
+        return results
 
     def _fetch_addons():
         addon_names = eks.list_addons(clusterName=cluster_name).get("addons", [])
@@ -1550,6 +1978,7 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
                         "cidrBlock": sub.get("CidrBlock"),
                         "availabilityZone": sub.get("AvailabilityZone"),
                         "mapPublicIpOnLaunch": sub.get("MapPublicIpOnLaunch", False),
+                        "isPublic": bool(sub.get("MapPublicIpOnLaunch", False)) or ("public" in sname.lower()),
                         "availableIpAddressCount": sub.get("AvailableIpAddressCount"),
                     })
             except Exception:
@@ -1580,7 +2009,38 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
     def _fetch_k8s():
         return _fetch_k8s_runtime_sync(connection, cluster_name, cluster_info, aws_region)
 
-    with ThreadPoolExecutor(max_workers=7) as pool:
+    def _fetch_helm_releases():
+        if cluster_info.get("status") != "ACTIVE":
+            return []
+        helm_bin = _resolve_helm_binary()
+        endpoint = cluster_info.get("endpoint")
+        ca_data = (cluster_info.get("certificateAuthority") or {}).get("data")
+        if not helm_bin or not endpoint or not ca_data:
+            return []
+        tmpdir = tempfile.mkdtemp(prefix="tesserak_hl_")
+        try:
+            tmp_path = Path(tmpdir)
+            kc_path = tmp_path / "kubeconfig"
+            kc_path.write_text(build_eks_kubeconfig_yaml(cluster_name, endpoint, ca_data, aws_region))
+            env = _isolated_helm_env(connection, kc_path, aws_region, tmp_path)
+            proc = subprocess.run(
+                [helm_bin, "list", "-A", "-o", "json", "--kubeconfig", str(kc_path)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=env,
+                check=False,
+            )
+            if proc.returncode != 0:
+                return []
+            items = json.loads(proc.stdout or "[]")
+            return items if isinstance(items, list) else []
+        except Exception:
+            return []
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
         f_ng = pool.submit(_fetch_nodegroups)
         f_ad = pool.submit(_fetch_addons)
         f_fg = pool.submit(_fetch_fargate)
@@ -1588,6 +2048,7 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
         f_net = pool.submit(_fetch_networking)
         f_nodes = pool.submit(_fetch_worker_nodes)
         f_k8s = pool.submit(_fetch_k8s)
+        f_helm = pool.submit(_fetch_helm_releases)
 
         nodegroups = f_ng.result()
         addons = f_ad.result()
@@ -1596,6 +2057,68 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
         networking = f_net.result()
         ec2_nodes = f_nodes.result()
         k8s_nodes_map, pods, k8s_warning = f_k8s.result()
+        helm_releases = f_helm.result()
+
+    # Build unified Community / Helm add-ons view combining live Helm releases + tracked/requested add-ons
+    live_by_name = {str(rel.get("name") or "").lower(): rel for rel in helm_releases}
+    tracked_results = {str(r.get("id") or "").lower(): r for r in (local_state or {}).get("communityAddons", []) if isinstance(r, dict)}
+    requested_comm = [
+        a for a in (((local_state or {}).get("desiredState") or {}).get("addons") or [])
+        if isinstance(a, dict) and a.get("type") == "community"
+    ]
+    community_addons: List[Dict[str, Any]] = []
+    seen_comm_ids: set = set()
+    for a in requested_comm:
+        aid = str(a.get("id") or "")
+        cfg = _COMMUNITY_ADDON_REPOS.get(aid, {})
+        rel_name = str(cfg.get("release") or aid).lower()
+        live = live_by_name.get(rel_name) or live_by_name.get(aid.lower())
+        tracked = tracked_results.get(aid.lower())
+        seen_comm_ids.add(rel_name)
+        if live:
+            community_addons.append({
+                "id": aid,
+                "name": a.get("name") or aid,
+                "releaseName": live.get("name"),
+                "namespace": live.get("namespace"),
+                "chart": live.get("chart"),
+                "version": live.get("app_version") or live.get("chart") or a.get("version"),
+                "requestedVersion": a.get("version"),
+                "status": str(live.get("status") or "deployed").upper(),
+                "source": "helm-live",
+                "details": live.get("updated") or "",
+            })
+        else:
+            community_addons.append({
+                "id": aid,
+                "name": a.get("name") or aid,
+                "releaseName": cfg.get("release") or aid,
+                "namespace": cfg.get("namespace") or "kube-system",
+                "chart": cfg.get("chart") or aid,
+                "version": a.get("version"),
+                "requestedVersion": a.get("version"),
+                "status": str((tracked or {}).get("status") or "NOT_INSTALLED").upper(),
+                "source": "requested",
+                "details": (tracked or {}).get("details") or "Selected during setup; click Install via Helm to deploy onto cluster.",
+            })
+    for rel in helm_releases:
+        rname = str(rel.get("name") or "").lower()
+        if rname and rname not in seen_comm_ids:
+            matched_id = next(
+                (k for k, v in _COMMUNITY_ADDON_REPOS.items() if str(v.get("release") or k).lower() == rname),
+                rname,
+            )
+            community_addons.append({
+                "id": matched_id,
+                "name": rel.get("name"),
+                "releaseName": rel.get("name"),
+                "namespace": rel.get("namespace"),
+                "chart": rel.get("chart"),
+                "version": rel.get("app_version") or rel.get("chart"),
+                "status": str(rel.get("status") or "deployed").upper(),
+                "source": "helm-live",
+                "details": rel.get("updated") or "",
+            })
 
     worker_nodes = _merge_nodes_and_compute_allocations(ec2_nodes, k8s_nodes_map, pods)
 
@@ -1644,6 +2167,7 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
         "k8sRuntimeWarning": k8s_warning,
         "fargateProfiles": fargate_profiles,
         "addons": addons,
+        "communityAddons": community_addons,
         "updateHistory": updates,
         "localState": {
             "lastUpdated": local_wrapper.get("last_updated") if local_wrapper else None,
@@ -1915,6 +2439,114 @@ async def delete_cluster_nodegroup(
         raise HTTPException(status_code=400, detail=f"Node group deletion failed: {str(e)}")
 
 
+_K8S_RESOURCE_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+
+
+def _validate_k8s_name(value: str, label: str) -> str:
+    clean = (value or "").strip()
+    if not clean or len(clean) > 253 or not _K8S_RESOURCE_NAME_RE.match(clean):
+        raise HTTPException(status_code=400, detail=f"Invalid Kubernetes {label}: '{value}'")
+    return clean
+
+
+def _kubectl_pod_action_sync(
+    connection: Any,
+    cluster_name: str,
+    namespace: str,
+    pod_name: str,
+    action: str,
+    force: bool = False,
+) -> Dict[str, Any]:
+    region = connection.region or "us-east-1"
+    eks = boto3.client(
+        "eks",
+        aws_access_key_id=connection.accessKey,
+        aws_secret_access_key=connection.secretKey,
+        region_name=region,
+        config=AWS_FAST_CFG,
+    )
+    cluster_info = eks.describe_cluster(name=cluster_name).get("cluster", {})
+    endpoint = cluster_info.get("endpoint")
+    ca_data = (cluster_info.get("certificateAuthority") or {}).get("data")
+    if not endpoint or not ca_data:
+        raise HTTPException(status_code=400, detail=f"Cluster '{cluster_name}' endpoint is not available.")
+
+    tmpdir = tempfile.mkdtemp(prefix="tesserak_pod_")
+    try:
+        kc_path = Path(tmpdir) / "kubeconfig"
+        kc_path.write_text(build_eks_kubeconfig_yaml(cluster_name, endpoint, ca_data, region))
+        env = _pip_cli_env(build_eks_cli_env(connection, kc_path, region))
+        cmd = [
+            "kubectl",
+            "--kubeconfig",
+            str(kc_path),
+            "delete",
+            "pod",
+            pod_name,
+            "-n",
+            namespace,
+            "--wait=false",
+        ]
+        if force and action == "delete":
+            cmd.extend(["--grace-period=0", "--force"])
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, env=env, check=False)
+        out = (proc.stdout or proc.stderr or "").strip()
+        if proc.returncode != 0:
+            if "NotFound" in out or "not found" in out.lower():
+                raise HTTPException(status_code=404, detail=f"Pod '{namespace}/{pod_name}' not found.")
+            raise HTTPException(status_code=400, detail=out or f"kubectl failed while trying to {action} pod.")
+        if action == "restart":
+            return {
+                "status": "restarting",
+                "clusterName": cluster_name,
+                "namespace": namespace,
+                "podName": pod_name,
+                "message": f'Pod "{pod_name}" in namespace "{namespace}" restart triggered (controller will recreate a fresh pod).',
+            }
+        return {
+            "status": "deleting",
+            "clusterName": cluster_name,
+            "namespace": namespace,
+            "podName": pod_name,
+            "message": f'Pod "{pod_name}" in namespace "{namespace}" deletion requested.',
+        }
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail=f"Timed out waiting for kubectl to {action} pod '{namespace}/{pod_name}'.")
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="kubectl CLI is not installed on the backend host.")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@app.post("/clusters/{cluster_name}/pods/{namespace}/{pod_name}/restart", dependencies=[Depends(require_auth_if_configured)])
+async def restart_cluster_pod(
+    cluster_name: str,
+    namespace: str,
+    pod_name: str,
+    account_id: Optional[str] = None,
+    x_user_email: str = Header(...),
+):
+    clean_ns = _validate_k8s_name(namespace, "namespace")
+    clean_pod = _validate_k8s_name(pod_name, "pod name")
+    connection = await _resolve_account_connection(x_user_email, account_id)
+    return await asyncio.to_thread(_kubectl_pod_action_sync, connection, cluster_name, clean_ns, clean_pod, "restart", False)
+
+
+@app.delete("/clusters/{cluster_name}/pods/{namespace}/{pod_name}", dependencies=[Depends(require_auth_if_configured)])
+async def delete_cluster_pod(
+    cluster_name: str,
+    namespace: str,
+    pod_name: str,
+    force: bool = False,
+    account_id: Optional[str] = None,
+    x_user_email: str = Header(...),
+):
+    clean_ns = _validate_k8s_name(namespace, "namespace")
+    clean_pod = _validate_k8s_name(pod_name, "pod name")
+    connection = await _resolve_account_connection(x_user_email, account_id)
+    return await asyncio.to_thread(_kubectl_pod_action_sync, connection, cluster_name, clean_ns, clean_pod, "delete", force)
+
+
 @app.delete("/clusters/{cluster_name}", dependencies=[Depends(require_auth_if_configured)])
 async def delete_cluster(
     cluster_name: str,
@@ -1972,46 +2604,102 @@ async def sync_cluster_state(
     x_user_email: str = Header(...),
 ):
     try:
-        eks_client = await connection_manager.get_aws_client(x_user_email, account_id=account_id)
-        if not eks_client:
-            raise HTTPException(
-                status_code=400,
-                detail=f"No valid AWS connection found{' for account ' + account_id if account_id else ''}. Please add AWS credentials in Integrations.",
-            )
+        connection = await _resolve_account_connection(x_user_email, account_id)
+        region = connection.region or "us-east-1"
 
-        cluster_info = await asyncio.to_thread(lambda: eks_client.describe_cluster(name=cluster_name)['cluster'])
-        aws_state = json.loads(
-            json.dumps(
-                {
-                    "status": cluster_info['status'],
-                    "endpoint": cluster_info.get('endpoint'),
-                    "version": cluster_info.get('version'),
-                    "aws_response": cluster_info,
-                },
-                default=str,
+        def _sync_pull():
+            eks_client = boto3.client(
+                "eks",
+                aws_access_key_id=connection.accessKey,
+                aws_secret_access_key=connection.secretKey,
+                region_name=region,
+                config=AWS_FAST_CFG,
             )
-        )
-        
-        current_state = state_manager.get_cluster_state(x_user_email, cluster_name)
-        if current_state:
+            cluster_info = eks_client.describe_cluster(name=cluster_name)["cluster"]
+            try:
+                ng_names = eks_client.list_nodegroups(clusterName=cluster_name).get("nodegroups", [])
+                nodegroups = [
+                    eks_client.describe_nodegroup(clusterName=cluster_name, nodegroupName=n)["nodegroup"]
+                    for n in ng_names[:20]
+                ]
+            except Exception:
+                nodegroups = []
+            aws_state = json.loads(
+                json.dumps(
+                    {
+                        "status": cluster_info["status"],
+                        "endpoint": cluster_info.get("endpoint"),
+                        "version": cluster_info.get("version"),
+                        "nodeGroups": nodegroups,
+                        "aws_response": cluster_info,
+                    },
+                    default=str,
+                )
+            )
+            current_wrapper = state_manager.get_cluster_state(x_user_email, cluster_name)
+            base_state = (
+                dict(current_wrapper.get("state", current_wrapper))
+                if current_wrapper
+                else {"name": cluster_name, "region": cluster_info["arn"].split(":")[3]}
+            )
+            change_type = "sync" if current_wrapper else "initial_sync"
             updated_state = state_data.record_state_change(
-                current_state,
-                "sync",
-                {"aws_state": aws_state}
+                base_state,
+                change_type,
+                {"aws_state": aws_state},
             )
-        else:
-            updated_state = state_data.record_state_change(
-                {"name": cluster_name, "region": cluster_info["arn"].split(":")[3]},
-                "initial_sync",
-                {"aws_state": aws_state}
-            )
-        
-        state_manager.save_cluster_state(x_user_email, cluster_name, updated_state)
+            state_manager.save_cluster_state(x_user_email, cluster_name, updated_state)
+            return {
+                "message": "State synchronized successfully",
+                "status": aws_state["status"],
+                "version": aws_state["version"],
+                "nodeGroupsCount": len(nodegroups),
+            }
+
+        res = await asyncio.to_thread(_sync_pull)
         invalidate_cluster_list_cache(x_user_email)
-        
-        return {"message": "State synchronized successfully"}
+        return res
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/clusters/{cluster_name}/community-addons", dependencies=[Depends(require_auth_if_configured)])
+async def install_cluster_community_addon(
+    cluster_name: str,
+    payload: CommunityAddonInstallRequest,
+    account_id: Optional[str] = None,
+    x_user_email: str = Header(...),
+):
+    connection = await _resolve_account_connection(x_user_email, account_id)
+    region = connection.region or "us-east-1"
+    addon = AddonModel(
+        id=payload.addonId.strip(),
+        name=payload.name or payload.addonId.strip(),
+        type="community",
+        version=payload.version,
+    )
+    res = await install_community_addon(connection, region, cluster_name, addon)
+
+    def _record_result():
+        wrapper = state_manager.get_cluster_state(x_user_email, cluster_name)
+        if not wrapper:
+            return
+        base = dict(wrapper.get("state", wrapper))
+        existing = [r for r in (base.get("communityAddons") or []) if isinstance(r, dict) and r.get("id") != res.get("id")]
+        existing.append(res)
+        updated = state_data.record_state_change(
+            base,
+            "community_addon_install",
+            {"communityAddons": existing, "addon": res},
+        )
+        state_manager.save_cluster_state(x_user_email, cluster_name, updated)
+
+    await asyncio.to_thread(_record_result)
+    if res.get("status") in ("failed", "unsupported"):
+        raise HTTPException(status_code=400, detail=res.get("details") or f"Failed to install {addon.id}")
+    return res
 
 @app.post("/api/connections/test", dependencies=[Depends(require_auth_if_configured)])
 async def test_connection(connection: ConnectionBase):

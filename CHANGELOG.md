@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **2026-11-27** — Clickable AWS EKS Node Group Details modal (`NodeGroupDetailsDialog.tsx`) with Details, Nodes, Health issues, Kubernetes labels, Update config, Kubernetes taints, per-nodegroup Update history, and Tags tabs (`frontend/src/components/Clusters/NodeGroupDetailsDialog.tsx`, `frontend/src/pages/ClusterDetails.tsx`, `backend/main.py`).
+- **2026-11-27** — Clickable Kubernetes Pod Details modal (`PodDetailsDialog.tsx`) with Structured view / Raw JSON view, expandable Container accordions, Conditions, Volumes, Labels, and confirmation-guarded Restart & Delete Pod actions (`POST /clusters/{cluster_name}/pods/{namespace}/{pod_name}/restart`, `DELETE /clusters/{cluster_name}/pods/{namespace}/{pod_name}`) (`frontend/src/components/Clusters/PodDetailsDialog.tsx`, `NodeDetailsDialog.tsx`, `ClusterDetails.tsx`, `backend/main.py`).
+- **2026-11-27** — Public/Private subnet classification badges in `ClusterDetails` Add Managed Node Group Worker Subnets selector and `_fetch_networking` (`frontend/src/pages/ClusterDetails.tsx`, `backend/main.py`).
+- **2026-11-27** — Real Helm-backed community add-on installer (`install_community_addon`, `_install_community_addon_sync`, `POST /clusters/{cluster_name}/community-addons`), live `helm list -A -o json` release discovery in `_get_cluster_details_sync`, and **Community / Helm Add-ons** management section in `ClusterDetails.tsx` (`backend/main.py`, `frontend/src/pages/ClusterDetails.tsx`).
+- **2026-11-27** — Explicit `stateDifferences` reporting on `ClusterResponse` and `ClusterTable` / `ClusterDetails` State Sync chips (`backend/main.py`, `frontend/src/types/cluster.ts`, `frontend/src/components/ClusterTable.tsx`, `frontend/src/pages/ClusterDetails.tsx`).
+
+### Fixed
+- **2026-11-27** — Fixed clusters created from Tesserak (or synced manually) remaining stuck on `Needs Sync` (`node_group_count_mismatch`) by passing live `nodeGroups` in `_list_clusters_sync`, unwrapping `current_state["state"]` and syncing `nodeGroups` in `sync_cluster_state` + `state_management.py`, and syncing local state after `_finalize_cluster_addons` (`backend/main.py`, `backend/state_management.py`).
+- **2026-11-27** — Fixed active AWS-only clusters (`missing_local`) counting toward `Missing / Deleted` on the `EKS State Health` donut chart (`frontend/src/pages/Clusters.tsx`).
+- **2026-11-27** — Preserved Auth0/Google SSO `picture` URLs when PostgreSQL profile records return an empty `avatarUrl`, backfilled DB avatars cleanly, added `tesserak-profile-updated` reactivity in `AuthContext.tsx` and `App.tsx`, and added `referrerPolicy="no-referrer"` on `<Avatar>` images (`frontend/src/auth/AuthContext.tsx`, `frontend/src/App.tsx`, `frontend/src/pages/Profile.tsx`).
+
 ## [v1.0.0] - 2026-11-27
 
 ### Added

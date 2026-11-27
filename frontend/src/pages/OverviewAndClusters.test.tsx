@@ -103,7 +103,18 @@ const sampleClusters = [
     version: '1.30',
     endpoint: 'https://eks.us-east-1.amazonaws.com',
     stateStatus: 'differences_found',
+    stateDifferences: ['version_mismatch'],
     createdAt: '2026-11-20T10:00:00Z',
+  },
+  {
+    name: 'aws-console-eks',
+    status: 'ACTIVE',
+    accountId: '123456789012',
+    region: 'us-east-1',
+    version: '1.33',
+    endpoint: 'https://eks2.us-east-1.amazonaws.com',
+    stateStatus: 'missing_local',
+    createdAt: '2026-11-20T09:00:00Z',
   },
 ];
 
@@ -180,7 +191,11 @@ describe('Overview vs Clusters route separation and visibility', () => {
     expect(screen.queryByRole('heading', { name: /Platform Overview/i })).not.toBeInTheDocument();
 
     expect(await screen.findByText('prod-eks-core')).toBeInTheDocument();
+    expect(screen.getByText('aws-console-eks')).toBeInTheDocument();
     expect(screen.getByText('Needs Sync')).toBeInTheDocument();
+    expect(screen.getByText('AWS Only')).toBeInTheDocument();
+    expect(screen.getByText(/Missing \/ Deleted:/i)).toHaveTextContent('Missing / Deleted: 0');
+    expect(screen.getByText(/Needs Sync:/i)).toHaveTextContent('Needs Sync: 2');
 
     const syncBtn = screen.getByRole('button', { name: /Sync prod-eks-core/i });
     fireEvent.click(syncBtn);

@@ -173,10 +173,29 @@ const Auth0SdkBridge: React.FC<{ children: React.ReactNode }> = ({ children }) =
     const p = localStorage.getItem('authProvider');
     return p === 'auth0' || p === 'auth0-demo-sso' || p === 'email' ? p : 'local';
   });
+  const [profileTick, setProfileTick] = useState(0);
+
+  useEffect(() => {
+    const handleProfileUpdate = () => setProfileTick((t) => t + 1);
+    window.addEventListener('tesserak-profile-updated', handleProfileUpdate);
+    return () => window.removeEventListener('tesserak-profile-updated', handleProfileUpdate);
+  }, []);
+
+  const lastSyncedSigRef = useRef<string>('');
 
   useLayoutEffect(() => {
     if (auth0Authed && auth0User) {
       const email = (auth0User.email || auth0User.sub || 'sso-user@tesserak.dev').toLowerCase();
+      const ssoPicture = (auth0User.picture || '').trim();
+      const firstName = auth0User.given_name || auth0User.name?.split(' ')[0] || 'SSO';
+      const lastName = auth0User.family_name || auth0User.name?.split(' ').slice(1).join(' ') || 'User';
+      const orgId = auth0User.org_id || '';
+      const sig = `${email}|${ssoPicture}|${firstName}|${lastName}|${orgId}`;
+      if (lastSyncedSigRef.current === sig) {
+        return;
+      }
+      lastSyncedSigRef.current = sig;
+
       localStorage.setItem('currentUser', email);
       localStorage.setItem('authProvider', 'auth0');
       localStorage.removeItem(SESSION_TOKEN_KEY);
@@ -184,18 +203,30 @@ const Auth0SdkBridge: React.FC<{ children: React.ReactNode }> = ({ children }) =
       users[email] = {
         ...users[email],
         email,
-        firstName: auth0User.given_name || auth0User.name?.split(' ')[0] || 'SSO',
-        lastName: auth0User.family_name || auth0User.name?.split(' ').slice(1).join(' ') || 'User',
-        accountType: auth0User.org_id ? 'organization' : users[email]?.accountType || 'individual',
-        organization: auth0User.org_id || users[email]?.organization || 'Auth0 Enterprise SSO',
-        avatarUrl: auth0User.picture || users[email]?.avatarUrl,
+        firstName,
+        lastName,
+        accountType: orgId ? 'organization' : users[email]?.accountType || 'individual',
+        organization: orgId || users[email]?.organization || 'Auth0 Enterprise SSO',
+        avatarUrl: users[email]?.avatarUrl || ssoPicture,
       };
       localStorage.setItem('users', JSON.stringify(users));
       setAuthProvider('auth0');
       setLocalToken(null);
       setLocalEmail(email);
+      setProfileTick((t) => t + 1);
+    } else {
+      lastSyncedSigRef.current = '';
     }
-  }, [auth0Authed, auth0User]);
+  }, [
+    auth0Authed,
+    auth0User?.email,
+    auth0User?.sub,
+    auth0User?.picture,
+    auth0User?.given_name,
+    auth0User?.family_name,
+    auth0User?.name,
+    auth0User?.org_id,
+  ]);
 
   const hasEmailSession = Boolean(localEmail && localToken);
   const effectiveEmail = auth0Authed
@@ -243,10 +274,33 @@ const Auth0SdkBridge: React.FC<{ children: React.ReactNode }> = ({ children }) =
         });
         if (!active || !res.ok) return;
         const dbProfile = await res.json();
+        const users = JSON.parse(localStorage.getItem('users') || '{}');
+        const existing = users[effectiveEmail] || {};
+        const ssoPicture = (auth0User.picture || '').trim();
+        const resolvedAvatar =
+          (dbProfile?.avatarUrl || '').trim() ||
+          ssoPicture ||
+          (existing.avatarUrl || '').trim();
+
         if (dbProfile && (dbProfile.firstName || dbProfile.avatarUrl)) {
-          const users = JSON.parse(localStorage.getItem('users') || '{}');
-          users[effectiveEmail] = { ...users[effectiveEmail], ...dbProfile };
+          users[effectiveEmail] = {
+            ...existing,
+            ...dbProfile,
+            avatarUrl: resolvedAvatar,
+          };
           localStorage.setItem('users', JSON.stringify(users));
+          setProfileTick((t) => t + 1);
+          // Backfill DB if Auth0/Google provided a picture but PostgreSQL had none yet
+          if (!(dbProfile.avatarUrl || '').trim() && ssoPicture) {
+            await fetch('http://localhost:8000/api/profile', {
+              method: 'PUT',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-user-email': effectiveEmail,
+              },
+              body: JSON.stringify({ avatarUrl: ssoPicture }),
+            });
+          }
           return;
         }
         await fetch('http://localhost:8000/api/profile', {
@@ -261,7 +315,7 @@ const Auth0SdkBridge: React.FC<{ children: React.ReactNode }> = ({ children }) =
             accountType: auth0User.org_id ? 'organization' : 'individual',
             organization: auth0User.org_id || 'Auth0 Enterprise SSO',
             authProvider: 'auth0',
-            avatarUrl: auth0User.picture || '',
+            avatarUrl: resolvedAvatar,
           }),
         });
       } catch {
@@ -276,8 +330,13 @@ const Auth0SdkBridge: React.FC<{ children: React.ReactNode }> = ({ children }) =
 
   const sessionUser = useMemo(() => {
     const base = readStoredUserProfile(effectiveEmail);
-    return base ? { ...base, authProvider } : null;
-  }, [effectiveEmail, authProvider]);
+    if (!base) return null;
+    return {
+      ...base,
+      avatarUrl: base.avatarUrl || auth0User?.picture || '',
+      authProvider,
+    };
+  }, [effectiveEmail, authProvider, auth0User?.picture, profileTick]);
 
   const value: TesserakAuthContextValue = {
     isAuthenticated: Boolean(auth0Authed || hasEmailSession),
@@ -423,15 +482,23 @@ const FallbackAuthBridge: React.FC<{ children: React.ReactNode }> = ({ children 
 };
 
 export const TesserakAuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  if (isRealAuth0EnvConfigured) {
+  const domain = (process.env.REACT_APP_AUTH0_DOMAIN || AUTH0_DOMAIN).trim();
+  const clientId = (process.env.REACT_APP_AUTH0_CLIENT_ID || AUTH0_CLIENT_ID).trim();
+  const audience = (process.env.REACT_APP_AUTH0_AUDIENCE || AUTH0_AUDIENCE).trim();
+  const configured =
+    Boolean(domain && clientId) &&
+    !domain.includes('your-tenant') &&
+    !clientId.includes('your-auth0');
+
+  if (configured || isRealAuth0EnvConfigured) {
     return (
       <Auth0Provider
-        domain={AUTH0_DOMAIN}
-        clientId={AUTH0_CLIENT_ID}
+        domain={domain}
+        clientId={clientId}
         authorizationParams={{
           redirect_uri: window.location.origin,
           scope: 'openid profile email offline_access',
-          ...(AUTH0_AUDIENCE ? { audience: AUTH0_AUDIENCE } : {}),
+          ...(audience ? { audience } : {}),
         }}
         useRefreshTokens={true}
         useRefreshTokensFallback={true}

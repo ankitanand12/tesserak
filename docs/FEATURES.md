@@ -10,7 +10,7 @@ Living inventory of implemented features and capabilities in **Tesserak** (`/Use
 | Authentication, SSO & Profile Management | Active | `backend/auth.py`, `backend/tesserak_router.py`, `frontend/src/auth/AuthContext.tsx`, `frontend/src/components/Auth/AuthPage.tsx`, `frontend/src/pages/Profile.tsx`, `frontend/src/pages/Settings.tsx` | 2026-11-26 |
 | Multi-Account AWS Connectors & Catalog Fallback | Active | `backend/connections.py`, `backend/main.py` | 2026-11-27 |
 | Amazon EKS Launch Wizard & Hybrid Catalog Cache | Active | `frontend/src/pages/CreateCluster.tsx`, `frontend/src/components/CreateCluster/*`, `backend/main.py`, `backend/db.py` (`AwsCatalogCacheRecord`) | 2026-11-27 |
-| EKS Cluster Inventory, Reconciliation & Deep Inspector | Active | `frontend/src/pages/Clusters.tsx`, `frontend/src/pages/ClusterDetails.tsx`, `frontend/src/components/Clusters/NodeDetailsDialog.tsx`, `backend/main.py` | 2026-11-26 |
+| EKS Cluster Inventory, Reconciliation & Deep Inspector | Active | `frontend/src/pages/Clusters.tsx`, `frontend/src/pages/ClusterDetails.tsx`, `frontend/src/components/Clusters/{NodeDetailsDialog,NodeGroupDetailsDialog,PodDetailsDialog}.tsx`, `backend/main.py` | 2026-11-27 |
 | Live AWS Cloud Resources & Drift Remediation | Active | `frontend/src/pages/CloudResources.tsx`, `backend/resources_service.py`, `backend/tesserak_router.py` | 2026-11-26 |
 | GitOps CI/CD Pipelines Runner | Active | `frontend/src/pages/Pipelines.tsx`, `backend/pipelines_service.py`, `backend/tesserak_router.py` | 2026-11-26 |
 | Policy Guardrails & Approval Workflows | Active | `frontend/src/pages/Guardrails.tsx`, `backend/resources_service.py`, `backend/tesserak_router.py` | 2026-11-26 |
@@ -47,6 +47,7 @@ Living inventory of implemented features and capabilities in **Tesserak** (`/Use
   - Backend env vars (`backend/.env`): `AUTH0_DOMAIN`, `AUTH0_AUDIENCE`, `TESSERAK_SESSION_SECRET`.
   - Frontend env vars (`frontend/.env`): `REACT_APP_AUTH0_DOMAIN`, `REACT_APP_AUTH0_CLIENT_ID`, `REACT_APP_AUTH0_AUDIENCE`.
 - **Recent Updates**:
+  - **2026-11-27**: Fixed Google/Auth0 SSO `avatarUrl` preservation and reactivity in `AuthContext.tsx`, `App.tsx`, and `Profile.tsx` when PostgreSQL profiles have an empty `avatarUrl`, with `referrerPolicy="no-referrer"` support.
   - **2026-11-26**: Switched shell routing in `frontend/src/App.tsx` to `BrowserRouter` and added `/profile` + `/settings` auth status panels showing live PostgreSQL and Auth0 state.
 
 ---
@@ -91,12 +92,16 @@ Living inventory of implemented features and capabilities in **Tesserak** (`/Use
 - **Entrypoints & Implementation**:
   - `frontend/src/pages/Clusters.tsx` (`/clusters`), `ClusterListManager.tsx`, `ClusterTable.tsx`, `ClusterHealth.tsx` (Recharts status donut).
   - `frontend/src/pages/ClusterDetails.tsx` (`/clusters/:clusterName`): Tabs `Overview & Config`, `Compute & Add-ons`, `Networking`, `Observability & Access`, `Update & State History`, and `Tags`.
-  - `frontend/src/components/Clusters/NodeDetailsDialog.tsx`: Clickable node inspection modal showing EC2/K8s metadata and paginated pods (`10` pods/page).
-  - `backend/main.py`: `_list_clusters_sync` (`DELETED_CLUSTER_RETENTION_DAYS = 7`), `_get_cluster_details_sync`, `_fetch_k8s_runtime_sync` (`kubectl get nodes,pods -A -o json`), `_merge_nodes_and_compute_allocations`, `GET /clusters`, `GET /clusters/{cluster_name}`, `POST /clusters/{cluster_name}/sync`, `DELETE /clusters/{cluster_name}`, `POST/PATCH/DELETE /clusters/{cluster_name}/nodegroups*`.
-  - `backend/state_manager.py` & `backend/state_management.py`: Local cluster snapshot persistence and live AWS EKS state checks.
+  - `frontend/src/components/Clusters/NodeDetailsDialog.tsx`: Clickable node inspection modal showing EC2/K8s metadata and paginated pods (`10` pods/page), with clickable pod rows linking into `PodDetailsDialog`.
+  - `frontend/src/components/Clusters/NodeGroupDetailsDialog.tsx`: Clickable AWS EKS node group inspector modal with configuration summary banner and tabs for `Details` (ARN, ASG, Role IAM ARN, Public/Private subnets, SSH, auto-repair), `Nodes`, `Health issues`, `Kubernetes labels`, `Update config`, `Kubernetes taints`, `Update history`, and `Tags`.
+  - `frontend/src/components/Clusters/PodDetailsDialog.tsx`: Clickable Kubernetes pod inspector with Structured view / Raw JSON toggle, expandable Container & Init Container accordions, Conditions, Volumes, Labels, and confirmation-guarded Restart Pod & Delete Pod actions.
+  - `backend/main.py`: `_list_clusters_sync` (`DELETED_CLUSTER_RETENTION_DAYS = 7`, live `nodeGroups` comparison, `stateDifferences`), `sync_cluster_state` (`POST /clusters/{cluster_name}/sync`), `install_community_addon` / `_install_community_addon_sync` (Helm installer), `POST /clusters/{cluster_name}/community-addons`, `_get_cluster_details_sync` (AWS + Helm add-ons, EC2/K8s nodes, pods), `_fetch_k8s_runtime_sync`, `_extract_pod_summary`, `_merge_nodes_and_compute_allocations`, `_kubectl_pod_action_sync`, `GET/POST/DELETE /clusters*`, nodegroups & pod actions.
+  - `backend/state_manager.py` & `backend/state_management.py`: Local cluster snapshot persistence (`nodeGroups` + `communityAddons` synced on `record_state_change`) and live AWS EKS state checks.
 - **Configuration & Usage**:
-  - Requires AWS credentials scoped to the target cluster account and `kubectl` installed for live node/pod telemetry.
+  - Requires AWS credentials scoped to the target cluster account, plus `kubectl` and `helm` installed for live node/pod telemetry, pod actions, and community add-on installation.
 - **Recent Updates**:
+  - **2026-11-27**: Fixed false `Needs Sync` (`node_group_count_mismatch`) drift comparison & `EKS State Health` donut classification (`Clusters.tsx`, `ClusterTable.tsx`), and replaced community add-on stub with real Helm installation + `ClusterDetails` Community/Helm Add-ons UI (`backend/main.py`, `ClusterDetails.tsx`).
+  - **2026-11-27**: Added `Public`/`Private` Worker Subnet badges in Add Node Group, clickable `NodeGroupDetailsDialog`, clickable `PodDetailsDialog`, and confirmation-guarded Pod Restart/Delete endpoints (`ClusterDetails.test.tsx`, `backend/test_fixes.py`).
   - **2026-11-26**: Enforced 7-day UTC-safe deleted-cluster retention (`test_deleted_cluster_retained_under_7_days_and_removed_after_7_days`) and added paginated `NodeDetailsDialog` (`ClusterDetails.test.tsx`).
 
 ---

@@ -408,6 +408,194 @@ class RegressionFixesTest(unittest.TestCase):
         import asyncio
         asyncio.run(_run())
 
+    def test_extract_pod_summary_enrichment_and_pod_actions(self):
+        from fastapi import HTTPException
+
+        _extract_pod_summary = backend_main._extract_pod_summary
+        _kubectl_pod_action_sync = backend_main._kubectl_pod_action_sync
+        _validate_k8s_name = backend_main._validate_k8s_name
+
+        pod = {
+            "kind": "Pod",
+            "apiVersion": "v1",
+            "metadata": {
+                "name": "ebs-csi-controller-7bbcfd96bb-gnkgh",
+                "namespace": "kube-system",
+                "uid": "pod-uid-123",
+                "creationTimestamp": "2026-11-27T11:30:00Z",
+                "managedFields": [{"manager": "kube-scheduler"}],
+                "ownerReferences": [
+                    {"kind": "ReplicaSet", "name": "ebs-csi-controller-7bbcfd96bb", "uid": "rs-1"}
+                ],
+                "labels": {"app": "ebs-csi-controller"},
+            },
+            "spec": {
+                "nodeName": "ip-10-42-31-199.ec2.internal",
+                "serviceAccountName": "ebs-csi-controller-sa",
+                "restartPolicy": "Always",
+                "volumes": [{"name": "socket-dir", "emptyDir": {}}],
+                "containers": [
+                    {
+                        "name": "ebs-plugin",
+                        "image": "public.ecr.aws/ebs-csi-driver/aws-ebs-csi-driver:v1.30.0",
+                        "imagePullPolicy": "IfNotPresent",
+                        "ports": [{"containerPort": 9808, "protocol": "TCP", "name": "healthz"}],
+                        "resources": {"requests": {"cpu": "10m", "memory": "40Mi"}},
+                        "volumeMounts": [{"name": "socket-dir", "mountPath": "/var/lib/csi/sockets/pluginproxy/"}],
+                        "env": [{"name": "CSI_ENDPOINT", "value": "unix:///csi/csi.sock"}],
+                    }
+                ],
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.18.2",
+                "hostIP": "10.42.31.199",
+                "qosClass": "Burstable",
+                "conditions": [
+                    {"type": "Ready", "status": "True", "lastTransitionTime": "2026-11-27T11:31:00Z"}
+                ],
+                "containerStatuses": [
+                    {
+                        "name": "ebs-plugin",
+                        "ready": True,
+                        "started": True,
+                        "restartCount": 1,
+                        "containerID": "containerd://abc",
+                        "state": {"running": {"startedAt": "2026-11-27T11:31:00Z"}},
+                    }
+                ],
+            },
+        }
+
+        summary = _extract_pod_summary(pod)
+        self.assertEqual(summary["controlledBy"][0]["kind"], "ReplicaSet")
+        self.assertEqual(summary["lastTransitionTime"], "2026-11-27T11:31:00Z")
+        self.assertEqual(summary["qosClass"], "Burstable")
+        self.assertEqual(summary["serviceAccountName"], "ebs-csi-controller-sa")
+        self.assertEqual(summary["containers"][0]["name"], "ebs-plugin")
+        self.assertEqual(summary["containers"][0]["state"]["status"], "Running")
+        self.assertEqual(summary["containers"][0]["envNames"], ["CSI_ENDPOINT"])
+        self.assertNotIn("managedFields", summary["raw"]["metadata"])
+
+        with self.assertRaises(HTTPException):
+            _validate_k8s_name("bad pod!", "pod name")
+
+        conn = SimpleNamespace(accessKey="AKIA1", secretKey="SEC1", region="us-east-1", accountId="111122223333")
+        fake_eks = MagicMock()
+        fake_eks.describe_cluster.return_value = {
+            "cluster": {
+                "endpoint": "https://example.eks.amazonaws.com",
+                "certificateAuthority": {"data": "Q0E="},
+            }
+        }
+        fake_proc = SimpleNamespace(returncode=0, stdout='pod "ebs-csi-controller-7bbcfd96bb-gnkgh" deleted', stderr="")
+        with patch.object(backend_main.boto3, "client", return_value=fake_eks), patch.object(
+            backend_main.subprocess, "run", return_value=fake_proc
+        ) as run_mock:
+            restart_res = _kubectl_pod_action_sync(conn, "tesserak", "kube-system", "ebs-csi-controller-7bbcfd96bb-gnkgh", "restart")
+            self.assertEqual(restart_res["status"], "restarting")
+            delete_res = _kubectl_pod_action_sync(conn, "tesserak", "kube-system", "ebs-csi-controller-7bbcfd96bb-gnkgh", "delete", force=True)
+            self.assertEqual(delete_res["status"], "deleting")
+            self.assertIn("--force", run_mock.call_args_list[1][0][0])
+
+    def test_cluster_sync_includes_nodegroups_and_helm_addon_installs_cleanly(self):
+        from state_management import StateData
+
+        sd = StateData()
+        base = {
+            "name": "tesserak",
+            "status": "CREATING",
+            "version": "1.37",
+            "endpoint": None,
+            "nodeGroups": [{"nodegroupName": "tesserak-ng"}],
+        }
+        updated = sd.record_state_change(
+            base,
+            "sync",
+            {
+                "aws_state": {
+                    "status": "ACTIVE",
+                    "version": "1.37",
+                    "endpoint": "https://eks.example.com",
+                    "nodeGroups": [{"nodegroupName": "tesserak-ng"}],
+                }
+            },
+        )
+        self.assertEqual(updated["status"], "ACTIVE")
+        self.assertEqual(updated["endpoint"], "https://eks.example.com")
+        self.assertEqual(len(updated["nodeGroups"]), 1)
+
+        fake_conn = SimpleNamespace(accessKey="AKIA1", secretKey="SEC1", region="us-east-1", accountId="111122223333")
+        fake_eks = MagicMock()
+        fake_eks.list_clusters.return_value = {"clusters": ["tesserak", "aws-only-cluster"]}
+        fake_eks.describe_cluster.side_effect = lambda name: {
+            "cluster": {
+                "name": name,
+                "status": "ACTIVE",
+                "version": "1.37",
+                "endpoint": "https://eks.example.com",
+                "arn": f"arn:aws:eks:us-east-1:111122223333:cluster/{name}",
+            }
+        }
+        fake_eks.list_nodegroups.side_effect = lambda clusterName: {
+            "nodegroups": ["tesserak-ng"] if clusterName == "tesserak" else []
+        }
+
+        fake_sts = MagicMock()
+        fake_sts.get_caller_identity.return_value = {"Account": "111122223333"}
+
+        def client_factory(service_name, **kwargs):
+            return fake_eks if service_name == "eks" else fake_sts
+
+        with patch.object(backend_main.boto3, "client", side_effect=client_factory), patch.object(
+            backend_main.state_manager, "list_user_clusters", return_value=["tesserak"]
+        ), patch.object(
+            backend_main.state_manager,
+            "get_cluster_state",
+            side_effect=lambda email, cname: (
+                {"state": updated, "last_updated": "2026-11-27T14:00:00"}
+                if cname == "tesserak"
+                else None
+            ),
+        ), patch.object(
+            backend_main.state_manager,
+            "compare_with_aws_state",
+            side_effect=lambda email, cname, aws_st: (
+                {"status": "in_sync", "differences": []}
+                if len(aws_st.get("nodeGroups") or []) == 1
+                else {"status": "differences_found", "differences": ["node_group_count_mismatch"]}
+            ),
+        ):
+            clusters = backend_main._list_clusters_sync(fake_conn, "user@tesserak.dev")
+            by_name = {c.name: c for c in clusters}
+            self.assertEqual(by_name["tesserak"].stateStatus, "synced")
+            self.assertEqual(by_name["tesserak"].stateDifferences, [])
+            self.assertEqual(by_name["aws-only-cluster"].stateStatus, "missing_local")
+
+        # Verify Helm community addon installer executes isolated repo add/update & upgrade --install
+        addon = backend_main.AddonModel(id="ingress-nginx", name="Ingress NGINX", type="community", version="4.12.1")
+        helm_calls = []
+
+        def fake_helm_run(cmd, capture_output=True, text=True, timeout=180, env=None, check=False):
+            helm_calls.append((cmd, env))
+            return SimpleNamespace(returncode=0, stdout='Release "ingress-nginx" has been upgraded.', stderr="")
+
+        with patch.object(backend_main, "_resolve_helm_binary", return_value="/opt/homebrew/bin/helm"), patch.object(
+            backend_main.subprocess, "run", side_effect=fake_helm_run
+        ):
+            install_res = backend_main._install_community_addon_sync(
+                fake_conn,
+                "us-east-1",
+                "tesserak",
+                addon,
+                cluster_info={"endpoint": "https://eks.example.com", "certificateAuthority": {"data": "Q0E="}},
+            )
+            self.assertEqual(install_res["status"], "installed")
+            self.assertEqual(install_res["namespace"], "ingress-nginx")
+            self.assertEqual(helm_calls[0][0][:3], ["/opt/homebrew/bin/helm", "repo", "add"])
+            self.assertEqual(helm_calls[2][0][:4], ["/opt/homebrew/bin/helm", "upgrade", "--install", "ingress-nginx"])
+            self.assertIn("HELM_CACHE_HOME", helm_calls[2][1])
+
 
 if __name__ == "__main__":
     unittest.main()

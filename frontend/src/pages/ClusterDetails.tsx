@@ -44,6 +44,7 @@ import {
   Memory as ComputeIcon,
   OpenInNew as OpenInNewIcon,
   Refresh as RefreshIcon,
+  RestartAlt as RestartIcon,
   Search as SearchIcon,
   Security as SecurityIcon,
   Storage as StorageIcon,
@@ -60,6 +61,14 @@ import {
   formatClusterDateTime,
   getPodStatusChipColor,
 } from '../components/Clusters/NodeDetailsDialog';
+import {
+  ClusterNodegroup,
+  ClusterSubnetInfo,
+  NodeGroupDetailsDialog,
+  isClusterSubnetPublic,
+} from '../components/Clusters/NodeGroupDetailsDialog';
+import { PodDetailsDialog } from '../components/Clusters/PodDetailsDialog';
+import { ConfirmDeleteDialog } from '../components/ConfirmDeleteDialog';
 import { EKS_AMI_TYPES } from '../components/CreateCluster/ClusterEnvironment';
 import { InstanceTypeSelect } from '../components/CreateCluster/InstanceTypeSelect';
 import { NumericCountField } from '../components/CreateCluster/NumericCountField';
@@ -92,14 +101,7 @@ interface ClusterDetailResponse {
   } | null;
   networking: {
     vpc?: { vpcId?: string; name?: string; cidrBlock?: string; isDefault?: boolean };
-    subnets?: Array<{
-      subnetId: string;
-      name?: string;
-      cidrBlock?: string;
-      availabilityZone?: string;
-      mapPublicIpOnLaunch?: boolean;
-      availableIpAddressCount?: number;
-    }>;
+    subnets?: ClusterSubnetInfo[];
     securityGroups?: Array<{
       groupId: string;
       groupName?: string;
@@ -112,18 +114,7 @@ interface ClusterDetailResponse {
     publicAccessCidrs?: string[];
     kubernetesNetworkConfig?: { serviceIpv4Cidr?: string; ipFamily?: string };
   };
-  nodegroups: Array<{
-    nodegroupName: string;
-    status?: string;
-    instanceTypes?: string[];
-    amiType?: string;
-    capacityType?: string;
-    diskSize?: number;
-    version?: string;
-    releaseVersion?: string;
-    scalingConfig?: { minSize?: number; desiredSize?: number; maxSize?: number };
-    subnets?: string[];
-  }>;
+  nodegroups: ClusterNodegroup[];
   workerNodes?: ClusterWorkerNode[];
   pods?: ClusterPod[];
   k8sRuntimeWarning?: string | null;
@@ -139,6 +130,18 @@ interface ClusterDetailResponse {
     status?: string;
     serviceAccountRoleArn?: string;
     health?: { issues?: Array<{ code?: string; message?: string }> };
+  }>;
+  communityAddons?: Array<{
+    id: string;
+    name: string;
+    releaseName?: string;
+    namespace?: string;
+    chart?: string;
+    version?: string;
+    requestedVersion?: string;
+    status: string;
+    source?: string;
+    details?: string;
   }>;
   updateHistory: Array<{
     id: string;
@@ -255,6 +258,14 @@ export const ClusterDetails: React.FC = () => {
   const [deleteNgTarget, setDeleteNgTarget] = useState<string | null>(null);
   const [deleteNgSubmitting, setDeleteNgSubmitting] = useState(false);
   const [selectedNode, setSelectedNode] = useState<ClusterWorkerNode | null>(null);
+  const [selectedNodegroup, setSelectedNodegroup] = useState<ClusterNodegroup | null>(null);
+  const [selectedPod, setSelectedPod] = useState<ClusterPod | null>(null);
+  const [podActionConfirm, setPodActionConfirm] = useState<{
+    action: 'restart' | 'delete';
+    pod: ClusterPod;
+  } | null>(null);
+  const [podActionSubmitting, setPodActionSubmitting] = useState(false);
+  const [installingAddonId, setInstallingAddonId] = useState<string | null>(null);
   const [podSearch, setPodSearch] = useState('');
 
   const loadDetails = useCallback(
@@ -480,6 +491,67 @@ export const ClusterDetails: React.FC = () => {
     }
   };
 
+  const handlePodAction = async () => {
+    if (!podActionConfirm) return;
+    const { action, pod } = podActionConfirm;
+    setPodActionSubmitting(true);
+    setError('');
+    setNotice('');
+    try {
+      const qs = detail?.accountId ? `?account_id=${encodeURIComponent(detail.accountId)}` : '';
+      const base = `http://localhost:8000/clusters/${encodeURIComponent(decodedName)}/pods/${encodeURIComponent(pod.namespace)}/${encodeURIComponent(pod.name)}`;
+      const url = action === 'restart' ? `${base}/restart${qs}` : `${base}${qs}`;
+      const res = await fetch(url, {
+        method: action === 'restart' ? 'POST' : 'DELETE',
+        headers: { 'x-user-email': userEmail },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `Failed to ${action} pod`);
+      }
+      setNotice(
+        data.message ||
+          `Pod "${pod.name}" (${pod.namespace}) ${action === 'restart' ? 'restart triggered' : 'deletion initiated'}.`
+      );
+      setPodActionConfirm(null);
+      setSelectedPod(null);
+      invalidateSwrCache(userEmail, cacheKey);
+      await loadDetails(true);
+    } catch (err: any) {
+      setError(err?.message || `Unable to ${action} pod`);
+    } finally {
+      setPodActionSubmitting(false);
+    }
+  };
+
+  const handleInstallCommunityAddon = async (addonId: string, name: string, version?: string) => {
+    setInstallingAddonId(addonId);
+    setError('');
+    setNotice('');
+    try {
+      const qs = detail?.accountId ? `?account_id=${encodeURIComponent(detail.accountId)}` : '';
+      const res = await fetch(
+        `http://localhost:8000/clusters/${encodeURIComponent(decodedName)}/community-addons${qs}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-user-email': userEmail },
+          body: JSON.stringify({ addonId, name, version }),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `Failed to install ${name} via Helm`);
+      }
+      setNotice(`Installed community add-on "${name}" via Helm in namespace "${data.namespace || 'kube-system'}".`);
+      invalidateSwrCache(userEmail, cacheKey);
+      await loadDetails(true);
+    } catch (err: any) {
+      setError(err?.message || `Unable to install ${name}`);
+    } finally {
+      setInstallingAddonId(null);
+    }
+  };
+
   if (loading && !detail) {
     return (
       <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', py: 10, gap: 2 }}>
@@ -551,17 +623,31 @@ export const ClusterDetails: React.FC = () => {
                 fontWeight: 700,
               }}
             />
-            <Chip
-              label={
-                detail?.stateStatus === 'synced'
-                  ? 'State Synced'
-                  : detail?.stateStatus === 'missing_local'
-                  ? 'AWS Only'
-                  : detail?.stateStatus || 'Unknown'
+            <Tooltip
+              title={
+                detail?.localState?.differences && detail.localState.differences.length > 0
+                  ? `Pending sync diffs: ${detail.localState.differences.join(', ')}`
+                  : ''
               }
-              size="small"
-              sx={{ bgcolor: '#eff6ff', color: '#1d4ed8', fontWeight: 700 }}
-            />
+            >
+              <Chip
+                label={
+                  detail?.stateStatus === 'synced'
+                    ? 'State Synced'
+                    : detail?.stateStatus === 'missing_local'
+                    ? 'AWS Only'
+                    : detail?.stateStatus === 'differences_found'
+                    ? `Needs Sync (${detail?.localState?.differences?.length || 1})`
+                    : detail?.stateStatus || 'Unknown'
+                }
+                size="small"
+                sx={{
+                  bgcolor: detail?.stateStatus === 'synced' ? '#eff6ff' : '#fef3c7',
+                  color: detail?.stateStatus === 'synced' ? '#1d4ed8' : '#92400e',
+                  fontWeight: 700,
+                }}
+              />
+            </Tooltip>
           </Box>
           <Typography variant="body2" sx={{ color: '#475569', mt: 0.5 }}>
             AWS Account {detail?.accountId} · Region {detail?.region} · Kubernetes{' '}
@@ -775,9 +861,14 @@ export const ClusterDetails: React.FC = () => {
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3.5 }}>
               <Box>
                 <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 1.5, mb: 1.5 }}>
-                  <Typography variant="subtitle1" sx={{ fontWeight: 700, color: '#09090b' }}>
-                    Managed Node Groups ({detail?.nodegroups.length || 0})
-                  </Typography>
+                  <Box>
+                    <Typography variant="subtitle1" sx={{ fontWeight: 700, color: '#09090b' }}>
+                      Managed Node Groups ({detail?.nodegroups.length || 0})
+                    </Typography>
+                    <Typography variant="caption" sx={{ color: '#64748b' }}>
+                      Click any node group name to inspect nodes, health issues, labels, taints, subnets &amp; update history
+                    </Typography>
+                  </Box>
                   {!detail?.awsMissing && (
                     <Tooltip
                       title={
@@ -816,8 +907,24 @@ export const ClusterDetails: React.FC = () => {
                       </TableHead>
                       <TableBody>
                         {detail.nodegroups.map((ng) => (
-                          <TableRow key={ng.nodegroupName}>
-                            <TableCell sx={{ fontWeight: 700 }}>{ng.nodegroupName}</TableCell>
+                          <TableRow key={ng.nodegroupName} hover>
+                            <TableCell sx={{ fontWeight: 700 }}>
+                              <Button
+                                size="small"
+                                variant="text"
+                                onClick={() => setSelectedNodegroup(ng)}
+                                sx={{
+                                  p: 0,
+                                  minWidth: 0,
+                                  textTransform: 'none',
+                                  fontWeight: 700,
+                                  color: '#2563eb',
+                                  textAlign: 'left',
+                                }}
+                              >
+                                {ng.nodegroupName}
+                              </Button>
+                            </TableCell>
                             <TableCell>
                               <Chip
                                 size="small"
@@ -1037,6 +1144,7 @@ export const ClusterDetails: React.FC = () => {
                             <TableCell><strong>Created Date</strong></TableCell>
                             <TableCell><strong>Pod IP</strong></TableCell>
                             <TableCell><strong>Node</strong></TableCell>
+                            <TableCell align="right"><strong>Actions</strong></TableCell>
                           </TableRow>
                         </TableHead>
                         <TableBody>
@@ -1051,7 +1159,22 @@ export const ClusterDetails: React.FC = () => {
                             return (
                               <TableRow key={`${pod.namespace}/${pod.name}`} hover>
                                 <TableCell sx={{ fontFamily: 'monospace', fontWeight: 700 }}>
-                                  {pod.name}{' '}
+                                  <Button
+                                    size="small"
+                                    variant="text"
+                                    onClick={() => setSelectedPod(pod)}
+                                    sx={{
+                                      p: 0,
+                                      minWidth: 0,
+                                      textTransform: 'none',
+                                      fontFamily: 'monospace',
+                                      fontWeight: 700,
+                                      color: '#2563eb',
+                                      textAlign: 'left',
+                                    }}
+                                  >
+                                    {pod.name}
+                                  </Button>{' '}
                                   {pod.ready && (
                                     <Typography
                                       component="span"
@@ -1099,6 +1222,32 @@ export const ClusterDetails: React.FC = () => {
                                     >
                                       {pod.nodeName || '—'}
                                     </Typography>
+                                  )}
+                                </TableCell>
+                                <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>
+                                  {!detail?.awsMissing && (
+                                    <Box sx={{ display: 'inline-flex', gap: 0.5 }}>
+                                      <Tooltip title="Restart Pod">
+                                        <IconButton
+                                          size="small"
+                                          color="primary"
+                                          aria-label={`Restart pod ${pod.name}`}
+                                          onClick={() => setPodActionConfirm({ action: 'restart', pod })}
+                                        >
+                                          <RestartIcon fontSize="small" />
+                                        </IconButton>
+                                      </Tooltip>
+                                      <Tooltip title="Delete Pod">
+                                        <IconButton
+                                          size="small"
+                                          color="error"
+                                          aria-label={`Delete pod ${pod.name}`}
+                                          onClick={() => setPodActionConfirm({ action: 'delete', pod })}
+                                        >
+                                          <DeleteIcon fontSize="small" />
+                                        </IconButton>
+                                      </Tooltip>
+                                    </Box>
                                   )}
                                 </TableCell>
                               </TableRow>
@@ -1158,6 +1307,91 @@ export const ClusterDetails: React.FC = () => {
                 ) : (
                   <Alert severity="info">
                     No AWS EKS add-ons currently installed (if cluster is CREATING, queued add-ons install once ACTIVE).
+                  </Alert>
+                )}
+              </Box>
+
+              <Divider />
+
+              <Box>
+                <Typography variant="subtitle1" sx={{ fontWeight: 700, mb: 0.5, color: '#09090b' }}>
+                  Community / Helm Add-ons ({detail?.communityAddons?.length || 0})
+                </Typography>
+                <Typography variant="caption" sx={{ color: '#64748b', display: 'block', mb: 1.5 }}>
+                  Open-source controllers &amp; Helm releases (Ingress NGINX, Cert Manager, External DNS, Argo CD, Metrics Server, Reloader, Cluster Autoscaler)
+                </Typography>
+                {detail?.communityAddons && detail.communityAddons.length > 0 ? (
+                  <TableContainer component={Paper} variant="outlined">
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow sx={{ bgcolor: '#f8fafc' }}>
+                          <TableCell><strong>Add-on</strong></TableCell>
+                          <TableCell><strong>Namespace</strong></TableCell>
+                          <TableCell><strong>Chart / Version</strong></TableCell>
+                          <TableCell><strong>Status</strong></TableCell>
+                          <TableCell><strong>Details</strong></TableCell>
+                          <TableCell align="right"><strong>Actions</strong></TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {detail.communityAddons.map((ca) => {
+                          const isDeployed = ['DEPLOYED', 'INSTALLED', 'SUCCESS'].includes(ca.status.toUpperCase());
+                          const isInstalling = installingAddonId === ca.id;
+                          return (
+                            <TableRow key={`${ca.id}-${ca.namespace || 'ns'}`}>
+                              <TableCell sx={{ fontWeight: 700 }}>{ca.name || ca.id}</TableCell>
+                              <TableCell sx={{ fontFamily: 'monospace' }}>{ca.namespace || '—'}</TableCell>
+                              <TableCell sx={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>
+                                {ca.chart ? `${ca.chart} · ` : ''}
+                                {ca.version || ca.requestedVersion || 'latest'}
+                              </TableCell>
+                              <TableCell>
+                                <Chip
+                                  size="small"
+                                  label={ca.status}
+                                  color={
+                                    isDeployed
+                                      ? 'success'
+                                      : ca.status.toUpperCase() === 'FAILED'
+                                      ? 'error'
+                                      : 'warning'
+                                  }
+                                />
+                              </TableCell>
+                              <TableCell sx={{ fontSize: '0.8rem', color: '#475569' }}>
+                                {ca.details || '—'}
+                              </TableCell>
+                              <TableCell align="right">
+                                {!detail?.awsMissing && detail?.status === 'ACTIVE' && (
+                                  <Button
+                                    size="small"
+                                    variant={isDeployed ? 'outlined' : 'contained'}
+                                    disabled={isInstalling || ca.status.toUpperCase() === 'UNSUPPORTED'}
+                                    onClick={() =>
+                                      handleInstallCommunityAddon(
+                                        ca.id,
+                                        ca.name || ca.id,
+                                        ca.requestedVersion || ca.version
+                                      )
+                                    }
+                                  >
+                                    {isInstalling
+                                      ? 'Installing...'
+                                      : isDeployed
+                                      ? 'Upgrade / Reinstall'
+                                      : 'Install via Helm'}
+                                  </Button>
+                                )}
+                              </TableCell>
+                            </TableRow>
+                          );
+                        })}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                ) : (
+                  <Alert severity="info">
+                    No Helm / community add-ons installed or requested for this cluster yet.
                   </Alert>
                 )}
               </Box>
@@ -1430,7 +1664,7 @@ export const ClusterDetails: React.FC = () => {
       </Perspective3DCard>
 
       {/* Add Node Group Dialog */}
-      <Dialog open={ngDialogOpen} onClose={() => setNgDialogOpen(false)} maxWidth="sm" fullWidth>
+      <Dialog open={ngDialogOpen} onClose={() => setNgDialogOpen(false)} maxWidth="md" fullWidth>
         <form onSubmit={handleCreateNodegroup}>
           <DialogTitle sx={{ bgcolor: '#09090b', color: '#ffffff', fontWeight: 700 }}>
             Add Managed Node Group
@@ -1567,14 +1801,65 @@ export const ClusterDetails: React.FC = () => {
               </Grid>
             </Grid>
 
-            <Autocomplete
+            <Autocomplete<ClusterSubnetInfo, true, false, false>
               multiple
               filterSelectedOptions
-              options={(detail?.networking.subnets || []).map((s) => s.subnetId)}
-              value={ngSubnets}
-              onChange={(_, vals) => setNgSubnets(vals)}
+              options={detail?.networking.subnets || []}
+              isOptionEqualToValue={(opt, val) => opt.subnetId === val.subnetId}
+              getOptionLabel={(s) => {
+                const access = isClusterSubnetPublic(s) ? 'Public' : 'Private';
+                const base = s.name && s.name !== s.subnetId ? `${s.name} (${s.subnetId})` : s.subnetId;
+                return `${base} · ${access}${s.cidrBlock ? ` · ${s.cidrBlock}` : ''}${s.availabilityZone ? ` · ${s.availabilityZone}` : ''}`;
+              }}
+              value={(detail?.networking.subnets || []).filter((s) => ngSubnets.includes(s.subnetId))}
+              onChange={(_, vals) => setNgSubnets(vals.map((s) => s.subnetId))}
+              renderTags={(selected, getTagProps) =>
+                selected.map((s, index) => {
+                  const isPub = isClusterSubnetPublic(s);
+                  const shortName = s.name && s.name !== s.subnetId ? `${s.name} (${s.subnetId})` : s.subnetId;
+                  return (
+                    <Chip
+                      {...getTagProps({ index })}
+                      key={s.subnetId}
+                      size="small"
+                      label={`${shortName} · ${isPub ? 'Public' : 'Private'}`}
+                      color={isPub ? 'primary' : 'default'}
+                      variant={isPub ? 'outlined' : 'filled'}
+                    />
+                  );
+                })
+              }
+              renderOption={(props, s) => {
+                const isPub = isClusterSubnetPublic(s);
+                return (
+                  <Box component="li" {...props} key={s.subnetId} sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 1.5, width: '100%' }}>
+                    <Box sx={{ minWidth: 0 }}>
+                      <Typography variant="body2" sx={{ fontWeight: 700, fontFamily: 'monospace' }} noWrap>
+                        {s.name && s.name !== s.subnetId ? `${s.name} (${s.subnetId})` : s.subnetId}
+                      </Typography>
+                      <Typography variant="caption" sx={{ color: '#64748b' }}>
+                        {[s.cidrBlock, s.availabilityZone, s.availableIpAddressCount !== undefined ? `${s.availableIpAddressCount} free IPs` : '']
+                          .filter(Boolean)
+                          .join(' · ')}
+                      </Typography>
+                    </Box>
+                    <Chip
+                      size="small"
+                      label={isPub ? 'Public' : 'Private'}
+                      color={isPub ? 'primary' : 'default'}
+                      variant={isPub ? 'filled' : 'outlined'}
+                      sx={{ fontWeight: 700, flexShrink: 0 }}
+                    />
+                  </Box>
+                );
+              }}
               renderInput={(params) => (
-                <TextField {...params} label="Worker Subnets" placeholder="Select cluster subnets..." />
+                <TextField
+                  {...params}
+                  label="Worker Subnets"
+                  placeholder="Select worker subnets (Public / Private)..."
+                  helperText="Public subnets route internet-facing traffic directly; Private subnets keep worker nodes isolated behind NAT."
+                />
               )}
             />
           </DialogContent>
@@ -1656,7 +1941,115 @@ export const ClusterDetails: React.FC = () => {
         node={selectedNode}
         pods={detail?.pods || []}
         onClose={() => setSelectedNode(null)}
+        onSelectPod={(pod) => {
+          setSelectedNode(null);
+          setSelectedPod(pod);
+        }}
       />
+
+      {/* Clickable AWS EKS Node Group Details Dialog */}
+      <NodeGroupDetailsDialog
+        nodegroup={selectedNodegroup}
+        workerNodes={detail?.workerNodes || []}
+        subnets={detail?.networking.subnets || []}
+        onClose={() => setSelectedNodegroup(null)}
+        onScale={(ng) => {
+          setSelectedNodegroup(null);
+          setScaleTarget({
+            nodegroupName: ng.nodegroupName,
+            minSize: ng.scalingConfig?.minSize ?? 1,
+            desiredSize: ng.scalingConfig?.desiredSize ?? 2,
+            maxSize: ng.scalingConfig?.maxSize ?? 4,
+          });
+        }}
+        onDelete={(ngNameToDelete) => {
+          setSelectedNodegroup(null);
+          setDeleteNgTarget(ngNameToDelete);
+        }}
+        onSelectNode={(node) => {
+          setSelectedNodegroup(null);
+          setSelectedNode(node);
+        }}
+      />
+
+      {/* Clickable AWS EKS Pod Details Dialog */}
+      <PodDetailsDialog
+        pod={selectedPod}
+        readOnly={Boolean(detail?.awsMissing)}
+        actionPending={podActionSubmitting}
+        onClose={() => setSelectedPod(null)}
+        onRestart={(pod) => setPodActionConfirm({ action: 'restart', pod })}
+        onDelete={(pod) => setPodActionConfirm({ action: 'delete', pod })}
+        onSelectNode={(nodeName) => {
+          const matched = (detail?.workerNodes || []).find(
+            (n) =>
+              n.nodeName === nodeName || n.name === nodeName || n.privateDnsName === nodeName
+          );
+          if (matched) {
+            setSelectedPod(null);
+            setSelectedNode(matched);
+          }
+        }}
+      />
+
+      {/* Confirm Pod Delete */}
+      <ConfirmDeleteDialog
+        open={Boolean(podActionConfirm && podActionConfirm.action === 'delete')}
+        title="Delete Pod?"
+        description={
+          podActionConfirm ? (
+            <>
+              Delete pod <strong>{podActionConfirm.pod.name}</strong> in namespace{' '}
+              <strong>{podActionConfirm.pod.namespace}</strong>?{' '}
+              {podActionConfirm.pod.controlledBy && podActionConfirm.pod.controlledBy.length > 0
+                ? 'Because this pod is managed by a controller, Kubernetes may schedule a replacement pod.'
+                : 'This standalone pod will be permanently terminated.'}
+            </>
+          ) : (
+            ''
+          )
+        }
+        confirmLabel="Confirm Delete Pod"
+        loading={podActionSubmitting}
+        onCancel={() => setPodActionConfirm(null)}
+        onConfirm={handlePodAction}
+      />
+
+      {/* Confirm Pod Restart */}
+      <Dialog
+        open={Boolean(podActionConfirm && podActionConfirm.action === 'restart')}
+        onClose={() => !podActionSubmitting && setPodActionConfirm(null)}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle sx={{ bgcolor: '#09090b', color: '#ffffff', fontWeight: 700 }}>
+          Restart Pod?
+        </DialogTitle>
+        <DialogContent sx={{ pt: '20px !important' }}>
+          <Typography variant="body2" sx={{ color: '#334155' }}>
+            Restart pod <strong>{podActionConfirm?.pod.name}</strong> in namespace{' '}
+            <strong>{podActionConfirm?.pod.namespace}</strong>? Kubernetes will terminate this pod
+            so its controller replaces it with a fresh pod instance.
+          </Typography>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2.5, bgcolor: '#f8fafc' }}>
+          <Button
+            onClick={() => setPodActionConfirm(null)}
+            disabled={podActionSubmitting}
+            sx={{ color: '#475569' }}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            disabled={podActionSubmitting}
+            startIcon={podActionSubmitting ? <CircularProgress size={14} color="inherit" /> : <RestartIcon fontSize="small" />}
+            onClick={handlePodAction}
+          >
+            {podActionSubmitting ? 'Restarting...' : 'Confirm Restart Pod'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 };

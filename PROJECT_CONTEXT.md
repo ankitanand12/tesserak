@@ -51,8 +51,10 @@ This document captures the current architecture, design decisions, database sche
   2. The user's `account_id` connector (or first active user connector if `account_id` is omitted or `'catalog'`).
 - Read-only AWS catalog APIs (`eks:DescribeAddonVersions`, `ec2:DescribeInstanceTypes`, standard `ssm:GetParameter`) reject unsigned HTTP calls, so credentials (either platform catalog IAM or user connector) are used when refreshing live data.
 
-### EKS Cluster Soft-Delete & Kubernetes Inspection
+### EKS Cluster Soft-Delete, State Reconciliation & Kubernetes Inspection
 - `delete_cluster` records `deleteInitiatedBy="tesserak"` and soft-deletion timestamps; `_list_clusters_sync` retains deleted clusters for `DELETED_CLUSTER_RETENTION_DAYS = 7` (UTC-safe calculation) before removing stale audit entries.
+- `_list_clusters_sync` and `sync_cluster_state` (`POST /clusters/{cluster_name}/sync`) reconcile live AWS `nodeGroups`, `status`, `version`, and `endpoint` with local PostgreSQL state via `StateData.record_state_change` and return exact `stateDifferences`.
+- `install_community_addon` / `_install_community_addon_sync` and `POST /clusters/{cluster_name}/community-addons` install selected community Kubernetes add-ons via isolated Helm CLI execution, and `_get_cluster_details_sync` merges live `helm list -A -o json` releases into `communityAddons`.
 - `_get_cluster_details_sync` merges EC2 instance metadata with live cluster state via `kubectl get nodes,pods -A -o json`, exposing per-node and pod status/IP/creation timestamps to `ClusterDetails`.
 
 ### Cloud Resources & CI/CD Pipelines
@@ -83,8 +85,11 @@ This document captures the current architecture, design decisions, database sche
 - `ClusterAddons.tsx` & `ClusterPreview.tsx`: Dynamic add-on version matrix and launch preview.
 
 ### Shared Safety & Utilities
-- `ConfirmDeleteDialog.tsx`: Shared destructive confirmation dialog used across deletions.
-- `Clusters/NodeDetailsDialog.tsx`: Node detail inspector with paginated pod list (`10` pods per page).
+- `ConfirmDeleteDialog.tsx`: Shared destructive confirmation dialog used across deletions (clusters, node groups, pods, pipelines, resources, integrations, connectors).
+- `Clusters/NodeDetailsDialog.tsx`: Node detail inspector with paginated pod list (`10` pods per page) and clickable pod rows.
+- `Clusters/NodeGroupDetailsDialog.tsx`: AWS EKS node group inspector modal (configuration summary banner + 8 tabs covering Details, Nodes, Health issues, Labels, Update config, Taints, Update history, and Tags) plus Public/Private subnet labeling.
+- `Clusters/PodDetailsDialog.tsx`: Kubernetes pod inspector (Structured/Raw view, expandable Containers/Init Containers, Conditions, Volumes, Labels, and confirmation-guarded Restart/Delete Pod actions via `POST/DELETE /clusters/{cluster_name}/pods/{namespace}/{pod_name}`).
+- `auth/AuthContext.tsx`: Preserves Auth0/Google SSO `picture` URLs across PostgreSQL profile hydration (`tesserak-profile-updated` event sync + DB backfill).
 - `utils/`: `swrCache.ts` (stale-while-revalidate client caching), `dateUtils.ts`, `imageUtils.ts`, `regionMapping.ts`.
 - `types/`: `cluster.ts`, `platform.ts`, `user.ts`.
 
