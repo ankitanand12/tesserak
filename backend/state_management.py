@@ -81,7 +81,7 @@ class StateData:
 
         # Sync top-level comparison attributes if provided directly or nested under aws_state
         source_aws = details.get("aws_state") if isinstance(details, dict) else None
-        for key in ("status", "version", "endpoint", "nodeGroups", "communityAddons"):
+        for key in ("status", "version", "endpoint", "nodeGroups", "communityAddons", "addons"):
             if isinstance(details, dict) and details.get(key) is not None:
                 updated[key] = details[key]
             elif isinstance(source_aws, dict) and source_aws.get(key) is not None:

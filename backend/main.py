@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -125,6 +126,7 @@ _COMMUNITY_ADDON_REPOS = {
         "chart": "cluster-proportional-autoscaler",
         "release": "cluster-proportional-autoscaler",
         "namespace": "kube-system",
+        "set_args": ["options.target=deployment/coredns"],
         "fallback": ["1.9.0", "1.8.8", "1.8.6"],
     },
     "cluster-autoscaler": {
@@ -215,8 +217,86 @@ class AddonModel(BaseModel):
     id: str
     name: str
     type: str
-    version: str
+    version: Optional[str] = None
     configuration: Optional[dict] = None
+    valuesYaml: Optional[str] = None
+
+
+_HELM_LOCKS_GUARD = threading.Lock()
+_HELM_RELEASE_LOCKS: Dict[str, threading.Lock] = {}
+
+
+def _get_helm_lock(cluster_name: str, release: str) -> threading.Lock:
+    key = f"{cluster_name}:{release}"
+    with _HELM_LOCKS_GUARD:
+        lock = _HELM_RELEASE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _HELM_RELEASE_LOCKS[key] = lock
+        return lock
+
+
+_COMMUNITY_ADDON_PRESETS: Dict[str, Dict[str, Any]] = {
+    "argo-cd": {
+        "presetValuesYaml": (
+            "# Expose Argo CD UI on a custom domain via Ingress NGINX\n"
+            "configs:\n"
+            "  params:\n"
+            "    server.insecure: true\n"
+            "server:\n"
+            "  ingress:\n"
+            "    enabled: true\n"
+            "    ingressClassName: nginx\n"
+            "    hostname: argocd.example.com\n"
+            "    # tls: true\n"
+            "    # annotations:\n"
+            "    #   cert-manager.io/cluster-issuer: letsencrypt-prod\n"
+        ),
+        "accessHints": [
+            "Map your DNS record (argocd.yourdomain.com) to the Ingress NGINX LoadBalancer hostname.",
+            'Retrieve initial admin password: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d',
+            "Or preview locally without DNS: kubectl port-forward svc/argo-cd-argocd-server -n argocd 8080:443",
+        ],
+    },
+    "ingress-nginx": {
+        "presetValuesYaml": (
+            "# Expose Ingress NGINX via internet-facing AWS LoadBalancer\n"
+            "controller:\n"
+            "  service:\n"
+            "    type: LoadBalancer\n"
+            "    annotations:\n"
+            "      service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing\n"
+        ),
+        "accessHints": [
+            "Point wildcard/subdomain DNS (CNAME / Route53 Alias) to the External-IP LoadBalancer DNS in Services below.",
+        ],
+    },
+    "cert-manager": {
+        "presetValuesYaml": (
+            "# Ensure Cert Manager installs CustomResourceDefinitions cleanly\n"
+            "crds:\n"
+            "  enabled: true\n"
+        ),
+        "accessHints": [
+            "After deployment, apply a ClusterIssuer (e.g. letsencrypt-prod) referencing ingressClassName: nginx.",
+        ],
+    },
+    "cluster-proportional-autoscaler": {
+        "presetValuesYaml": (
+            "# Scale CoreDNS proportionally with cluster node count\n"
+            "options:\n"
+            "  target: deployment/coredns\n"
+            "config:\n"
+            "  linear:\n"
+            "    coresPerReplica: 256\n"
+            "    nodesPerReplica: 16\n"
+            "    min: 2\n"
+        ),
+        "accessHints": [
+            "Required field options.target defaults to deployment/coredns on EKS.",
+        ],
+    },
+}
 
 async def get_compatible_aws_addon_version(eks_client, addon_name: str, eks_version: str, requested_version: str = None) -> str:
     """Return a compatible addon version for the given EKS version, or None if not found."""
@@ -555,6 +635,56 @@ def _isolated_helm_env(conn: Any, kc_path: Path, region: str, base_dir: Path) ->
     })
 
 
+def _clear_stuck_helm_release(
+    helm_bin: str,
+    release: str,
+    namespace: str,
+    kc_path: Path,
+    env: Dict[str, str],
+    logs: List[str],
+) -> None:
+    """Recover if a previous Helm operation left a release stuck in pending-* state."""
+    st_proc = subprocess.run(
+        [helm_bin, "status", release, "-n", namespace, "-o", "json", "--kubeconfig", str(kc_path)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=env,
+        check=False,
+    )
+    if st_proc.returncode != 0:
+        return
+    try:
+        st_json = json.loads(st_proc.stdout or "{}")
+    except Exception:
+        return
+    rel_status = str((st_json.get("info") or {}).get("status") or "").lower()
+    if rel_status == "pending-install":
+        logs.append(f"[recovery] Release '{release}' was stuck in 'pending-install'; cleaning via helm uninstall before retrying.")
+        un = subprocess.run(
+            [helm_bin, "uninstall", release, "-n", namespace, "--kubeconfig", str(kc_path)],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            env=env,
+            check=False,
+        )
+        if un.stdout or un.stderr:
+            logs.append((un.stdout or un.stderr).strip())
+    elif rel_status in ("pending-upgrade", "pending-rollback"):
+        logs.append(f"[recovery] Release '{release}' was stuck in '{rel_status}'; rolling back last healthy revision.")
+        rb = subprocess.run(
+            [helm_bin, "rollback", release, "0", "-n", namespace, "--kubeconfig", str(kc_path)],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            env=env,
+            check=False,
+        )
+        if rb.stdout or rb.stderr:
+            logs.append((rb.stdout or rb.stderr).strip())
+
+
 def _install_community_addon_sync(
     conn: Any,
     region: str,
@@ -564,13 +694,16 @@ def _install_community_addon_sync(
 ) -> Dict[str, Any]:
     """Install or upgrade a Kubernetes community add-on via Helm CLI."""
     cfg = _COMMUNITY_ADDON_REPOS.get(addon.id)
+    now_iso = datetime.utcnow().isoformat() + "Z"
     if not cfg or (not cfg.get("helm_repo_url") and not cfg.get("oci_chart")):
         return {
             "id": addon.id,
             "name": addon.name or addon.id,
             "status": "unsupported",
             "version": addon.version,
+            "updatedAt": now_iso,
             "details": f'"{addon.id}" does not have an official Helm chart repository mapping.',
+            "logs": f'Skipped "{addon.id}": no Helm chart repository configured.',
         }
 
     helm_bin = _resolve_helm_binary()
@@ -580,7 +713,9 @@ def _install_community_addon_sync(
             "name": addon.name or cfg.get("release", addon.id),
             "status": "failed",
             "version": addon.version,
+            "updatedAt": now_iso,
             "details": "Helm CLI is not installed on the backend host.",
+            "logs": "Helm binary not found on PATH or /opt/homebrew/bin/helm.",
         }
 
     if not cluster_info:
@@ -601,88 +736,172 @@ def _install_community_addon_sync(
             "name": addon.name or addon.id,
             "status": "failed",
             "version": addon.version,
+            "updatedAt": now_iso,
             "details": f"Cluster '{cluster_name}' API endpoint is not ready yet.",
+            "logs": "Cluster endpoint/certificateAuthority missing.",
         }
 
-    release = cfg.get("release") or addon.id
-    namespace = cfg.get("namespace") or "kube-system"
-    chart = cfg.get("chart") or addon.id
-    tmpdir = tempfile.mkdtemp(prefix="tesserak_helm_")
-    try:
-        tmp_path = Path(tmpdir)
-        kc_path = tmp_path / "kubeconfig"
-        kc_path.write_text(build_eks_kubeconfig_yaml(cluster_name, endpoint, ca_data, region))
-        env = _isolated_helm_env(conn, kc_path, region, tmp_path)
+    release = str(cfg.get("release") or addon.id)
+    namespace = str(cfg.get("namespace") or "kube-system")
+    chart = str(cfg.get("chart") or addon.id)
+    logs: List[str] = [f"[{now_iso}] Starting Helm install for {addon.name or release} (namespace={namespace})"]
 
-        if cfg.get("oci_chart"):
-            chart_ref = str(cfg["oci_chart"])
-        else:
-            repo_name = str(cfg["helm_repo_name"])
-            repo_url = str(cfg["helm_repo_url"])
-            add_proc = subprocess.run(
-                [helm_bin, "repo", "add", repo_name, repo_url, "--force-update"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=env,
-                check=False,
-            )
-            if add_proc.returncode != 0:
+    release_lock = _get_helm_lock(cluster_name, release)
+    with release_lock:
+        tmpdir = tempfile.mkdtemp(prefix="tesserak_helm_")
+        try:
+            tmp_path = Path(tmpdir)
+            kc_path = tmp_path / "kubeconfig"
+            kc_path.write_text(build_eks_kubeconfig_yaml(cluster_name, endpoint, ca_data, region))
+            env = _isolated_helm_env(conn, kc_path, region, tmp_path)
+
+            if cfg.get("oci_chart"):
+                chart_ref = str(cfg["oci_chart"])
+            else:
+                repo_name = str(cfg["helm_repo_name"])
+                repo_url = str(cfg["helm_repo_url"])
+                logs.append(f"$ helm repo add {repo_name} {repo_url} --force-update")
+                add_proc = subprocess.run(
+                    [helm_bin, "repo", "add", repo_name, repo_url, "--force-update"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=env,
+                    check=False,
+                )
+                if add_proc.stdout or add_proc.stderr:
+                    logs.append((add_proc.stdout or add_proc.stderr).strip())
+                if add_proc.returncode != 0:
+                    return {
+                        "id": addon.id,
+                        "name": addon.name or release,
+                        "releaseName": release,
+                        "namespace": namespace,
+                        "chart": chart,
+                        "status": "failed",
+                        "version": addon.version,
+                        "updatedAt": now_iso,
+                        "details": (add_proc.stderr or add_proc.stdout or "helm repo add failed").strip(),
+                        "logs": "\n".join(logs),
+                    }
+                logs.append(f"$ helm repo update {repo_name}")
+                upd_proc = subprocess.run(
+                    [helm_bin, "repo", "update", repo_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                    env=env,
+                    check=False,
+                )
+                if upd_proc.stdout or upd_proc.stderr:
+                    logs.append((upd_proc.stdout or upd_proc.stderr).strip())
+                chart_ref = f"{repo_name}/{chart}"
+
+            _clear_stuck_helm_release(helm_bin, release, namespace, kc_path, env, logs)
+
+            base_cmd = [
+                helm_bin,
+                "upgrade",
+                "--install",
+                release,
+                chart_ref,
+                "--kubeconfig",
+                str(kc_path),
+                "--namespace",
+                namespace,
+                "--create-namespace",
+                "--history-max",
+                "5",
+                "--timeout",
+                "5m",
+            ]
+            for s_arg in cfg.get("set_args", []):
+                base_cmd.extend(["--set", s_arg])
+            if cfg.get("needs_cluster_name"):
+                flag = "settings.clusterName" if addon.id == "karpenter" else "clusterName"
+                base_cmd.extend(["--set", f"{flag}={cluster_name}"])
+            if cfg.get("needs_cluster_region"):
+                base_cmd.extend([
+                    "--set", f"autoDiscovery.clusterName={cluster_name}",
+                    "--set", f"awsRegion={region}",
+                ])
+            if addon.valuesYaml and addon.valuesYaml.strip():
+                val_file = tmp_path / "custom-values.yaml"
+                val_file.write_text(addon.valuesYaml.strip() + "\n")
+                base_cmd.extend(["--values", str(val_file)])
+                logs.append("[custom values] Attached custom values.yaml overrides.")
+
+            req_ver = (addon.version or "").strip().lstrip("v")
+            cmd = list(base_cmd) + (["--version", req_ver] if req_ver else [])
+            logs.append(f"$ helm upgrade --install {release} {chart_ref} -n {namespace}" + (f" --version {req_ver}" if req_ver else ""))
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env, check=False)
+            if proc.stdout:
+                logs.append(proc.stdout.strip())
+            if proc.stderr:
+                logs.append(proc.stderr.strip())
+
+            # Retry without pinned --version if GitHub release app tag didn't match Helm chart semver
+            if proc.returncode != 0 and req_ver:
+                err_l = (proc.stderr or proc.stdout or "").lower()
+                if "not found" in err_l or "chart" in err_l:
+                    logs.append("[fallback] Requested version not found in chart index; retrying with latest compatible chart version.")
+                    proc = subprocess.run(base_cmd, capture_output=True, text=True, timeout=180, env=env, check=False)
+                    if proc.stdout:
+                        logs.append(proc.stdout.strip())
+                    if proc.stderr:
+                        logs.append(proc.stderr.strip())
+
+            # Auto-recover if release raced into another-operation error
+            if proc.returncode != 0 and "another operation" in (proc.stderr or proc.stdout or "").lower():
+                _clear_stuck_helm_release(helm_bin, release, namespace, kc_path, env, logs)
+                proc = subprocess.run(base_cmd, capture_output=True, text=True, timeout=180, env=env, check=False)
+                if proc.stdout:
+                    logs.append(proc.stdout.strip())
+                if proc.stderr:
+                    logs.append(proc.stderr.strip())
+
+            if proc.returncode != 0:
+                err_msg = (proc.stderr or proc.stdout or "Helm install failed").strip().splitlines()
                 return {
                     "id": addon.id,
                     "name": addon.name or release,
+                    "releaseName": release,
                     "namespace": namespace,
+                    "chart": chart,
                     "status": "failed",
                     "version": addon.version,
-                    "details": (add_proc.stderr or add_proc.stdout or "helm repo add failed").strip(),
+                    "valuesYaml": addon.valuesYaml or "",
+                    "updatedAt": datetime.utcnow().isoformat() + "Z",
+                    "details": err_msg[-1] if err_msg else "Helm install failed",
+                    "logs": "\n".join(logs),
                 }
-            subprocess.run(
-                [helm_bin, "repo", "update", repo_name],
+
+            notes_proc = subprocess.run(
+                [helm_bin, "get", "notes", release, "-n", namespace, "--kubeconfig", str(kc_path)],
                 capture_output=True,
                 text=True,
-                timeout=45,
+                timeout=15,
                 env=env,
                 check=False,
             )
-            chart_ref = f"{repo_name}/{chart}"
+            notes_text = (notes_proc.stdout or "").strip() if notes_proc.returncode == 0 else ""
 
-        base_cmd = [
-            helm_bin,
-            "upgrade",
-            "--install",
-            release,
-            chart_ref,
-            "--kubeconfig",
-            str(kc_path),
-            "--namespace",
-            namespace,
-            "--create-namespace",
-            "--timeout",
-            "5m",
-        ]
-        for s_arg in cfg.get("set_args", []):
-            base_cmd.extend(["--set", s_arg])
-        if cfg.get("needs_cluster_name"):
-            flag = "settings.clusterName" if addon.id == "karpenter" else "clusterName"
-            base_cmd.extend(["--set", f"{flag}={cluster_name}"])
-        if cfg.get("needs_cluster_region"):
-            base_cmd.extend([
-                "--set", f"autoDiscovery.clusterName={cluster_name}",
-                "--set", f"awsRegion={region}",
-            ])
-
-        req_ver = (addon.version or "").strip().lstrip("v")
-        cmd = list(base_cmd) + (["--version", req_ver] if req_ver else [])
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env, check=False)
-
-        # Retry without pinned --version if GitHub release app tag didn't match Helm chart semver
-        if proc.returncode != 0 and req_ver:
-            err_l = (proc.stderr or proc.stdout or "").lower()
-            if "not found" in err_l or "chart" in err_l:
-                proc = subprocess.run(base_cmd, capture_output=True, text=True, timeout=180, env=env, check=False)
-
-        if proc.returncode != 0:
-            err_msg = (proc.stderr or proc.stdout or "Helm install failed").strip().splitlines()
+            return {
+                "id": addon.id,
+                "name": addon.name or release,
+                "releaseName": release,
+                "namespace": namespace,
+                "chart": chart,
+                "status": "installed",
+                "version": addon.version or "latest",
+                "valuesYaml": addon.valuesYaml or "",
+                "updatedAt": datetime.utcnow().isoformat() + "Z",
+                "notes": notes_text,
+                "details": (proc.stdout or "Helm release installed").strip().splitlines()[0] if proc.stdout else "Installed",
+                "logs": "\n".join(logs),
+            }
+        except subprocess.TimeoutExpired:
+            logs.append("[error] Helm command timed out.")
             return {
                 "id": addon.id,
                 "name": addon.name or release,
@@ -691,39 +910,26 @@ def _install_community_addon_sync(
                 "chart": chart,
                 "status": "failed",
                 "version": addon.version,
-                "details": err_msg[-1] if err_msg else "Helm install failed",
+                "updatedAt": datetime.utcnow().isoformat() + "Z",
+                "details": f"Timed out installing {release} via Helm.",
+                "logs": "\n".join(logs),
             }
-
-        return {
-            "id": addon.id,
-            "name": addon.name or release,
-            "releaseName": release,
-            "namespace": namespace,
-            "chart": chart,
-            "status": "installed",
-            "version": addon.version or "latest",
-            "details": (proc.stdout or "Helm release installed").strip().splitlines()[0] if proc.stdout else "Installed",
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "id": addon.id,
-            "name": addon.name or release,
-            "namespace": namespace,
-            "status": "failed",
-            "version": addon.version,
-            "details": f"Timed out installing {release} via Helm.",
-        }
-    except Exception as exc:
-        return {
-            "id": addon.id,
-            "name": addon.name or release,
-            "namespace": namespace,
-            "status": "failed",
-            "version": addon.version,
-            "details": str(exc),
-        }
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception as exc:
+            logs.append(f"[error] {exc}")
+            return {
+                "id": addon.id,
+                "name": addon.name or release,
+                "releaseName": release,
+                "namespace": namespace,
+                "chart": chart,
+                "status": "failed",
+                "version": addon.version,
+                "updatedAt": datetime.utcnow().isoformat() + "Z",
+                "details": str(exc),
+                "logs": "\n".join(logs),
+            }
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 async def install_community_addon(
@@ -816,6 +1022,7 @@ class CommunityAddonInstallRequest(BaseModel):
     addonId: str
     name: Optional[str] = None
     version: Optional[str] = None
+    valuesYaml: Optional[str] = None
 
 
 class ClusterResponse(BaseModel):
@@ -2071,6 +2278,7 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
     for a in requested_comm:
         aid = str(a.get("id") or "")
         cfg = _COMMUNITY_ADDON_REPOS.get(aid, {})
+        preset = _COMMUNITY_ADDON_PRESETS.get(aid, {})
         rel_name = str(cfg.get("release") or aid).lower()
         live = live_by_name.get(rel_name) or live_by_name.get(aid.lower())
         tracked = tracked_results.get(aid.lower())
@@ -2086,7 +2294,12 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
                 "requestedVersion": a.get("version"),
                 "status": str(live.get("status") or "deployed").upper(),
                 "source": "helm-live",
-                "details": live.get("updated") or "",
+                "details": live.get("updated") or (tracked or {}).get("details") or "",
+                "logs": (tracked or {}).get("logs") or "",
+                "notes": (tracked or {}).get("notes") or "",
+                "valuesYaml": (tracked or {}).get("valuesYaml") or "",
+                "presetValuesYaml": preset.get("presetValuesYaml") or "",
+                "accessHints": preset.get("accessHints") or [],
             })
         else:
             community_addons.append({
@@ -2100,6 +2313,11 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
                 "status": str((tracked or {}).get("status") or "NOT_INSTALLED").upper(),
                 "source": "requested",
                 "details": (tracked or {}).get("details") or "Selected during setup; click Install via Helm to deploy onto cluster.",
+                "logs": (tracked or {}).get("logs") or "",
+                "notes": (tracked or {}).get("notes") or "",
+                "valuesYaml": (tracked or {}).get("valuesYaml") or "",
+                "presetValuesYaml": preset.get("presetValuesYaml") or "",
+                "accessHints": preset.get("accessHints") or [],
             })
     for rel in helm_releases:
         rname = str(rel.get("name") or "").lower()
@@ -2108,6 +2326,8 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
                 (k for k, v in _COMMUNITY_ADDON_REPOS.items() if str(v.get("release") or k).lower() == rname),
                 rname,
             )
+            tracked = tracked_results.get(matched_id.lower())
+            preset = _COMMUNITY_ADDON_PRESETS.get(matched_id, {})
             community_addons.append({
                 "id": matched_id,
                 "name": rel.get("name"),
@@ -2118,6 +2338,11 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
                 "status": str(rel.get("status") or "deployed").upper(),
                 "source": "helm-live",
                 "details": rel.get("updated") or "",
+                "logs": (tracked or {}).get("logs") or "",
+                "notes": (tracked or {}).get("notes") or "",
+                "valuesYaml": (tracked or {}).get("valuesYaml") or "",
+                "presetValuesYaml": preset.get("presetValuesYaml") or "",
+                "accessHints": preset.get("accessHints") or [],
             })
 
     worker_nodes = _merge_nodes_and_compute_allocations(ec2_nodes, k8s_nodes_map, pods)
@@ -2547,6 +2772,118 @@ async def delete_cluster_pod(
     return await asyncio.to_thread(_kubectl_pod_action_sync, connection, cluster_name, clean_ns, clean_pod, "delete", force)
 
 
+def _format_k8s_event_item(ev: Dict[str, Any]) -> Dict[str, Any]:
+    meta = ev.get("metadata") or {}
+    src = ev.get("source") or {}
+    involved = ev.get("involvedObject") or {}
+    last_ts = ev.get("lastTimestamp") or ev.get("eventTime") or meta.get("creationTimestamp")
+    first_ts = ev.get("firstTimestamp") or ev.get("eventTime") or meta.get("creationTimestamp")
+    source_name = src.get("component") or ev.get("reportingComponent") or ""
+    if src.get("host"):
+        source_name = f"{source_name} ({src['host']})" if source_name else src["host"]
+    return {
+        "type": ev.get("type") or "Normal",
+        "reason": ev.get("reason") or "Event",
+        "message": ev.get("message") or "",
+        "count": int(ev.get("count") or 1),
+        "source": source_name or "kubernetes",
+        "involvedKind": involved.get("kind") or "",
+        "involvedName": involved.get("name") or "",
+        "firstSeen": first_ts,
+        "lastSeen": last_ts,
+    }
+
+
+def _fetch_pod_events_sync(
+    connection: Any,
+    cluster_name: str,
+    namespace: str,
+    pod_name: str,
+) -> Dict[str, Any]:
+    region = connection.region or "us-east-1"
+    eks = boto3.client(
+        "eks",
+        aws_access_key_id=connection.accessKey,
+        aws_secret_access_key=connection.secretKey,
+        region_name=region,
+        config=AWS_FAST_CFG,
+    )
+    cluster_info = eks.describe_cluster(name=cluster_name).get("cluster", {})
+    endpoint = cluster_info.get("endpoint")
+    ca_data = (cluster_info.get("certificateAuthority") or {}).get("data")
+    if not endpoint or not ca_data:
+        return {"events": [], "pod": None, "warning": f"Cluster '{cluster_name}' endpoint not ready"}
+
+    tmpdir = tempfile.mkdtemp(prefix="tesserak_pe_")
+    try:
+        kc_path = Path(tmpdir) / "kubeconfig"
+        kc_path.write_text(build_eks_kubeconfig_yaml(cluster_name, endpoint, ca_data, region))
+        env = _pip_cli_env(build_eks_cli_env(connection, kc_path, region))
+        ev_proc = subprocess.run(
+            [
+                "kubectl",
+                "--kubeconfig",
+                str(kc_path),
+                "get",
+                "events",
+                "-n",
+                namespace,
+                "--field-selector",
+                f"involvedObject.name={pod_name},involvedObject.kind=Pod",
+                "-o",
+                "json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+            check=False,
+        )
+        events: List[Dict[str, Any]] = []
+        warning: Optional[str] = None
+        if ev_proc.returncode == 0:
+            raw_items = (json.loads(ev_proc.stdout or "{}").get("items")) or []
+            events = [_format_k8s_event_item(it) for it in raw_items]
+            events.sort(key=lambda e: str(e.get("lastSeen") or ""), reverse=True)
+        else:
+            err = (ev_proc.stderr or ev_proc.stdout or "").strip().splitlines()
+            warning = err[-1] if err else "Unable to query pod events"
+
+        pod_summary: Optional[Dict[str, Any]] = None
+        pod_proc = subprocess.run(
+            ["kubectl", "--kubeconfig", str(kc_path), "get", "pod", pod_name, "-n", namespace, "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+            check=False,
+        )
+        if pod_proc.returncode == 0 and pod_proc.stdout.strip():
+            pod_summary = _extract_pod_summary(json.loads(pod_proc.stdout))
+
+        return {"events": events, "pod": pod_summary, "warning": warning}
+    except subprocess.TimeoutExpired:
+        return {"events": [], "pod": None, "warning": "Timed out fetching pod events"}
+    except FileNotFoundError:
+        return {"events": [], "pod": None, "warning": "kubectl CLI not installed"}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@app.get("/clusters/{cluster_name}/pods/{namespace}/{pod_name}/events", dependencies=[Depends(require_auth_if_configured)])
+async def get_cluster_pod_events(
+    cluster_name: str,
+    namespace: str,
+    pod_name: str,
+    account_id: Optional[str] = None,
+    x_user_email: str = Header(...),
+):
+    clean_ns = _validate_k8s_name(namespace, "namespace")
+    clean_pod = _validate_k8s_name(pod_name, "pod name")
+    connection = await _resolve_account_connection(x_user_email, account_id)
+    return await asyncio.to_thread(_fetch_pod_events_sync, connection, cluster_name, clean_ns, clean_pod)
+
+
 @app.delete("/clusters/{cluster_name}", dependencies=[Depends(require_auth_if_configured)])
 async def delete_cluster(
     cluster_name: str,
@@ -2679,6 +3016,7 @@ async def install_cluster_community_addon(
         name=payload.name or payload.addonId.strip(),
         type="community",
         version=payload.version,
+        valuesYaml=payload.valuesYaml,
     )
     res = await install_community_addon(connection, region, cluster_name, addon)
 
@@ -2700,6 +3038,270 @@ async def install_cluster_community_addon(
     if res.get("status") in ("failed", "unsupported"):
         raise HTTPException(status_code=400, detail=res.get("details") or f"Failed to install {addon.id}")
     return res
+
+
+def _fetch_community_addon_details_sync(
+    connection: Any,
+    user_email: str,
+    cluster_name: str,
+    addon_id: str,
+) -> Dict[str, Any]:
+    region = connection.region or "us-east-1"
+    cfg = _COMMUNITY_ADDON_REPOS.get(addon_id, {})
+    preset = _COMMUNITY_ADDON_PRESETS.get(addon_id, {})
+    release = str(cfg.get("release") or addon_id)
+    namespace = str(cfg.get("namespace") or "kube-system")
+
+    wrapper = state_manager.get_cluster_state(user_email, cluster_name)
+    base_state = dict(wrapper.get("state", wrapper)) if wrapper else {}
+    tracked = next(
+        (
+            r for r in (base_state.get("communityAddons") or [])
+            if isinstance(r, dict) and str(r.get("id") or "").lower() == addon_id.lower()
+        ),
+        {},
+    )
+    if tracked.get("releaseName"):
+        release = str(tracked["releaseName"])
+    if tracked.get("namespace"):
+        namespace = str(tracked["namespace"])
+
+    eks = boto3.client(
+        "eks",
+        aws_access_key_id=connection.accessKey,
+        aws_secret_access_key=connection.secretKey,
+        region_name=region,
+        config=AWS_FAST_CFG,
+    )
+    cluster_info = eks.describe_cluster(name=cluster_name).get("cluster", {})
+    endpoint = cluster_info.get("endpoint")
+    ca_data = (cluster_info.get("certificateAuthority") or {}).get("data")
+
+    helm_status: Optional[Dict[str, Any]] = None
+    notes = tracked.get("notes") or ""
+    values_yaml = tracked.get("valuesYaml") or ""
+    pods: List[Dict[str, Any]] = []
+    services: List[Dict[str, Any]] = []
+    ingresses: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []
+
+    if endpoint and ca_data and cluster_info.get("status") == "ACTIVE":
+        tmpdir = tempfile.mkdtemp(prefix="tesserak_cad_")
+        try:
+            tmp_path = Path(tmpdir)
+            kc_path = tmp_path / "kubeconfig"
+            kc_path.write_text(build_eks_kubeconfig_yaml(cluster_name, endpoint, ca_data, region))
+            env = _isolated_helm_env(connection, kc_path, region, tmp_path)
+            helm_bin = _resolve_helm_binary()
+
+            if helm_bin:
+                st_p = subprocess.run(
+                    [helm_bin, "status", release, "-n", namespace, "-o", "json", "--kubeconfig", str(kc_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    env=env,
+                    check=False,
+                )
+                if st_p.returncode == 0 and st_p.stdout.strip():
+                    helm_status = json.loads(st_p.stdout)
+                    info_notes = ((helm_status or {}).get("info") or {}).get("notes")
+                    if info_notes and not notes:
+                        notes = info_notes
+                val_p = subprocess.run(
+                    [helm_bin, "get", "values", release, "-n", namespace, "--kubeconfig", str(kc_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    env=env,
+                    check=False,
+                )
+                if val_p.returncode == 0 and val_p.stdout.strip() and "null" not in val_p.stdout.strip().lower()[:6]:
+                    values_yaml = val_p.stdout.strip()
+
+            res_p = subprocess.run(
+                [
+                    "kubectl",
+                    "--kubeconfig",
+                    str(kc_path),
+                    "get",
+                    "pods,svc,ingress,events",
+                    "-n",
+                    namespace,
+                    "-o",
+                    "json",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=env,
+                check=False,
+            )
+            if res_p.returncode == 0 and res_p.stdout.strip():
+                items = (json.loads(res_p.stdout) or {}).get("items") or []
+                for it in items:
+                    kind = it.get("kind")
+                    if kind == "Pod":
+                        pods.append(_extract_pod_summary(it))
+                    elif kind == "Service":
+                        meta = it.get("metadata") or {}
+                        spec = it.get("spec") or {}
+                        status = it.get("status") or {}
+                        lb_ing = ((status.get("loadBalancer") or {}).get("ingress")) or []
+                        external_hosts = [
+                            x.get("hostname") or x.get("ip")
+                            for x in lb_ing
+                            if x.get("hostname") or x.get("ip")
+                        ]
+                        services.append({
+                            "name": meta.get("name"),
+                            "type": spec.get("type"),
+                            "clusterIP": spec.get("clusterIP"),
+                            "externalEndpoints": external_hosts,
+                            "ports": [
+                                f"{p.get('port')}/{p.get('protocol', 'TCP')}"
+                                + (f" -> {p.get('nodePort')}" if p.get("nodePort") else "")
+                                for p in (spec.get("ports") or [])
+                            ],
+                        })
+                    elif kind == "Ingress":
+                        meta = it.get("metadata") or {}
+                        spec = it.get("spec") or {}
+                        status = it.get("status") or {}
+                        hosts = [r.get("host") for r in (spec.get("rules") or []) if r.get("host")]
+                        lb_ing = ((status.get("loadBalancer") or {}).get("ingress")) or []
+                        addresses = [x.get("hostname") or x.get("ip") for x in lb_ing if x.get("hostname") or x.get("ip")]
+                        ingresses.append({
+                            "name": meta.get("name"),
+                            "className": spec.get("ingressClassName"),
+                            "hosts": hosts,
+                            "addresses": addresses,
+                            "tls": bool(spec.get("tls")),
+                        })
+                    elif kind == "Event":
+                        events.append(_format_k8s_event_item(it))
+                events.sort(key=lambda e: str(e.get("lastSeen") or ""), reverse=True)
+        except Exception as exc:
+            logger.warning(f"Community addon live inspection warning for {addon_id}: {exc}")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return {
+        "id": addon_id,
+        "releaseName": release,
+        "namespace": namespace,
+        "helmStatus": (helm_status or {}).get("info") or {},
+        "notes": notes,
+        "valuesYaml": values_yaml,
+        "presetValuesYaml": preset.get("presetValuesYaml") or "",
+        "accessHints": preset.get("accessHints") or [],
+        "logs": tracked.get("logs") or "",
+        "details": tracked.get("details") or "",
+        "updatedAt": tracked.get("updatedAt"),
+        "resources": {
+            "pods": pods,
+            "services": services,
+            "ingresses": ingresses,
+        },
+        "events": events[:50],
+    }
+
+
+@app.get("/clusters/{cluster_name}/community-addons/{addon_id}/details", dependencies=[Depends(require_auth_if_configured)])
+async def get_cluster_community_addon_details(
+    cluster_name: str,
+    addon_id: str,
+    account_id: Optional[str] = None,
+    x_user_email: str = Header(...),
+):
+    connection = await _resolve_account_connection(x_user_email, account_id)
+    return await asyncio.to_thread(_fetch_community_addon_details_sync, connection, x_user_email, cluster_name, addon_id)
+
+
+def _uninstall_community_addon_sync(
+    connection: Any,
+    user_email: str,
+    cluster_name: str,
+    addon_id: str,
+) -> Dict[str, Any]:
+    region = connection.region or "us-east-1"
+    cfg = _COMMUNITY_ADDON_REPOS.get(addon_id, {})
+    release = str(cfg.get("release") or addon_id)
+    namespace = str(cfg.get("namespace") or "kube-system")
+    helm_bin = _resolve_helm_binary()
+    if not helm_bin:
+        raise HTTPException(status_code=500, detail="Helm CLI is not installed on the backend host.")
+
+    eks = boto3.client(
+        "eks",
+        aws_access_key_id=connection.accessKey,
+        aws_secret_access_key=connection.secretKey,
+        region_name=region,
+        config=AWS_FAST_CFG,
+    )
+    cluster_info = eks.describe_cluster(name=cluster_name).get("cluster", {})
+    endpoint = cluster_info.get("endpoint")
+    ca_data = (cluster_info.get("certificateAuthority") or {}).get("data")
+    if not endpoint or not ca_data:
+        raise HTTPException(status_code=400, detail=f"Cluster '{cluster_name}' endpoint is not available.")
+
+    with _get_helm_lock(cluster_name, release):
+        tmpdir = tempfile.mkdtemp(prefix="tesserak_hu_")
+        try:
+            tmp_path = Path(tmpdir)
+            kc_path = tmp_path / "kubeconfig"
+            kc_path.write_text(build_eks_kubeconfig_yaml(cluster_name, endpoint, ca_data, region))
+            env = _isolated_helm_env(connection, kc_path, region, tmp_path)
+            proc = subprocess.run(
+                [helm_bin, "uninstall", release, "-n", namespace, "--kubeconfig", str(kc_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=env,
+                check=False,
+            )
+            out = (proc.stdout or proc.stderr or "").strip()
+            if proc.returncode != 0 and "not found" not in out.lower():
+                raise HTTPException(status_code=400, detail=out or f"Failed to uninstall {release}")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    wrapper = state_manager.get_cluster_state(user_email, cluster_name)
+    if wrapper:
+        base = dict(wrapper.get("state", wrapper))
+        remaining_comm = [
+            r for r in (base.get("communityAddons") or [])
+            if isinstance(r, dict) and r.get("id") != addon_id
+        ]
+        remaining_addons = [
+            a for a in (base.get("addons") or [])
+            if isinstance(a, dict) and a.get("id") != addon_id
+        ]
+        updated = state_data.record_state_change(
+            base,
+            "community_addon_uninstall",
+            {"communityAddons": remaining_comm, "addons": remaining_addons, "addonId": addon_id},
+        )
+        state_manager.save_cluster_state(user_email, cluster_name, updated)
+
+    return {
+        "status": "uninstalled",
+        "id": addon_id,
+        "releaseName": release,
+        "namespace": namespace,
+        "message": out or f'Uninstalled Helm release "{release}" from namespace "{namespace}".',
+    }
+
+
+@app.delete("/clusters/{cluster_name}/community-addons/{addon_id}", dependencies=[Depends(require_auth_if_configured)])
+async def uninstall_cluster_community_addon(
+    cluster_name: str,
+    addon_id: str,
+    account_id: Optional[str] = None,
+    x_user_email: str = Header(...),
+):
+    connection = await _resolve_account_connection(x_user_email, account_id)
+    return await asyncio.to_thread(_uninstall_community_addon_sync, connection, x_user_email, cluster_name, addon_id)
 
 @app.post("/api/connections/test", dependencies=[Depends(require_auth_if_configured)])
 async def test_connection(connection: ConnectionBase):

@@ -15,8 +15,8 @@ Tesserak is a full-stack Kubernetes and AWS cloud internal developer platform (I
 - **Background Reconciliation & Audit Retention (`/clusters`)**:
   - Polls live AWS EKS cluster state every 60 seconds, detects state drift (`Synced`, `Needs Sync`, `Missing / Deleted`), and triggers one-click state synchronization (`POST /clusters/{cluster_name}/sync`).
   - Retains deleted clusters for **7 days** (`DELETED_CLUSTER_RETENTION_DAYS = 7`) for audit history before pruning.
-- **Cluster Deep Inspection (`/clusters/:clusterName`, `NodeDetailsDialog`)**:
-  - Inspects VPC/networking, access mode, nodegroups (create, scale, delete), merged EC2 + Kubernetes nodes, and running pods via `kubectl get nodes,pods -A -o json`, with a paginated node-level pod inspector (`NodeDetailsDialog`).
+- **Cluster Deep Inspection (`/clusters/:clusterName`, `NodeDetailsDialog`, `NodeGroupDetailsDialog`, `PodDetailsDialog`, `AddOnDetailsDialog`)**:
+  - Inspects VPC/networking, access mode, nodegroups (create, scale, delete, clickable 8-tab inspector), merged EC2 + Kubernetes nodes (`NodeDetailsDialog`), live running pods with auto-refreshing `5s` Kubernetes events and Restart/Delete actions (`PodDetailsDialog`), and AWS EKS / Helm community add-ons (`AddOnDetailsDialog` with execution logs, domain/access guides, custom `values.yaml` overrides, and Helm uninstall).
 
 ### 2. Multi-Account Connector Scoping & Hybrid AWS Catalog Caching
 - **Strict Account Scoping (`backend/connections.py`)**: Account-scoped AWS endpoints (`/api/aws/regions/{account_id}`, `/vpcs`, `/zones`, `/subnets`, `POST /api/vpc`, and `/clusters*`) resolve the authenticated user's specific AWS connector matching `account_id`.
@@ -77,7 +77,8 @@ tesserak/
         │                        # Settings, Profile (+ legacy route alias pages)
         ├── components/          # Reusable UI primitives & feature modules
         │   ├── Auth/            # AuthPage
-        │   ├── Clusters/        # NodeDetailsDialog
+        │   ├── Clusters/        # NodeDetailsDialog, NodeGroupDetailsDialog,
+        │   │                    # PodDetailsDialog, AddOnDetailsDialog
         │   ├── Connectors/      # ConnectorForm, ConnectorList
         │   └── CreateCluster/   # ClusterBasicDetails, ClusterEnvironment, ClusterAddons,
         │                        # ClusterPreview, InstanceTypeSelect, NumericCountField
@@ -173,7 +174,8 @@ CI=true npm test -- --watchAll=false
 | `POST /api/connections` / `GET /api/connections` / `POST /api/connections/test` / `DELETE /api/connections/{connection_id}` | Manage and test AWS IAM connectors |
 | `GET /clusters` / `POST /clusters` / `GET /clusters/{cluster_name}` / `POST /clusters/{cluster_name}/sync` / `DELETE /clusters/{cluster_name}` | EKS cluster CRUD, reconciliation, and 7-day soft-delete audit list |
 | `POST /clusters/{cluster_name}/nodegroups` / `PATCH /clusters/{cluster_name}/nodegroups/{nodegroup_name}` / `DELETE /clusters/{cluster_name}/nodegroups/{nodegroup_name}` | Managed node group creation, scaling, and deletion |
-| `POST /clusters/{cluster_name}/pods/{namespace}/{pod_name}/restart` / `DELETE /clusters/{cluster_name}/pods/{namespace}/{pod_name}` | Restart or delete a live Kubernetes pod in an EKS cluster |
+| `POST /clusters/{cluster_name}/pods/{namespace}/{pod_name}/restart` / `DELETE /clusters/{cluster_name}/pods/{namespace}/{pod_name}` / `GET /clusters/{cluster_name}/pods/{namespace}/{pod_name}/events` | Restart, delete, or stream live Kubernetes events for a pod in an EKS cluster |
+| `POST /clusters/{cluster_name}/community-addons` / `GET /clusters/{cluster_name}/community-addons/{addon_id}/details` / `DELETE /clusters/{cluster_name}/community-addons/{addon_id}` | Install, inspect logs/events/values/ingress endpoints, or uninstall Helm community add-ons |
 | `GET /api/resources` / `POST /api/resources` / `DELETE /api/resources/{id}` / `POST /api/resources/{id}/drift-check` | Live AWS resource discovery, provisioning, and drift remediation |
 | `GET /api/guardrails*` / `POST /api/approvals/{id}/decision` | Policy guardrails & approval queue |
 | `GET /api/pipelines` / `POST /api/pipelines` / `POST /api/pipelines/{id}/trigger` / `DELETE /api/pipelines/{id}` | GitOps pipeline CRUD, execution, and cluster cleanup |

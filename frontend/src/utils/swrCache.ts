@@ -34,19 +34,23 @@ export function writeSwrCache<T>(userEmail: string, key: string, data: T): void 
 
 export function clearSwrCache(): void {
   cacheStore.clear();
+  inflightRequests.clear();
 }
 
 export function invalidateSwrCache(userEmail?: string, keyPrefix?: string): void {
   if (!userEmail && !keyPrefix) {
     cacheStore.clear();
+    inflightRequests.clear();
     return;
   }
   const emailPrefix = userEmail ? `${userEmail.trim().toLowerCase()}::` : '';
-  for (const fullKey of Array.from(cacheStore.keys())) {
-    if (emailPrefix && !fullKey.startsWith(emailPrefix)) continue;
-    const rawKey = emailPrefix ? fullKey.slice(emailPrefix.length) : fullKey.split('::')[1] || fullKey;
-    if (!keyPrefix || rawKey.startsWith(keyPrefix)) {
-      cacheStore.delete(fullKey);
+  for (const store of [cacheStore, inflightRequests]) {
+    for (const fullKey of Array.from(store.keys())) {
+      if (emailPrefix && !fullKey.startsWith(emailPrefix)) continue;
+      const rawKey = emailPrefix ? fullKey.slice(emailPrefix.length) : fullKey.split('::')[1] || fullKey;
+      if (!keyPrefix || rawKey.startsWith(keyPrefix)) {
+        store.delete(fullKey);
+      }
     }
   }
 }

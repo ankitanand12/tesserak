@@ -68,6 +68,11 @@ import {
   isClusterSubnetPublic,
 } from '../components/Clusters/NodeGroupDetailsDialog';
 import { PodDetailsDialog } from '../components/Clusters/PodDetailsDialog';
+import {
+  AddOnDetailsDialog,
+  AwsClusterAddon,
+  CommunityClusterAddon,
+} from '../components/Clusters/AddOnDetailsDialog';
 import { ConfirmDeleteDialog } from '../components/ConfirmDeleteDialog';
 import { EKS_AMI_TYPES } from '../components/CreateCluster/ClusterEnvironment';
 import { InstanceTypeSelect } from '../components/CreateCluster/InstanceTypeSelect';
@@ -124,25 +129,8 @@ interface ClusterDetailResponse {
     podExecutionRoleArn?: string;
     selectors?: Array<{ namespace?: string }>;
   }>;
-  addons: Array<{
-    addonName: string;
-    addonVersion?: string;
-    status?: string;
-    serviceAccountRoleArn?: string;
-    health?: { issues?: Array<{ code?: string; message?: string }> };
-  }>;
-  communityAddons?: Array<{
-    id: string;
-    name: string;
-    releaseName?: string;
-    namespace?: string;
-    chart?: string;
-    version?: string;
-    requestedVersion?: string;
-    status: string;
-    source?: string;
-    details?: string;
-  }>;
+  addons: AwsClusterAddon[];
+  communityAddons?: CommunityClusterAddon[];
   updateHistory: Array<{
     id: string;
     type?: string;
@@ -265,7 +253,9 @@ export const ClusterDetails: React.FC = () => {
     pod: ClusterPod;
   } | null>(null);
   const [podActionSubmitting, setPodActionSubmitting] = useState(false);
-  const [installingAddonId, setInstallingAddonId] = useState<string | null>(null);
+  const [installingAddonIds, setInstallingAddonIds] = useState<Record<string, boolean>>({});
+  const [selectedAwsAddon, setSelectedAwsAddon] = useState<AwsClusterAddon | null>(null);
+  const [selectedCommunityAddon, setSelectedCommunityAddon] = useState<CommunityClusterAddon | null>(null);
   const [podSearch, setPodSearch] = useState('');
 
   const loadDetails = useCallback(
@@ -524,8 +514,13 @@ export const ClusterDetails: React.FC = () => {
     }
   };
 
-  const handleInstallCommunityAddon = async (addonId: string, name: string, version?: string) => {
-    setInstallingAddonId(addonId);
+  const handleInstallCommunityAddon = async (
+    addonId: string,
+    name: string,
+    version?: string,
+    valuesYaml?: string
+  ) => {
+    setInstallingAddonIds((prev) => ({ ...prev, [addonId]: true }));
     setError('');
     setNotice('');
     try {
@@ -535,7 +530,12 @@ export const ClusterDetails: React.FC = () => {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-user-email': userEmail },
-          body: JSON.stringify({ addonId, name, version }),
+          body: JSON.stringify({
+            addonId,
+            name,
+            version,
+            ...(valuesYaml !== undefined ? { valuesYaml } : {}),
+          }),
         }
       );
       const data = await res.json().catch(() => ({}));
@@ -546,9 +546,41 @@ export const ClusterDetails: React.FC = () => {
       invalidateSwrCache(userEmail, cacheKey);
       await loadDetails(true);
     } catch (err: any) {
-      setError(err?.message || `Unable to install ${name}`);
+      const msg = err?.message || `Unable to install ${name}`;
+      invalidateSwrCache(userEmail, cacheKey);
+      await loadDetails(true).catch(() => {});
+      setError(msg);
     } finally {
-      setInstallingAddonId(null);
+      setInstallingAddonIds((prev) => ({ ...prev, [addonId]: false }));
+    }
+  };
+
+  const handleUninstallCommunityAddon = async (addonId: string, name: string) => {
+    setInstallingAddonIds((prev) => ({ ...prev, [addonId]: true }));
+    setError('');
+    setNotice('');
+    try {
+      const qs = detail?.accountId ? `?account_id=${encodeURIComponent(detail.accountId)}` : '';
+      const res = await fetch(
+        `http://localhost:8000/clusters/${encodeURIComponent(decodedName)}/community-addons/${encodeURIComponent(addonId)}${qs}`,
+        {
+          method: 'DELETE',
+          headers: { 'x-user-email': userEmail },
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `Failed to uninstall ${name}`);
+      }
+      setNotice(`Uninstalled community add-on "${name}" via Helm.`);
+      setSelectedCommunityAddon(null);
+      invalidateSwrCache(userEmail, cacheKey);
+      await loadDetails(true);
+    } catch (err: any) {
+      const msg = err?.message || `Unable to uninstall ${name}`;
+      setError(msg);
+    } finally {
+      setInstallingAddonIds((prev) => ({ ...prev, [addonId]: false }));
     }
   };
 
@@ -566,6 +598,13 @@ export const ClusterDetails: React.FC = () => {
   const c = detail?.cluster;
   const tagEntries = Object.entries(detail?.tags || {});
   const loggingEntries = c?.logging || [];
+  const activeSelectedAwsAddon = selectedAwsAddon
+    ? (detail?.addons || []).find((ad) => ad.addonName === selectedAwsAddon.addonName) || selectedAwsAddon
+    : null;
+  const activeSelectedCommunityAddon = selectedCommunityAddon
+    ? (detail?.communityAddons || []).find((ca) => ca.id === selectedCommunityAddon.id) ||
+      selectedCommunityAddon
+    : null;
 
   return (
     <Box
@@ -1263,8 +1302,11 @@ export const ClusterDetails: React.FC = () => {
               <Divider />
 
               <Box>
-                <Typography variant="subtitle1" sx={{ fontWeight: 700, mb: 1.5, color: '#09090b' }}>
+                <Typography variant="subtitle1" sx={{ fontWeight: 700, mb: 0.5, color: '#09090b' }}>
                   Installed AWS EKS Add-ons ({detail?.addons.length || 0})
+                </Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+                  Click any AWS add-on name to inspect configuration values, ARN details, health issues, and related pods.
                 </Typography>
                 {detail?.addons && detail.addons.length > 0 ? (
                   <TableContainer component={Paper} variant="outlined">
@@ -1279,11 +1321,26 @@ export const ClusterDetails: React.FC = () => {
                       </TableHead>
                       <TableBody>
                         {detail.addons.map((ad) => (
-                          <TableRow key={ad.addonName}>
+                          <TableRow key={ad.addonName} hover>
                             <TableCell sx={{ fontWeight: 700 }}>
                               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                                 <AddonIcon fontSize="small" color="primary" />
-                                {ad.addonName}
+                                <Button
+                                  variant="text"
+                                  size="small"
+                                  onClick={() => setSelectedAwsAddon(ad)}
+                                  sx={{
+                                    p: 0,
+                                    minWidth: 0,
+                                    textTransform: 'none',
+                                    fontWeight: 700,
+                                    color: '#2563eb',
+                                    justifyContent: 'flex-start',
+                                    textAlign: 'left',
+                                  }}
+                                >
+                                  {ad.addonName}
+                                </Button>
                               </Box>
                             </TableCell>
                             <TableCell sx={{ fontFamily: 'monospace' }}>{ad.addonVersion || '—'}</TableCell>
@@ -1318,7 +1375,7 @@ export const ClusterDetails: React.FC = () => {
                   Community / Helm Add-ons ({detail?.communityAddons?.length || 0})
                 </Typography>
                 <Typography variant="caption" sx={{ color: '#64748b', display: 'block', mb: 1.5 }}>
-                  Open-source controllers &amp; Helm releases (Ingress NGINX, Cert Manager, External DNS, Argo CD, Metrics Server, Reloader, Cluster Autoscaler)
+                  Click any add-on name to inspect live Helm status, install logs, namespace pods/events, domain access setup, or custom values.yaml overrides.
                 </Typography>
                 {detail?.communityAddons && detail.communityAddons.length > 0 ? (
                   <TableContainer component={Paper} variant="outlined">
@@ -1336,10 +1393,27 @@ export const ClusterDetails: React.FC = () => {
                       <TableBody>
                         {detail.communityAddons.map((ca) => {
                           const isDeployed = ['DEPLOYED', 'INSTALLED', 'SUCCESS'].includes(ca.status.toUpperCase());
-                          const isInstalling = installingAddonId === ca.id;
+                          const isInstalling = Boolean(installingAddonIds[ca.id]);
                           return (
-                            <TableRow key={`${ca.id}-${ca.namespace || 'ns'}`}>
-                              <TableCell sx={{ fontWeight: 700 }}>{ca.name || ca.id}</TableCell>
+                            <TableRow key={`${ca.id}-${ca.namespace || 'ns'}`} hover>
+                              <TableCell sx={{ fontWeight: 700 }}>
+                                <Button
+                                  variant="text"
+                                  size="small"
+                                  onClick={() => setSelectedCommunityAddon(ca)}
+                                  sx={{
+                                    p: 0,
+                                    minWidth: 0,
+                                    textTransform: 'none',
+                                    fontWeight: 700,
+                                    color: '#2563eb',
+                                    justifyContent: 'flex-start',
+                                    textAlign: 'left',
+                                  }}
+                                >
+                                  {ca.name || ca.id}
+                                </Button>
+                              </TableCell>
                               <TableCell sx={{ fontFamily: 'monospace' }}>{ca.namespace || '—'}</TableCell>
                               <TableCell sx={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>
                                 {ca.chart ? `${ca.chart} · ` : ''}
@@ -1975,6 +2049,9 @@ export const ClusterDetails: React.FC = () => {
       {/* Clickable AWS EKS Pod Details Dialog */}
       <PodDetailsDialog
         pod={selectedPod}
+        clusterName={decodedName}
+        accountId={detail?.accountId}
+        userEmail={userEmail}
         readOnly={Boolean(detail?.awsMissing)}
         actionPending={podActionSubmitting}
         onClose={() => setSelectedPod(null)}
@@ -1990,6 +2067,32 @@ export const ClusterDetails: React.FC = () => {
             setSelectedNode(matched);
           }
         }}
+      />
+
+      {/* Clickable AWS & Community Add-on Details Dialog */}
+      <AddOnDetailsDialog
+        clusterName={decodedName}
+        accountId={detail?.accountId}
+        userEmail={userEmail}
+        awsAddon={activeSelectedAwsAddon}
+        communityAddon={activeSelectedCommunityAddon}
+        pods={detail?.pods || []}
+        isClusterActive={detail?.status === 'ACTIVE'}
+        readOnly={Boolean(detail?.awsMissing)}
+        installing={Boolean(
+          activeSelectedCommunityAddon && installingAddonIds[activeSelectedCommunityAddon.id]
+        )}
+        onClose={() => {
+          setSelectedAwsAddon(null);
+          setSelectedCommunityAddon(null);
+        }}
+        onSelectPod={(pod) => {
+          setSelectedAwsAddon(null);
+          setSelectedCommunityAddon(null);
+          setSelectedPod(pod);
+        }}
+        onInstallCommunityAddon={handleInstallCommunityAddon}
+        onUninstallCommunityAddon={handleUninstallCommunityAddon}
       />
 
       {/* Confirm Pod Delete */}

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   Accordion,
   AccordionDetails,
@@ -7,6 +7,7 @@ import {
   Box,
   Button,
   Chip,
+  CircularProgress,
   Dialog,
   DialogActions,
   DialogContent,
@@ -31,6 +32,7 @@ import {
   ContentCopy as CopyIcon,
   DeleteOutline as DeleteIcon,
   ExpandMore as ExpandMoreIcon,
+  Refresh as RefreshIcon,
   RestartAlt as RestartIcon,
 } from '@mui/icons-material';
 import {
@@ -40,8 +42,21 @@ import {
   getPodStatusChipColor,
 } from './NodeDetailsDialog';
 
+export interface PodEventItem {
+  type?: string;
+  reason?: string;
+  message?: string;
+  count?: number;
+  source?: string;
+  firstSeen?: string;
+  lastSeen?: string;
+}
+
 interface PodDetailsDialogProps {
   pod: ClusterPod | null;
+  clusterName?: string;
+  accountId?: string;
+  userEmail?: string;
   readOnly?: boolean;
   actionPending?: boolean;
   onClose: () => void;
@@ -206,6 +221,9 @@ const ContainerAccordion: React.FC<{ container: ClusterPodContainer }> = ({ cont
 
 export const PodDetailsDialog: React.FC<PodDetailsDialogProps> = ({
   pod,
+  clusterName,
+  accountId,
+  userEmail,
   readOnly = false,
   actionPending = false,
   onClose,
@@ -215,6 +233,55 @@ export const PodDetailsDialog: React.FC<PodDetailsDialogProps> = ({
 }) => {
   const [viewMode, setViewMode] = useState<'structured' | 'raw'>('structured');
   const [copiedRaw, setCopiedRaw] = useState(false);
+  const [events, setEvents] = useState<PodEventItem[]>([]);
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const [eventsWarning, setEventsWarning] = useState('');
+
+  const fetchEvents = useCallback(
+    async (silent: boolean = false) => {
+      if (!clusterName || !pod?.namespace || !pod?.name) return;
+      if (!silent) {
+        setEventsLoading(true);
+      }
+      try {
+        const qs = accountId ? `?account_id=${encodeURIComponent(accountId)}` : '';
+        const res = await fetch(
+          `http://localhost:8000/clusters/${encodeURIComponent(clusterName)}/pods/${encodeURIComponent(
+            pod.namespace
+          )}/${encodeURIComponent(pod.name)}/events${qs}`,
+          {
+            headers: userEmail ? { 'x-user-email': userEmail } : {},
+          }
+        );
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.detail || 'Unable to fetch pod events');
+        }
+        setEvents(Array.isArray(data.events) ? data.events : []);
+        setEventsWarning(data.warning || '');
+      } catch (err: any) {
+        setEventsWarning(err?.message || 'Unable to fetch live pod events');
+      } finally {
+        if (!silent) {
+          setEventsLoading(false);
+        }
+      }
+    },
+    [clusterName, pod?.namespace, pod?.name, accountId, userEmail]
+  );
+
+  useEffect(() => {
+    if (!pod || !clusterName) {
+      setEvents([]);
+      setEventsWarning('');
+      return;
+    }
+    fetchEvents(false);
+    const intervalId = window.setInterval(() => {
+      fetchEvents(true);
+    }, 5000);
+    return () => window.clearInterval(intervalId);
+  }, [pod, clusterName, fetchEvents]);
 
   if (!pod) return null;
 
@@ -484,6 +551,105 @@ export const PodDetailsDialog: React.FC<PodDetailsDialogProps> = ({
                 </TableContainer>
               ) : (
                 <Alert severity="info">No pod conditions reported.</Alert>
+              )}
+            </Box>
+
+            {/* Live Kubernetes Pod Events */}
+            <Box>
+              <Box
+                sx={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: 1,
+                  mb: 1,
+                }}
+              >
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+                  <Typography variant="subtitle2" sx={{ fontWeight: 800, color: '#09090b' }}>
+                    Events ({events.length})
+                  </Typography>
+                  {clusterName && (
+                    <Chip
+                      size="small"
+                      label="Live · Auto-refresh 5s"
+                      color="primary"
+                      variant="outlined"
+                      sx={{ fontWeight: 600 }}
+                    />
+                  )}
+                </Box>
+                {clusterName && (
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    startIcon={eventsLoading ? <CircularProgress size={14} /> : <RefreshIcon fontSize="small" />}
+                    onClick={() => fetchEvents(false)}
+                    disabled={eventsLoading}
+                    sx={{ textTransform: 'none', fontWeight: 600 }}
+                  >
+                    Refresh Events
+                  </Button>
+                )}
+              </Box>
+              {eventsWarning && (
+                <Alert severity="warning" sx={{ mb: 1.25 }}>
+                  {eventsWarning}
+                </Alert>
+              )}
+              {eventsLoading && events.length === 0 ? (
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.25, py: 2 }}>
+                  <CircularProgress size={18} />
+                  <Typography variant="body2" color="text.secondary">
+                    Fetching live Kubernetes pod events...
+                  </Typography>
+                </Box>
+              ) : events.length > 0 ? (
+                <TableContainer component={Paper} variant="outlined" sx={{ maxHeight: 280 }}>
+                  <Table size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow sx={{ bgcolor: '#f8fafc' }}>
+                        <TableCell><strong>Type</strong></TableCell>
+                        <TableCell><strong>Reason</strong></TableCell>
+                        <TableCell><strong>Count</strong></TableCell>
+                        <TableCell><strong>Source</strong></TableCell>
+                        <TableCell><strong>Message</strong></TableCell>
+                        <TableCell><strong>Last Seen</strong></TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {events.map((ev, idx) => (
+                        <TableRow key={`${ev.reason || 'event'}-${ev.lastSeen || idx}-${idx}`}>
+                          <TableCell>
+                            <Chip
+                              size="small"
+                              label={ev.type || 'Normal'}
+                              color={ev.type === 'Warning' ? 'warning' : 'default'}
+                            />
+                          </TableCell>
+                          <TableCell sx={{ fontWeight: 700, fontFamily: 'monospace' }}>
+                            {ev.reason || '—'}
+                          </TableCell>
+                          <TableCell>{ev.count ?? 1}</TableCell>
+                          <TableCell sx={{ fontFamily: 'monospace', fontSize: '0.78rem' }}>
+                            {ev.source || '—'}
+                          </TableCell>
+                          <TableCell sx={{ minWidth: 260 }}>{ev.message || '—'}</TableCell>
+                          <TableCell sx={{ whiteSpace: 'nowrap' }}>
+                            {formatClusterDateTime(ev.lastSeen || ev.firstSeen)}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              ) : (
+                <Alert severity="info">
+                  {clusterName
+                    ? 'No recent Kubernetes events found for this pod yet (auto-refreshing every 5s).'
+                    : 'Live events require cluster context.'}
+                </Alert>
               )}
             </Box>
 

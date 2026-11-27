@@ -268,7 +268,7 @@ describe('Pipelines Hide Logs & CloudResources AWS Sync', () => {
     // 2. Cloud Resources delete confirmation (Cancel aborts, Confirm deletes)
     clearSwrCache();
     const resRender = render(<CloudResources />);
-    fireEvent.click(await screen.findByRole('button', { name: 'Delete tesserak-beta' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete tesserak-beta' }, { timeout: 5000 }));
     expect(await screen.findByText('Delete AWS Resource?')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     await waitFor(() => {

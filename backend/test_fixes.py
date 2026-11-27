@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import unittest
@@ -578,6 +579,10 @@ class RegressionFixesTest(unittest.TestCase):
 
         def fake_helm_run(cmd, capture_output=True, text=True, timeout=180, env=None, check=False):
             helm_calls.append((cmd, env))
+            if len(cmd) >= 2 and cmd[1] == "status":
+                return SimpleNamespace(returncode=1, stdout="", stderr="release: not found")
+            if len(cmd) >= 3 and cmd[1] == "get" and cmd[2] == "notes":
+                return SimpleNamespace(returncode=0, stdout="Ingress NGINX Ready", stderr="")
             return SimpleNamespace(returncode=0, stdout='Release "ingress-nginx" has been upgraded.', stderr="")
 
         with patch.object(backend_main, "_resolve_helm_binary", return_value="/opt/homebrew/bin/helm"), patch.object(
@@ -593,8 +598,161 @@ class RegressionFixesTest(unittest.TestCase):
             self.assertEqual(install_res["status"], "installed")
             self.assertEqual(install_res["namespace"], "ingress-nginx")
             self.assertEqual(helm_calls[0][0][:3], ["/opt/homebrew/bin/helm", "repo", "add"])
-            self.assertEqual(helm_calls[2][0][:4], ["/opt/homebrew/bin/helm", "upgrade", "--install", "ingress-nginx"])
-            self.assertIn("HELM_CACHE_HOME", helm_calls[2][1])
+            upgrade_call = next(c for c in helm_calls if len(c[0]) > 1 and c[0][1] == "upgrade")
+            self.assertEqual(upgrade_call[0][:4], ["/opt/homebrew/bin/helm", "upgrade", "--install", "ingress-nginx"])
+            self.assertIn("HELM_CACHE_HOME", upgrade_call[1])
+
+    def test_cpa_target_custom_values_and_pending_helm_recovery(self):
+        fake_conn = SimpleNamespace(accessKey="AKIA1", secretKey="SEC1", region="us-east-1", accountId="111122223333")
+        cluster_info = {"endpoint": "https://eks.example.com", "certificateAuthority": {"data": "Q0E="}}
+
+        # 1. Cluster Proportional Autoscaler includes default options.target=deployment/coredns
+        cpa_addon = backend_main.AddonModel(
+            id="cluster-proportional-autoscaler",
+            name="Cluster Proportional Autoscaler",
+            type="community",
+        )
+        cpa_cmds = []
+
+        def fake_cpa_run(cmd, capture_output=True, text=True, timeout=180, env=None, check=False):
+            cpa_cmds.append(cmd)
+            if len(cmd) >= 2 and cmd[1] == "status":
+                return SimpleNamespace(returncode=1, stdout="", stderr="release: not found")
+            if len(cmd) >= 3 and cmd[1] == "get" and cmd[2] == "notes":
+                return SimpleNamespace(returncode=0, stdout="CPA Notes", stderr="")
+            return SimpleNamespace(returncode=0, stdout="Release \"cluster-proportional-autoscaler\" deployed", stderr="")
+
+        with patch.object(backend_main, "_resolve_helm_binary", return_value="/opt/homebrew/bin/helm"), patch.object(
+            backend_main.subprocess, "run", side_effect=fake_cpa_run
+        ):
+            res = backend_main._install_community_addon_sync(
+                fake_conn, "us-east-1", "tesserak", cpa_addon, cluster_info=cluster_info
+            )
+            self.assertEqual(res["status"], "installed")
+            upgrade_cmd = next(c for c in cpa_cmds if "upgrade" in c)
+            self.assertIn("options.target=deployment/coredns", upgrade_cmd)
+            self.assertEqual(res["notes"], "CPA Notes")
+
+        # 2. Custom values.yaml + recovery from stuck pending-install release
+        argo_addon = backend_main.AddonModel(
+            id="argo-cd",
+            name="Argo CD",
+            type="community",
+            valuesYaml="server:\n  ingress:\n    enabled: true\n",
+        )
+        argo_cmds = []
+        captured_values = []
+
+        def fake_argo_run(cmd, capture_output=True, text=True, timeout=180, env=None, check=False):
+            argo_cmds.append(cmd)
+            if len(cmd) >= 2 and cmd[1] == "status":
+                return SimpleNamespace(returncode=0, stdout='{"info": {"status": "pending-install"}}', stderr="")
+            if len(cmd) >= 2 and cmd[1] == "uninstall":
+                return SimpleNamespace(returncode=0, stdout="release uninstalled", stderr="")
+            if "--values" in cmd:
+                val_path = cmd[cmd.index("--values") + 1]
+                with open(val_path, "r") as fh:
+                    captured_values.append(fh.read())
+            if len(cmd) >= 3 and cmd[1] == "get" and cmd[2] == "notes":
+                return SimpleNamespace(returncode=0, stdout="Argo CD URL ready", stderr="")
+            return SimpleNamespace(returncode=0, stdout="Release \"argocd\" deployed", stderr="")
+
+        with patch.object(backend_main, "_resolve_helm_binary", return_value="/opt/homebrew/bin/helm"), patch.object(
+            backend_main.subprocess, "run", side_effect=fake_argo_run
+        ):
+            res2 = backend_main._install_community_addon_sync(
+                fake_conn, "us-east-1", "tesserak", argo_addon, cluster_info=cluster_info
+            )
+            self.assertEqual(res2["status"], "installed")
+            self.assertTrue(any("uninstall" in c for c in argo_cmds))
+            self.assertEqual(len(captured_values), 1)
+            self.assertIn("enabled: true", captured_values[0])
+            self.assertIn("Custom values.yaml", res2["logs"]) if "Custom" in res2["logs"] else self.assertIn("custom values", res2["logs"])
+
+    def test_fetch_pod_events_sync_and_uninstall_addon(self):
+        fake_conn = SimpleNamespace(accessKey="AKIA1", secretKey="SEC1", region="us-east-1", accountId="111122223333")
+        fake_eks = MagicMock()
+        fake_eks.describe_cluster.return_value = {
+            "cluster": {
+                "name": "tesserak",
+                "status": "ACTIVE",
+                "endpoint": "https://eks.example.com",
+                "certificateAuthority": {"data": "Q0E="},
+            }
+        }
+
+        events_payload = {
+            "items": [
+                {
+                    "type": "Normal",
+                    "reason": "Scheduled",
+                    "message": "Successfully assigned default/pod-1 to node-1",
+                    "count": 1,
+                    "source": {"component": "default-scheduler"},
+                    "involvedObject": {"kind": "Pod", "name": "pod-1"},
+                    "lastTimestamp": "2026-11-27T10:00:00Z",
+                },
+                {
+                    "type": "Warning",
+                    "reason": "BackOff",
+                    "message": "Back-off restarting failed container",
+                    "count": 3,
+                    "source": {"component": "kubelet", "host": "node-1"},
+                    "involvedObject": {"kind": "Pod", "name": "pod-1"},
+                    "lastTimestamp": "2026-11-27T10:05:00Z",
+                },
+            ]
+        }
+        pod_payload = {
+            "metadata": {"name": "pod-1", "namespace": "default"},
+            "status": {"phase": "Running", "containerStatuses": []},
+            "spec": {"containers": [{"name": "app", "image": "nginx:latest"}]},
+        }
+
+        def fake_kubectl_run(cmd, capture_output=True, text=True, timeout=15, env=None, check=False):
+            if "events" in cmd:
+                return SimpleNamespace(returncode=0, stdout=json.dumps(events_payload), stderr="")
+            if "pod" in cmd:
+                return SimpleNamespace(returncode=0, stdout=json.dumps(pod_payload), stderr="")
+            if "uninstall" in cmd:
+                return SimpleNamespace(returncode=0, stdout='release "argocd" uninstalled', stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(backend_main.boto3, "client", return_value=fake_eks), patch.object(
+            backend_main.subprocess, "run", side_effect=fake_kubectl_run
+        ):
+            ev_res = backend_main._fetch_pod_events_sync(fake_conn, "tesserak", "default", "pod-1")
+            self.assertEqual(len(ev_res["events"]), 2)
+            self.assertEqual(ev_res["events"][0]["reason"], "BackOff")
+            self.assertEqual(ev_res["events"][0]["count"], 3)
+            self.assertEqual(ev_res["pod"]["name"], "pod-1")
+
+        stored_wrapper = {
+            "state": {
+                "name": "tesserak",
+                "communityAddons": [
+                    {"id": "argo-cd", "releaseName": "argocd", "namespace": "argocd", "status": "installed"},
+                    {"id": "metrics-server", "releaseName": "metrics-server", "namespace": "kube-system", "status": "installed"},
+                ],
+                "addons": [
+                    {"id": "argo-cd", "type": "community"},
+                    {"id": "vpc-cni", "type": "aws"},
+                ],
+            }
+        }
+        saved_states = []
+        with patch.object(backend_main.boto3, "client", return_value=fake_eks), patch.object(
+            backend_main, "_resolve_helm_binary", return_value="/opt/homebrew/bin/helm"
+        ), patch.object(backend_main.subprocess, "run", side_effect=fake_kubectl_run), patch.object(
+            backend_main.state_manager, "get_cluster_state", return_value=stored_wrapper
+        ), patch.object(
+            backend_main.state_manager, "save_cluster_state", side_effect=lambda email, cname, st: saved_states.append(st)
+        ):
+            un_res = backend_main._uninstall_community_addon_sync(fake_conn, "user@tesserak.dev", "tesserak", "argo-cd")
+            self.assertEqual(un_res["status"], "uninstalled")
+            self.assertEqual(len(saved_states), 1)
+            self.assertEqual([a["id"] for a in saved_states[0]["communityAddons"]], ["metrics-server"])
+            self.assertEqual([a["id"] for a in saved_states[0]["addons"]], ["vpc-cni"])
 
 
 if __name__ == "__main__":

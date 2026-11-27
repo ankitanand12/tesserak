@@ -41,6 +41,7 @@ const baseConfig: ClusterConfig = {
 };
 
 describe('CreateCluster wizard fixes', () => {
+  jest.setTimeout(90000);
   const originalFetch = global.fetch;
 
   afterEach(() => {

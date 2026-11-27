@@ -85,10 +85,11 @@ This document captures the current architecture, design decisions, database sche
 - `ClusterAddons.tsx` & `ClusterPreview.tsx`: Dynamic add-on version matrix and launch preview.
 
 ### Shared Safety & Utilities
-- `ConfirmDeleteDialog.tsx`: Shared destructive confirmation dialog used across deletions (clusters, node groups, pods, pipelines, resources, integrations, connectors).
+- `ConfirmDeleteDialog.tsx`: Shared destructive confirmation dialog used across deletions (clusters, node groups, pods, Helm add-ons, pipelines, resources, integrations, connectors).
+- `Clusters/AddOnDetailsDialog.tsx`: Clickable AWS EKS & Community/Helm add-on inspector modal (`Overview & Access` domain/Ingress/Service endpoints & notes, `Install Logs & Events`, `Custom Values (values.yaml)` editor with recommended presets, and confirmation-guarded Helm uninstall via `GET/DELETE /clusters/{cluster_name}/community-addons/{addon_id}`).
 - `Clusters/NodeDetailsDialog.tsx`: Node detail inspector with paginated pod list (`10` pods per page) and clickable pod rows.
 - `Clusters/NodeGroupDetailsDialog.tsx`: AWS EKS node group inspector modal (configuration summary banner + 8 tabs covering Details, Nodes, Health issues, Labels, Update config, Taints, Update history, and Tags) plus Public/Private subnet labeling.
-- `Clusters/PodDetailsDialog.tsx`: Kubernetes pod inspector (Structured/Raw view, expandable Containers/Init Containers, Conditions, Volumes, Labels, and confirmation-guarded Restart/Delete Pod actions via `POST/DELETE /clusters/{cluster_name}/pods/{namespace}/{pod_name}`).
+- `Clusters/PodDetailsDialog.tsx`: Kubernetes pod inspector (Structured/Raw view, expandable Containers/Init Containers, Conditions, auto-refreshing `5s` live Events via `GET /clusters/{cluster_name}/pods/{namespace}/{pod_name}/events`, Volumes, Labels, and confirmation-guarded Restart/Delete Pod actions via `POST/DELETE /clusters/{cluster_name}/pods/{namespace}/{pod_name}`).
 - `auth/AuthContext.tsx`: Preserves Auth0/Google SSO `picture` URLs across PostgreSQL profile hydration (`tesserak-profile-updated` event sync + DB backfill).
 - `utils/`: `swrCache.ts` (stale-while-revalidate client caching), `dateUtils.ts`, `imageUtils.ts`, `regionMapping.ts`.
 - `types/`: `cluster.ts`, `platform.ts`, `user.ts`.
