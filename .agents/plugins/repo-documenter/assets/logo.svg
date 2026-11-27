@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none">
+  <title>Repo Documenter</title>
+  <!-- Document base with ~10% outer margin -->
+  <path d="M24 18C24 14.6863 26.6863 12 30 12H76L104 40V108C104 111.314 101.314 114 98 114H30C26.6863 114 24 111.314 24 108V18Z" fill="#1E293B" stroke="#60A5FA" stroke-width="4" stroke-linejoin="round"/>
+  <!-- Folded corner -->
+  <path d="M76 12V34C76 37.3137 78.6863 40 82 40H104" fill="#334155" stroke="#60A5FA" stroke-width="4" stroke-linejoin="round"/>
+  <!-- Git branch / commit line on left -->
+  <line x1="42" y1="38" x2="42" y2="88" stroke="#38BDF8" stroke-width="4" stroke-linecap="round"/>
+  <path d="M42 66C42 57 54 57 54 49" stroke="#34D399" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="42" cy="38" r="5.5" fill="#38BDF8" stroke="#0F172A" stroke-width="2"/>
+  <circle cx="54" cy="48" r="5.5" fill="#34D399" stroke="#0F172A" stroke-width="2"/>
+  <circle cx="42" cy="88" r="5.5" fill="#38BDF8" stroke="#0F172A" stroke-width="2"/>
+  <!-- Changelog lines -->
+  <line x1="66" y1="48" x2="90" y2="48" stroke="#E2E8F0" stroke-width="4" stroke-linecap="round"/>
+  <line x1="60" y1="68" x2="90" y2="68" stroke="#CBD5E1" stroke-width="4" stroke-linecap="round"/>
+  <line x1="60" y1="86" x2="80" y2="86" stroke="#CBD5E1" stroke-width="4" stroke-linecap="round"/>
+  <!-- Verified badge bottom-right -->
+  <circle cx="94" cy="96" r="16" fill="#10B981" stroke="#0F172A" stroke-width="3.5"/>
+  <path d="M87.5 96L92 100.5L101 91.5" stroke="#FFFFFF" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

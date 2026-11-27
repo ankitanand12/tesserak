@@ -1,0 +1,15 @@
+{
+  "name": "repo-documenter",
+  "displayName": "Repo Documenter",
+  "version": "1.0.0",
+  "description": "Automatically documents every repository change and feature update in CHANGELOG.md, docs/FEATURES.md, and PROJECT_CONTEXT.md using always-on rules, lifecycle hooks, and git history sync.",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "Local User Plugin"
+  },
+  "suggestedPrompts": [
+    "Document all recent changes and features in this repository",
+    "Create or update PROJECT_CONTEXT.md to match the latest repository state",
+    "Audit the codebase and build a complete docs/FEATURES.md catalog and CHANGELOG.md"
+  ]
+}

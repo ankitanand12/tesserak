@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .agents/plugins/repo-documenter/scripts/claude_stop_hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}
