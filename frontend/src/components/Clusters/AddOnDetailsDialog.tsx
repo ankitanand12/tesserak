@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Box,
@@ -127,6 +127,7 @@ interface AddOnDetailsDialogProps {
   isClusterActive?: boolean;
   readOnly?: boolean;
   installing?: boolean;
+  uninstalling?: boolean;
   onClose: () => void;
   onSelectPod?: (pod: ClusterPod) => void;
   onInstallCommunityAddon?: (
@@ -135,7 +136,10 @@ interface AddOnDetailsDialogProps {
     version?: string,
     valuesYaml?: string
   ) => Promise<void> | void;
-  onUninstallCommunityAddon?: (addonId: string, name: string) => Promise<void> | void;
+  onUninstallCommunityAddon?: (
+    addonId: string,
+    name: string
+  ) => Promise<{ logs?: string; message?: string } | void> | void;
 }
 
 const KeyVal: React.FC<{ label: string; value?: React.ReactNode; copyValue?: string }> = ({
@@ -194,6 +198,7 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
   isClusterActive = false,
   readOnly = false,
   installing = false,
+  uninstalling: uninstallingProp = false,
   onClose,
   onSelectPod,
   onInstallCommunityAddon,
@@ -204,51 +209,77 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
   const [liveData, setLiveData] = useState<CommunityAddonLiveDetails | null>(null);
   const [customValues, setCustomValues] = useState('');
   const [confirmUninstall, setConfirmUninstall] = useState(false);
-  const [uninstalling, setUninstalling] = useState(false);
+  const [localUninstalling, setLocalUninstalling] = useState(false);
+  const [uninstalledCompleted, setUninstalledCompleted] = useState(false);
+  const [actionTraceLog, setActionTraceLog] = useState('');
+  const [actionStatusBanner, setActionStatusBanner] = useState<{
+    severity: 'success' | 'error' | 'info';
+    message: string;
+  } | null>(null);
 
   const open = Boolean(awsAddon || communityAddon);
+  const communityAddonId = communityAddon?.id || '';
+  const awsAddonName = awsAddon?.addonName || '';
+  const currentAddonKey = awsAddonName ? `aws:${awsAddonName}` : communityAddonId ? `comm:${communityAddonId}` : '';
+  const currentAddonKeyRef = useRef(currentAddonKey);
+  currentAddonKeyRef.current = currentAddonKey;
+  const isUninstalling = Boolean(uninstallingProp || localUninstalling);
 
-  const loadCommunityLiveDetails = useCallback(async () => {
-    if (!communityAddon || !clusterName) return;
-    setLoadingLive(true);
-    try {
-      const qs = accountId ? `?account_id=${encodeURIComponent(accountId)}` : '';
-      const res = await fetch(
-        `http://localhost:8000/clusters/${encodeURIComponent(clusterName)}/community-addons/${encodeURIComponent(communityAddon.id)}/details${qs}`,
-        { headers: { 'x-user-email': userEmail } }
-      );
-      if (res.ok) {
-        const data: CommunityAddonLiveDetails = await res.json();
-        setLiveData(data);
-        if (data.valuesYaml) {
-          setCustomValues((prev) => (prev.trim() ? prev : data.valuesYaml || ''));
+  const loadCommunityLiveDetails = useCallback(
+    async (explicitAddonId?: string) => {
+      const targetId = explicitAddonId || communityAddonId;
+      if (!targetId || !clusterName) return;
+      const expectedKey = `comm:${targetId}`;
+      setLoadingLive(true);
+      try {
+        const qs = accountId ? `?account_id=${encodeURIComponent(accountId)}` : '';
+        const res = await fetch(
+          `http://localhost:8000/clusters/${encodeURIComponent(clusterName)}/community-addons/${encodeURIComponent(targetId)}/details${qs}`,
+          { headers: { 'x-user-email': userEmail } }
+        );
+        if (res.ok) {
+          const data: CommunityAddonLiveDetails = await res.json();
+          if (currentAddonKeyRef.current !== expectedKey) return;
+          setLiveData(data);
+          if (data.valuesYaml) {
+            setCustomValues((prev) => (prev.trim() ? prev : data.valuesYaml || ''));
+          }
+        }
+      } catch {
+        // Optional live telemetry helper
+      } finally {
+        if (currentAddonKeyRef.current === expectedKey) {
+          setLoadingLive(false);
         }
       }
-    } catch {
-      // Optional live telemetry helper
-    } finally {
-      setLoadingLive(false);
-    }
-  }, [communityAddon, clusterName, accountId, userEmail]);
+    },
+    [communityAddonId, clusterName, accountId, userEmail]
+  );
 
   useEffect(() => {
     setTab(0);
     setLiveData(null);
-    if (communityAddon) {
-      setCustomValues(communityAddon.valuesYaml || '');
-      loadCommunityLiveDetails();
+    setConfirmUninstall(false);
+    setLocalUninstalling(false);
+    setUninstalledCompleted(false);
+    setActionTraceLog('');
+    setActionStatusBanner(null);
+    if (open && communityAddonId) {
+      setCustomValues(communityAddon?.valuesYaml || '');
+      loadCommunityLiveDetails(communityAddonId);
     } else {
       setCustomValues('');
     }
-  }, [awsAddon?.addonName, communityAddon?.id, loadCommunityLiveDetails]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, awsAddonName, communityAddonId, loadCommunityLiveDetails]);
 
   useEffect(() => {
-    if (!communityAddon || !installing) return;
+    if (!open || !communityAddonId || (!installing && !isUninstalling)) return;
     const timer = setInterval(() => {
-      loadCommunityLiveDetails();
-    }, 5000);
+      loadCommunityLiveDetails(communityAddonId);
+    }, 3000);
     return () => clearInterval(timer);
-  }, [communityAddon, installing, loadCommunityLiveDetails]);
+  }, [open, communityAddonId, installing, isUninstalling, loadCommunityLiveDetails]);
 
   const matchedAwsAddonPods = useMemo(() => {
     if (!awsAddon) return [];
@@ -451,11 +482,18 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
 
   // Render Community / Helm Add-on Details
   const ca = communityAddon!;
-  const effectiveStatus = installing
+  const effectiveStatus = isUninstalling
+    ? 'UNINSTALLING'
+    : installing
     ? 'INSTALLING'
-    : (liveData?.helmStatus?.status || ca.status || 'NOT_INSTALLED').toUpperCase();
+    : liveData?.helmStatus?.status
+    ? String(liveData.helmStatus.status).toUpperCase()
+    : uninstalledCompleted
+    ? 'NOT_INSTALLED'
+    : (ca.status || 'NOT_INSTALLED').toUpperCase();
   const isDeployed = ['DEPLOYED', 'INSTALLED', 'SUCCESS'].includes(effectiveStatus);
-  const logsText = liveData?.logs || ca.logs || ca.details || 'No Helm execution trace recorded yet.';
+  const logsText =
+    actionTraceLog || liveData?.logs || ca.logs || ca.details || 'No Helm execution trace recorded yet.';
   const notesText = liveData?.notes || ca.notes || '';
   const presetYaml = liveData?.presetValuesYaml || ca.presetValuesYaml || '';
   const accessHints = liveData?.accessHints || ca.accessHints || [];
@@ -497,7 +535,7 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
                   ? 'success'
                   : effectiveStatus === 'FAILED'
                   ? 'error'
-                  : effectiveStatus === 'INSTALLING'
+                  : effectiveStatus === 'INSTALLING' || effectiveStatus === 'UNINSTALLING'
                   ? 'info'
                   : 'warning'
               }
@@ -511,7 +549,7 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
               variant="outlined"
               disabled={loadingLive}
               startIcon={loadingLive ? <CircularProgress size={14} color="inherit" /> : <RefreshIcon fontSize="small" />}
-              onClick={loadCommunityLiveDetails}
+              onClick={() => loadCommunityLiveDetails()}
               sx={{ color: '#ffffff', borderColor: 'rgba(255,255,255,0.35)' }}
             >
               Refresh
@@ -520,31 +558,41 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
               <Button
                 size="small"
                 variant="contained"
-                disabled={installing}
+                disabled={installing || isUninstalling}
                 startIcon={installing ? <CircularProgress size={14} color="inherit" /> : <InstallIcon fontSize="small" />}
                 onClick={async () => {
+                  setTab(1);
+                  setActionStatusBanner(null);
+                  setActionTraceLog(
+                    `$ helm upgrade --install ${liveData?.releaseName || ca.releaseName || ca.id} -n ${
+                      liveData?.namespace || ca.namespace || 'kube-system'
+                    }\nApplying Helm release...`
+                  );
                   await onInstallCommunityAddon(
                     ca.id,
                     ca.name || ca.id,
                     ca.requestedVersion || ca.version,
                     customValues.trim() ? customValues : undefined
                   );
+                  setActionTraceLog('');
                   loadCommunityLiveDetails();
                 }}
               >
                 {installing ? 'Installing...' : isDeployed ? 'Upgrade / Apply' : 'Install via Helm'}
               </Button>
             )}
-            {!readOnly && isClusterActive && isDeployed && onUninstallCommunityAddon && (
+            {!readOnly && isClusterActive && (isDeployed || isUninstalling) && onUninstallCommunityAddon && (
               <Button
                 size="small"
                 variant="outlined"
                 color="error"
-                disabled={installing || uninstalling}
-                startIcon={<DeleteIcon fontSize="small" />}
+                disabled={installing || isUninstalling}
+                startIcon={
+                  isUninstalling ? <CircularProgress size={14} color="inherit" /> : <DeleteIcon fontSize="small" />
+                }
                 onClick={() => setConfirmUninstall(true)}
               >
-                Uninstall
+                {isUninstalling ? 'Uninstalling...' : 'Uninstall'}
               </Button>
             )}
             <IconButton aria-label="Close add-on details" onClick={onClose} sx={{ color: '#cbd5e1' }}>
@@ -554,6 +602,11 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
         </DialogTitle>
 
         <DialogContent sx={{ pt: 2.5, pb: 3 }}>
+          {actionStatusBanner && (
+            <Alert severity={actionStatusBanner.severity} onClose={() => setActionStatusBanner(null)} sx={{ mb: 2 }}>
+              {actionStatusBanner.message}
+            </Alert>
+          )}
           {effectiveStatus === 'FAILED' && (
             <Alert severity="error" sx={{ mb: 2 }}>
               <strong>Last Helm install failed:</strong> {liveData?.details || ca.details || 'See Install Logs tab below.'}
@@ -836,16 +889,23 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
                 <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
                   <Button
                     variant="contained"
-                    disabled={installing}
+                    disabled={installing || isUninstalling}
                     startIcon={installing ? <CircularProgress size={16} color="inherit" /> : <InstallIcon fontSize="small" />}
                     onClick={async () => {
+                      setTab(1);
+                      setActionStatusBanner(null);
+                      setActionTraceLog(
+                        `$ helm upgrade --install ${liveData?.releaseName || ca.releaseName || ca.id} -n ${
+                          liveData?.namespace || ca.namespace || 'kube-system'
+                        } --values custom-values.yaml\nApplying Helm release with custom values...`
+                      );
                       await onInstallCommunityAddon(
                         ca.id,
                         ca.name || ca.id,
                         ca.requestedVersion || ca.version,
                         customValues.trim() ? customValues : undefined
                       );
-                      setTab(1);
+                      setActionTraceLog('');
                       loadCommunityLiveDetails();
                     }}
                   >
@@ -865,7 +925,7 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
       </Dialog>
 
       <ConfirmDeleteDialog
-        open={confirmUninstall}
+        open={Boolean(open && confirmUninstall && communityAddon)}
         title="Uninstall Community Add-on?"
         description={
           <>
@@ -874,17 +934,53 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
           </>
         }
         confirmLabel="Confirm Uninstall"
-        loading={uninstalling}
+        loading={false}
         onCancel={() => setConfirmUninstall(false)}
         onConfirm={async () => {
           if (!onUninstallCommunityAddon) return;
-          setUninstalling(true);
+          const targetId = ca.id;
+          const targetName = ca.name || ca.id;
+          const releaseName = liveData?.releaseName || ca.releaseName || ca.id;
+          const nsName = liveData?.namespace || ca.namespace || 'kube-system';
+
+          setConfirmUninstall(false);
+          setTab(1);
+          setActionStatusBanner(null);
+          setUninstalledCompleted(false);
+          setActionTraceLog(
+            `$ helm uninstall ${releaseName} -n ${nsName}\nUninstalling Helm release and streaming Kubernetes cleanup events...`
+          );
+          setLocalUninstalling(true);
           try {
-            await onUninstallCommunityAddon(ca.id, ca.name || ca.id);
-            setConfirmUninstall(false);
-            onClose();
+            const result = await onUninstallCommunityAddon(targetId, targetName);
+            if (currentAddonKeyRef.current === `comm:${targetId}`) {
+              setUninstalledCompleted(true);
+              if (result && typeof result === 'object' && result.logs) {
+                setActionTraceLog(result.logs);
+              } else {
+                setActionTraceLog(
+                  `$ helm uninstall ${releaseName} -n ${nsName}\n${
+                    (result && typeof result === 'object' && result.message) ||
+                    `Uninstalled Helm release "${releaseName}" from namespace "${nsName}".`
+                  }`
+                );
+              }
+              setActionStatusBanner({
+                severity: 'success',
+                message: `Uninstalled community add-on "${targetName}" via Helm.`,
+              });
+              loadCommunityLiveDetails(targetId);
+            }
+          } catch (err: any) {
+            if (currentAddonKeyRef.current === `comm:${targetId}`) {
+              const msg = err?.message || `Failed to uninstall ${targetName}`;
+              setActionTraceLog((prev) => `${prev}\nError: ${msg}`);
+              setActionStatusBanner({ severity: 'error', message: msg });
+            }
           } finally {
-            setUninstalling(false);
+            if (currentAddonKeyRef.current === `comm:${targetId}`) {
+              setLocalUninstalling(false);
+            }
           }
         }}
       />

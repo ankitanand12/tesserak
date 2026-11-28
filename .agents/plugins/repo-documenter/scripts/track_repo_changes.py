@@ -37,6 +37,11 @@ FEATURE_DOC_CANDIDATES = {
     "docs/feature_catalog.md",
 }
 
+PROJECT_CONTEXT_CANDIDATES = {
+    "project_context.md",
+    "docs/project_context.md",
+}
+
 ROOT_DOC_FILES = {
     "readme.md",
     "readme",
@@ -349,14 +354,19 @@ def diff_snapshots(
     non_doc_added = sorted(p for p in added_paths if not is_doc_only_file(p))
     changelogs_updated = sorted(p for p in changed_paths if is_changelog_file(p))
     feature_docs_updated = sorted(p for p in changed_paths if is_feature_doc_file(p))
+    project_context_updated = sorted(
+        p for p in changed_paths if normalize_rel_path(p).lower() in PROJECT_CONTEXT_CANDIDATES
+    )
 
     return {
         "non_doc_changed": non_doc_changed,
         "non_doc_added": non_doc_added,
         "changelogs_updated": changelogs_updated,
         "feature_docs_updated": feature_docs_updated,
+        "project_context_updated": project_context_updated,
         "has_changelog": has_existing_file(repo_root, CHANGELOG_CANDIDATES),
         "has_feature_doc": has_existing_file(repo_root, FEATURE_DOC_CANDIDATES),
+        "has_project_context": has_existing_file(repo_root, PROJECT_CONTEXT_CANDIDATES),
     }
 
 
@@ -558,8 +568,16 @@ def handle_stop(payload: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any
         needs_changelog = not diff["changelogs_updated"]
         needs_feature_init = not diff["has_feature_doc"] and not diff["feature_docs_updated"]
         needs_feature_new_files = bool(diff["non_doc_added"]) and not diff["feature_docs_updated"]
+        needs_project_context_init = (
+            not diff["has_project_context"] and not diff["project_context_updated"]
+        )
 
-        if needs_changelog or needs_feature_init or needs_feature_new_files:
+        if (
+            needs_changelog
+            or needs_feature_init
+            or needs_feature_new_files
+            or needs_project_context_init
+        ):
             missing_docs: List[str] = []
             if needs_changelog:
                 missing_docs.append(
@@ -573,6 +591,8 @@ def handle_stop(payload: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any
                 missing_docs.append(
                     "docs/FEATURES.md or FEATURES.md (document new/updated features if applicable)"
                 )
+            if needs_project_context_init:
+                missing_docs.append("PROJECT_CONTEXT.md (initial project context)")
             repo_name = os.path.basename(repo_root) or repo_root
             missing_items.append(
                 f"Repo '{repo_name}' modified [{format_file_list(non_doc)}] without updating "

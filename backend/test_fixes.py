@@ -750,9 +750,21 @@ class RegressionFixesTest(unittest.TestCase):
         ):
             un_res = backend_main._uninstall_community_addon_sync(fake_conn, "user@tesserak.dev", "tesserak", "argo-cd")
             self.assertEqual(un_res["status"], "uninstalled")
+            self.assertIn("$ helm uninstall argocd -n argocd", un_res["logs"])
+            self.assertIn('release "argocd" uninstalled', un_res["logs"])
             self.assertEqual(len(saved_states), 1)
             self.assertEqual([a["id"] for a in saved_states[0]["communityAddons"]], ["metrics-server"])
             self.assertEqual([a["id"] for a in saved_states[0]["addons"]], ["vpc-cni"])
+
+        # After uninstall removes communityAddons entry, /details still recovers uninstall logs from history
+        with patch.object(backend_main.boto3, "client", return_value=fake_eks), patch.object(
+            backend_main, "_resolve_helm_binary", return_value="/opt/homebrew/bin/helm"
+        ), patch.object(backend_main.subprocess, "run", side_effect=fake_kubectl_run), patch.object(
+            backend_main.state_manager, "get_cluster_state", return_value={"state": saved_states[0]}
+        ):
+            det_res = backend_main._fetch_community_addon_details_sync(fake_conn, "user@tesserak.dev", "tesserak", "argo-cd")
+            self.assertIn("$ helm uninstall argocd -n argocd", det_res["logs"])
+            self.assertIn('release "argocd" uninstalled', det_res["logs"])
 
 
 if __name__ == "__main__":

@@ -254,6 +254,7 @@ export const ClusterDetails: React.FC = () => {
   } | null>(null);
   const [podActionSubmitting, setPodActionSubmitting] = useState(false);
   const [installingAddonIds, setInstallingAddonIds] = useState<Record<string, boolean>>({});
+  const [uninstallingAddonIds, setUninstallingAddonIds] = useState<Record<string, boolean>>({});
   const [selectedAwsAddon, setSelectedAwsAddon] = useState<AwsClusterAddon | null>(null);
   const [selectedCommunityAddon, setSelectedCommunityAddon] = useState<CommunityClusterAddon | null>(null);
   const [podSearch, setPodSearch] = useState('');
@@ -555,8 +556,11 @@ export const ClusterDetails: React.FC = () => {
     }
   };
 
-  const handleUninstallCommunityAddon = async (addonId: string, name: string) => {
-    setInstallingAddonIds((prev) => ({ ...prev, [addonId]: true }));
+  const handleUninstallCommunityAddon = async (
+    addonId: string,
+    name: string
+  ): Promise<{ logs?: string; message?: string } | void> => {
+    setUninstallingAddonIds((prev) => ({ ...prev, [addonId]: true }));
     setError('');
     setNotice('');
     try {
@@ -573,14 +577,25 @@ export const ClusterDetails: React.FC = () => {
         throw new Error(data.detail || `Failed to uninstall ${name}`);
       }
       setNotice(`Uninstalled community add-on "${name}" via Helm.`);
-      setSelectedCommunityAddon(null);
+      setSelectedCommunityAddon((prev) =>
+        prev && prev.id === addonId
+          ? {
+              ...prev,
+              status: 'NOT_INSTALLED',
+              logs: data?.logs || prev.logs,
+              details: data?.message || `Uninstalled Helm release for ${name}.`,
+            }
+          : prev
+      );
       invalidateSwrCache(userEmail, cacheKey);
       await loadDetails(true);
+      return data;
     } catch (err: any) {
       const msg = err?.message || `Unable to uninstall ${name}`;
       setError(msg);
+      throw err;
     } finally {
-      setInstallingAddonIds((prev) => ({ ...prev, [addonId]: false }));
+      setUninstallingAddonIds((prev) => ({ ...prev, [addonId]: false }));
     }
   };
 
@@ -1394,6 +1409,7 @@ export const ClusterDetails: React.FC = () => {
                         {detail.communityAddons.map((ca) => {
                           const isDeployed = ['DEPLOYED', 'INSTALLED', 'SUCCESS'].includes(ca.status.toUpperCase());
                           const isInstalling = Boolean(installingAddonIds[ca.id]);
+                          const isUninstalling = Boolean(uninstallingAddonIds[ca.id]);
                           return (
                             <TableRow key={`${ca.id}-${ca.namespace || 'ns'}`} hover>
                               <TableCell sx={{ fontWeight: 700 }}>
@@ -1440,7 +1456,7 @@ export const ClusterDetails: React.FC = () => {
                                   <Button
                                     size="small"
                                     variant={isDeployed ? 'outlined' : 'contained'}
-                                    disabled={isInstalling || ca.status.toUpperCase() === 'UNSUPPORTED'}
+                                    disabled={isInstalling || isUninstalling || ca.status.toUpperCase() === 'UNSUPPORTED'}
                                     onClick={() =>
                                       handleInstallCommunityAddon(
                                         ca.id,
@@ -1449,7 +1465,9 @@ export const ClusterDetails: React.FC = () => {
                                       )
                                     }
                                   >
-                                    {isInstalling
+                                    {isUninstalling
+                                      ? 'Uninstalling...'
+                                      : isInstalling
                                       ? 'Installing...'
                                       : isDeployed
                                       ? 'Upgrade / Reinstall'
@@ -2081,6 +2099,9 @@ export const ClusterDetails: React.FC = () => {
         readOnly={Boolean(detail?.awsMissing)}
         installing={Boolean(
           activeSelectedCommunityAddon && installingAddonIds[activeSelectedCommunityAddon.id]
+        )}
+        uninstalling={Boolean(
+          activeSelectedCommunityAddon && uninstallingAddonIds[activeSelectedCommunityAddon.id]
         )}
         onClose={() => {
           setSelectedAwsAddon(null);

@@ -2302,6 +2302,7 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
                 "accessHints": preset.get("accessHints") or [],
             })
         else:
+            hist = _latest_addon_history_entry(local_state or {}, aid)
             community_addons.append({
                 "id": aid,
                 "name": a.get("name") or aid,
@@ -2312,8 +2313,8 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
                 "requestedVersion": a.get("version"),
                 "status": str((tracked or {}).get("status") or "NOT_INSTALLED").upper(),
                 "source": "requested",
-                "details": (tracked or {}).get("details") or "Selected during setup; click Install via Helm to deploy onto cluster.",
-                "logs": (tracked or {}).get("logs") or "",
+                "details": (tracked or {}).get("details") or hist.get("details") or "Selected during setup; click Install via Helm to deploy onto cluster.",
+                "logs": (tracked or {}).get("logs") or hist.get("logs") or "",
                 "notes": (tracked or {}).get("notes") or "",
                 "valuesYaml": (tracked or {}).get("valuesYaml") or "",
                 "presetValuesYaml": preset.get("presetValuesYaml") or "",
@@ -3040,13 +3041,35 @@ async def install_cluster_community_addon(
     return res
 
 
-def _fetch_community_addon_details_sync(
-    connection: Any,
+def _latest_addon_history_entry(state_dict: Dict[str, Any], addon_id: str) -> Dict[str, str]:
+    target = (addon_id or "").lower()
+    for entry in reversed(state_dict.get("history") or []):
+        if not isinstance(entry, dict):
+            continue
+        etype = entry.get("type")
+        details = entry.get("details") if isinstance(entry.get("details"), dict) else {}
+        if etype == "community_addon_uninstall" and str(details.get("addonId") or "").lower() == target:
+            return {
+                "logs": str(details.get("logs") or ""),
+                "details": str(details.get("details") or ""),
+                "timestamp": str(entry.get("timestamp") or ""),
+            }
+        if etype == "community_addon_install":
+            addon_obj = details.get("addon") if isinstance(details.get("addon"), dict) else {}
+            if str(addon_obj.get("id") or "").lower() == target:
+                return {
+                    "logs": str(addon_obj.get("logs") or ""),
+                    "details": str(addon_obj.get("details") or ""),
+                    "timestamp": str(entry.get("timestamp") or ""),
+                }
+    return {"logs": "", "details": "", "timestamp": ""}
+
+
+def _resolve_community_addon_target(
     user_email: str,
     cluster_name: str,
     addon_id: str,
-) -> Dict[str, Any]:
-    region = connection.region or "us-east-1"
+) -> Tuple[str, str, Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     cfg = _COMMUNITY_ADDON_REPOS.get(addon_id, {})
     preset = _COMMUNITY_ADDON_PRESETS.get(addon_id, {})
     release = str(cfg.get("release") or addon_id)
@@ -3065,6 +3088,19 @@ def _fetch_community_addon_details_sync(
         release = str(tracked["releaseName"])
     if tracked.get("namespace"):
         namespace = str(tracked["namespace"])
+    return release, namespace, cfg, preset, tracked, base_state
+
+
+def _fetch_community_addon_details_sync(
+    connection: Any,
+    user_email: str,
+    cluster_name: str,
+    addon_id: str,
+) -> Dict[str, Any]:
+    region = connection.region or "us-east-1"
+    release, namespace, _cfg, preset, tracked, base_state = _resolve_community_addon_target(
+        user_email, cluster_name, addon_id
+    )
 
     eks = boto3.client(
         "eks",
@@ -3186,6 +3222,7 @@ def _fetch_community_addon_details_sync(
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    hist_entry = _latest_addon_history_entry(base_state, addon_id)
     return {
         "id": addon_id,
         "releaseName": release,
@@ -3195,9 +3232,9 @@ def _fetch_community_addon_details_sync(
         "valuesYaml": values_yaml,
         "presetValuesYaml": preset.get("presetValuesYaml") or "",
         "accessHints": preset.get("accessHints") or [],
-        "logs": tracked.get("logs") or "",
-        "details": tracked.get("details") or "",
-        "updatedAt": tracked.get("updatedAt"),
+        "logs": tracked.get("logs") or hist_entry.get("logs") or "",
+        "details": tracked.get("details") or hist_entry.get("details") or "",
+        "updatedAt": tracked.get("updatedAt") or hist_entry.get("timestamp") or None,
         "resources": {
             "pods": pods,
             "services": services,
@@ -3225,9 +3262,9 @@ def _uninstall_community_addon_sync(
     addon_id: str,
 ) -> Dict[str, Any]:
     region = connection.region or "us-east-1"
-    cfg = _COMMUNITY_ADDON_REPOS.get(addon_id, {})
-    release = str(cfg.get("release") or addon_id)
-    namespace = str(cfg.get("namespace") or "kube-system")
+    release, namespace, _cfg, _preset, _tracked, _base_state = _resolve_community_addon_target(
+        user_email, cluster_name, addon_id
+    )
     helm_bin = _resolve_helm_binary()
     if not helm_bin:
         raise HTTPException(status_code=500, detail="Helm CLI is not installed on the backend host.")
@@ -3260,12 +3297,16 @@ def _uninstall_community_addon_sync(
                 env=env,
                 check=False,
             )
-            out = (proc.stdout or proc.stderr or "").strip()
-            if proc.returncode != 0 and "not found" not in out.lower():
-                raise HTTPException(status_code=400, detail=out or f"Failed to uninstall {release}")
+            combined_out = "\n".join(
+                part for part in [(proc.stdout or "").strip(), (proc.stderr or "").strip()] if part
+            ).strip()
+            trace_log = f"$ helm uninstall {release} -n {namespace}\n{combined_out or 'release uninstalled'}"
+            if proc.returncode != 0 and "not found" not in combined_out.lower():
+                raise HTTPException(status_code=400, detail=combined_out or f"Failed to uninstall {release}")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    details_msg = combined_out or f'Uninstalled Helm release "{release}" from namespace "{namespace}".'
     wrapper = state_manager.get_cluster_state(user_email, cluster_name)
     if wrapper:
         base = dict(wrapper.get("state", wrapper))
@@ -3280,7 +3321,13 @@ def _uninstall_community_addon_sync(
         updated = state_data.record_state_change(
             base,
             "community_addon_uninstall",
-            {"communityAddons": remaining_comm, "addons": remaining_addons, "addonId": addon_id},
+            {
+                "communityAddons": remaining_comm,
+                "addons": remaining_addons,
+                "addonId": addon_id,
+                "logs": trace_log,
+                "details": details_msg,
+            },
         )
         state_manager.save_cluster_state(user_email, cluster_name, updated)
 
@@ -3289,7 +3336,8 @@ def _uninstall_community_addon_sync(
         "id": addon_id,
         "releaseName": release,
         "namespace": namespace,
-        "message": out or f'Uninstalled Helm release "{release}" from namespace "{namespace}".',
+        "logs": trace_log,
+        "message": details_msg,
     }
 
 

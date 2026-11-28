@@ -630,9 +630,12 @@ describe('ClusterDetails page', () => {
     ).toBeInTheDocument();
   });
 
-  const setupMultiAddonTest = (holdConcurrentInstalls: boolean = false) => {
+  const setupMultiAddonTest = (opts: boolean | { holdConcurrentInstalls?: boolean; holdUninstall?: boolean } = false) => {
+    const holdConcurrentInstalls = typeof opts === 'boolean' ? opts : Boolean(opts.holdConcurrentInstalls);
+    const holdUninstall = typeof opts === 'boolean' ? false : Boolean(opts.holdUninstall);
     let resolveFirstInstall: ((value: Response) => void) | null = null;
     let resolveSecondInstall: ((value: Response) => void) | null = null;
+    let resolveUninstallReq: ((value: Response) => void) | null = null;
     const postedBodies: Array<{ addonId: string; valuesYaml?: string }> = [];
 
     const multiAddonDetail = {
@@ -716,9 +719,19 @@ describe('ClusterDetails page', () => {
         } as Response);
       }
       if (url.includes('/community-addons/argo-cd') && init?.method === 'DELETE') {
+        if (holdUninstall && !resolveUninstallReq) {
+          return new Promise<Response>((resolve) => {
+            resolveUninstallReq = resolve;
+          });
+        }
         return Promise.resolve({
           ok: true,
-          json: async () => ({ status: 'uninstalled', id: 'argo-cd' }),
+          json: async () => ({
+            status: 'uninstalled',
+            id: 'argo-cd',
+            logs: '$ helm uninstall argocd -n argocd\nrelease "argocd" uninstalled',
+            message: 'release "argocd" uninstalled',
+          }),
         } as Response);
       }
       if (url.includes('/community-addons') && init?.method === 'POST') {
@@ -750,6 +763,7 @@ describe('ClusterDetails page', () => {
       postedBodies,
       resolveFirst: (resp: Response) => resolveFirstInstall?.(resp),
       resolveSecond: (resp: Response) => resolveSecondInstall?.(resp),
+      resolveUninstall: (resp: Response) => resolveUninstallReq?.(resp),
     };
   };
 
@@ -824,13 +838,63 @@ describe('ClusterDetails page', () => {
       { timeout: 10000 }
     );
 
-    // Uninstall flow uses ConfirmDeleteDialog
+    // Uninstall flow closes confirmation modal immediately & keeps details modal open on Logs tab
     const uninstallBtn = within(helmModal).getByRole('button', { name: 'Uninstall' });
     await waitFor(() => expect(uninstallBtn).not.toBeDisabled(), { timeout: 10000 });
     fireEvent.click(uninstallBtn);
     fireEvent.click(await screen.findByRole('button', { name: 'Confirm Uninstall' }, { timeout: 5000 }));
     expect(
-      await screen.findByText('Uninstalled community add-on "Argo CD" via Helm.', {}, { timeout: 10000 })
+      await within(helmModal).findByText('Uninstalled community add-on "Argo CD" via Helm.', {}, { timeout: 10000 })
     ).toBeInTheDocument();
+    expect(within(helmModal).getByText(/release "argocd" uninstalled/i)).toBeInTheDocument();
+  });
+
+  test('closes confirmation dialog immediately on uninstall, displays Uninstalling... and uninstall logs cleanly', async () => {
+    const ctx = setupMultiAddonTest({ holdUninstall: true });
+
+    render(<ClusterDetails />);
+    fireEvent.click(await screen.findByRole('tab', { name: /Compute & Add-ons/i }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Argo CD' }));
+    const helmModal = await screen.findByRole('dialog');
+    await within(helmModal).findByText('Domain & Access Guide', {}, { timeout: 10000 });
+
+    fireEvent.click(within(helmModal).getByRole('button', { name: 'Uninstall' }));
+    expect(await screen.findByText('Uninstall Community Add-on?')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm Uninstall' }));
+
+    // Confirmation popup must disappear right away while details modal switches to Logs & shows Uninstalling...
+    await waitFor(
+      () => expect(screen.queryByText('Uninstall Community Add-on?')).not.toBeInTheDocument(),
+      { timeout: 5000 }
+    );
+    expect(within(helmModal).getByText('UNINSTALLING')).toBeInTheDocument();
+    expect(within(helmModal).getByRole('button', { name: 'Uninstalling...' })).toBeDisabled();
+    expect(within(helmModal).getByText(/\$ helm uninstall argocd -n argocd/i)).toBeInTheDocument();
+    // Background table must also say Uninstalling... (aria-hidden while modal is open) and never Installing...
+    expect(screen.queryByText('Installing...')).not.toBeInTheDocument();
+    expect(screen.getAllByText('Uninstalling...').length).toBeGreaterThanOrEqual(2);
+
+    ctx.resolveUninstall({
+      ok: true,
+      json: async () => ({
+        status: 'uninstalled',
+        id: 'argo-cd',
+        logs: '$ helm uninstall argocd -n argocd\nrelease "argocd" uninstalled',
+        message: 'release "argocd" uninstalled',
+      }),
+    } as Response);
+
+    expect(
+      await within(helmModal).findByText('Uninstalled community add-on "Argo CD" via Helm.', {}, { timeout: 10000 })
+    ).toBeInTheDocument();
+    expect(within(helmModal).getByText(/release "argocd" uninstalled/i)).toBeInTheDocument();
+
+    // Closing and opening another add-on must never leak any confirmation dialog
+    fireEvent.click(within(helmModal).getByRole('button', { name: 'Close add-on details' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument(), { timeout: 10000 });
+    fireEvent.click(screen.getByRole('button', { name: 'Metrics Server' }));
+    await screen.findByRole('dialog');
+    expect(screen.queryByText('Uninstall Community Add-on?')).not.toBeInTheDocument();
   });
 });

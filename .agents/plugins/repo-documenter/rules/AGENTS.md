@@ -14,8 +14,8 @@ Whenever you create, modify, rename, or delete code, configuration, schemas, scr
    - Whenever a feature, endpoint, CLI command, UI screen, integration, workflow, or capability is added, modified, deprecated, or removed, update the summary index table and the corresponding feature section (purpose, key files/symbols, configuration/usage, and a dated update note).
 
 3. **Keep Interface & Context Docs Aligned (`README.md` & `PROJECT_CONTEXT.md`)**:
+   - Inspect the repository for `PROJECT_CONTEXT.md` at the repo root. If it does not exist, create `PROJECT_CONTEXT.md` using the `project-context` skill. If it exists and architecture, dependencies, directory layout, entrypoints, or dev/test commands changed, update `PROJECT_CONTEXT.md` to stay current.
    - Update `README.md` or nearby module documentation whenever setup steps, CLI flags, environment variables, public APIs, or user-facing workflows change.
-   - If `PROJECT_CONTEXT.md` exists at the repository root and architecture, dependencies, directory layout, entrypoints, or dev/test commands changed, update `PROJECT_CONTEXT.md` to stay current. Use the `project-context` skill when asked to create or refresh `PROJECT_CONTEXT.md`.
 
 ## Guardrails & Skip Conditions
 
