@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
+  Alert,
   AppBar,
   Avatar,
   Box,
@@ -15,6 +16,7 @@ import {
   ListItemText,
   Menu,
   MenuItem,
+  Snackbar,
   Toolbar,
   Typography,
   ThemeProvider,
@@ -433,8 +435,9 @@ const Layout: React.FC<LayoutProps> = ({
 };
 
 const AppShell: React.FC = () => {
-  const { isAuthenticated, isLoading, userEmail, sessionUser, loginWithLocal, logout } =
+  const { isAuthenticated, isLoading, userEmail, sessionUser, logout } =
     useTesserakAuth();
+  const [authToast, setAuthToast] = useState<string | null>(null);
 
   if (isLoading) {
     return (
@@ -464,7 +467,7 @@ const AppShell: React.FC = () => {
     return (
       <ThemeProvider theme={obsidianBlueTheme}>
         <CssBaseline />
-        <AuthPage onLogin={loginWithLocal} />
+        <AuthPage onSuccessToast={(message) => setAuthToast(message)} />
       </ThemeProvider>
     );
   }
@@ -501,6 +504,21 @@ const AppShell: React.FC = () => {
             <Route path="/profile" element={<Profile email={userEmail} />} />
           </Routes>
         </Layout>
+        <Snackbar
+          open={Boolean(authToast)}
+          autoHideDuration={6500}
+          onClose={() => setAuthToast(null)}
+          anchorOrigin={{ vertical: 'top', horizontal: 'center' }}
+        >
+          <Alert
+            severity="success"
+            variant="filled"
+            onClose={() => setAuthToast(null)}
+            sx={{ width: '100%', fontWeight: 600 }}
+          >
+            {authToast}
+          </Alert>
+        </Snackbar>
       </ThemeProvider>
     </Router>
   );

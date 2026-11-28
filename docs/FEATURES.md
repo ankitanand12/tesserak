@@ -7,7 +7,7 @@ Living inventory of implemented features and capabilities in **Tesserak** (`/Use
 | Feature | Status | Key Entrypoints / Files | Last Updated |
 | :--- | :--- | :--- | :--- |
 | Platform Overview Dashboard | Active | `frontend/src/pages/Dashboard.tsx`, `backend/tesserak_router.py` (`GET /api/overview`) | 2026-11-26 |
-| Authentication, SSO & Profile Management | Active | `backend/auth.py`, `backend/tesserak_router.py`, `frontend/src/auth/AuthContext.tsx`, `frontend/src/components/Auth/AuthPage.tsx`, `frontend/src/pages/Profile.tsx`, `frontend/src/pages/Settings.tsx` | 2026-11-26 |
+| Authentication, SSO & Profile Management | Active | `backend/auth.py`, `backend/db.py` (`UserRecord`, `EmailVerificationRecord`), `backend/tesserak_router.py`, `frontend/src/auth/AuthContext.tsx`, `frontend/src/components/Auth/AuthPage.tsx`, `frontend/src/pages/Profile.tsx`, `frontend/src/pages/Settings.tsx` | 2026-11-28 |
 | Multi-Account AWS Connectors & Catalog Fallback | Active | `backend/connections.py`, `backend/main.py` | 2026-11-27 |
 | Amazon EKS Launch Wizard & Hybrid Catalog Cache | Active | `frontend/src/pages/CreateCluster.tsx`, `frontend/src/components/CreateCluster/*`, `backend/main.py`, `backend/db.py` (`AwsCatalogCacheRecord`) | 2026-11-27 |
 | EKS Cluster Inventory, Reconciliation & Deep Inspector | Active | `frontend/src/pages/Clusters.tsx`, `frontend/src/pages/ClusterDetails.tsx`, `frontend/src/components/Clusters/{NodeDetailsDialog,NodeGroupDetailsDialog,PodDetailsDialog,AddOnDetailsDialog}.tsx`, `backend/main.py` | 2026-11-28 |
@@ -37,16 +37,18 @@ Living inventory of implemented features and capabilities in **Tesserak** (`/Use
 ## Authentication, SSO & Profile Management
 
 - **Status**: Active
-- **Purpose**: Supports Auth0 Universal Login SSO, Individual or Organization email/password registration and login, local workspace fallback in dev mode, and operator profile customization.
+- **Purpose**: Supports Auth0 Universal Login SSO, 6-digit OTP-verified Individual and Organization email/password registration and login, local workspace fallback in dev mode, and operator profile customization.
 - **Entrypoints & Implementation**:
-  - `backend/auth.py`: `require_auth_if_configured`, `register_email_user`, `authenticate_email_user`, `issue_email_session_token`, `verify_email_session_token`, `get_user_profile`, `upsert_user_profile`.
-  - `backend/tesserak_router.py`: `GET /api/auth/status`, `POST /api/auth/email/register`, `POST /api/auth/email/login`, `GET /api/profile`, `PUT /api/profile`.
-  - `frontend/src/auth/AuthContext.tsx` (`TesserakAuthProvider`, `useTesserakAuth`), `frontend/src/components/Auth/AuthPage.tsx`, `frontend/src/pages/Profile.tsx` (`/profile`), `frontend/src/pages/Settings.tsx` (`/settings`).
+  - `backend/auth.py`: `require_auth_if_configured`, `register_email_user`, `verify_email_registration_otp`, `resend_email_registration_otp`, `authenticate_email_user`, `issue_email_session_token`, `verify_email_session_token`, `get_user_profile`, `upsert_user_profile`.
+  - `backend/db.py`: `UserRecord` (`users`), `EmailVerificationRecord` (`email_verifications`).
+  - `backend/tesserak_router.py`: `GET /api/auth/status`, `POST /api/auth/email/register`, `POST /api/auth/email/verify-otp`, `POST /api/auth/email/resend-otp`, `POST /api/auth/email/login`, `GET /api/profile`, `PUT /api/profile`.
+  - `frontend/src/auth/AuthContext.tsx` (`TesserakAuthProvider`, `useTesserakAuth`), `frontend/src/components/Auth/AuthPage.tsx`, `frontend/src/App.tsx` (post-auth welcome `Snackbar`), `frontend/src/pages/Profile.tsx` (`/profile`), `frontend/src/pages/Settings.tsx` (`/settings`).
   - `frontend/src/utils/imageUtils.ts`: Client-side avatar compression (`compressImage`).
 - **Configuration & Usage**:
-  - Backend env vars (`backend/.env`): `AUTH0_DOMAIN`, `AUTH0_AUDIENCE`, `TESSERAK_SESSION_SECRET`.
+  - Backend env vars (`backend/.env`): `AUTH0_DOMAIN`, `AUTH0_AUDIENCE`, `TESSERAK_SESSION_SECRET`, optional `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_USE_TLS` (when `SMTP_HOST` is unset, registration exposes a `dev-preview` 6-digit OTP code in UI).
   - Frontend env vars (`frontend/.env`): `REACT_APP_AUTH0_DOMAIN`, `REACT_APP_AUTH0_CLIENT_ID`, `REACT_APP_AUTH0_AUDIENCE`.
 - **Recent Updates**:
+  - **2026-11-28**: Added 6-digit OTP email verification (`POST /api/auth/email/verify-otp`, `/api/auth/email/resend-otp`), SMTP/dev-preview delivery, post-signup/sign-in success notifications in `App.tsx`, form reset on `Sign In` / `Create Account` tab switches, and fixed duplicate `loginWithLocal` clearing `localToken` in `Auth0SdkBridge`.
   - **2026-11-27**: Fixed Google/Auth0 SSO `avatarUrl` preservation and reactivity in `AuthContext.tsx`, `App.tsx`, and `Profile.tsx` when PostgreSQL profiles have an empty `avatarUrl`, with `referrerPolicy="no-referrer"` support.
   - **2026-11-26**: Switched shell routing in `frontend/src/App.tsx` to `BrowserRouter` and added `/profile` + `/settings` auth status panels showing live PostgreSQL and Auth0 state.
 

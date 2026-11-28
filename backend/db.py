@@ -67,6 +67,19 @@ class UserRecord(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class EmailVerificationRecord(Base):
+    __tablename__ = "email_verifications"
+
+    email = Column(String(255), primary_key=True)
+    otp_hash = Column(String(255), nullable=False)
+    pending_user_json = Column(JSON, nullable=False)
+    expires_at = Column(Integer, nullable=False)
+    attempts = Column(Integer, nullable=False, default=0)
+    resend_available_at = Column(Integer, nullable=False, default=0)
+    created_at = Column(Integer, nullable=False)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class AwsConnectionRecord(Base):
     __tablename__ = "aws_connections"
     __table_args__ = (

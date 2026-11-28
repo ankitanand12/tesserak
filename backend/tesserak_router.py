@@ -14,7 +14,9 @@ from auth import (
     get_user_profile,
     register_email_user,
     require_auth_if_configured,
+    resend_email_registration_otp,
     upsert_user_profile,
+    verify_email_registration_otp,
 )
 from connections import ConnectionManager
 from db import (
@@ -386,6 +388,15 @@ class EmailRegisterRequest(BaseModel):
     organization: Optional[str] = None
 
 
+class EmailVerifyOtpRequest(BaseModel):
+    email: str
+    otp: str
+
+
+class EmailResendOtpRequest(BaseModel):
+    email: str
+
+
 class ProfileUpdateRequest(BaseModel):
     firstName: Optional[str] = None
     lastName: Optional[str] = None
@@ -405,6 +416,8 @@ async def get_auth_config_status():
         "domainConfigured": bool(domain),
         "audienceConfigured": bool(audience),
         "emailAuthEnabled": True,
+        "emailOtpVerification": True,
+        "smtpConfigured": bool(os.getenv("SMTP_HOST", "").strip()),
         "database": "postgresql",
         "mode": "auth0" if domain else "local-fallback",
     }
@@ -447,7 +460,8 @@ async def save_user_profile(
 
 @public_router.post("/api/auth/email/register")
 async def email_register(payload: EmailRegisterRequest):
-    return register_email_user(
+    return await asyncio.to_thread(
+        register_email_user,
         email=payload.email,
         password=payload.password,
         first_name=payload.firstName,
@@ -457,9 +471,30 @@ async def email_register(payload: EmailRegisterRequest):
     )
 
 
+@public_router.post("/api/auth/email/verify-otp")
+async def email_verify_otp(payload: EmailVerifyOtpRequest):
+    return await asyncio.to_thread(
+        verify_email_registration_otp,
+        email=payload.email,
+        otp=payload.otp,
+    )
+
+
+@public_router.post("/api/auth/email/resend-otp")
+async def email_resend_otp(payload: EmailResendOtpRequest):
+    return await asyncio.to_thread(
+        resend_email_registration_otp,
+        email=payload.email,
+    )
+
+
 @public_router.post("/api/auth/email/login")
 async def email_login(payload: EmailLoginRequest):
-    return authenticate_email_user(email=payload.email, password=payload.password)
+    return await asyncio.to_thread(
+        authenticate_email_user,
+        email=payload.email,
+        password=payload.password,
+    )
 
 
 def _build_overview_alerts(

@@ -352,6 +352,7 @@ const Auth0SdkBridge: React.FC<{ children: React.ReactNode }> = ({ children }) =
       setAuthProvider(provider);
       setLocalToken(options?.token || null);
       setLocalEmail(email);
+      setProfileTick((t) => t + 1);
     },
     loginWithAuth0: async (options?: Auth0LoginOptions) => {
       await loginWithRedirect({
@@ -418,6 +419,13 @@ const FallbackAuthBridge: React.FC<{ children: React.ReactNode }> = ({ children 
     const p = localStorage.getItem('authProvider');
     return p === 'auth0' || p === 'auth0-demo-sso' || p === 'email' ? p : 'local';
   });
+  const [profileTick, setProfileTick] = useState(0);
+
+  useEffect(() => {
+    const handleProfileUpdate = () => setProfileTick((t) => t + 1);
+    window.addEventListener('tesserak-profile-updated', handleProfileUpdate);
+    return () => window.removeEventListener('tesserak-profile-updated', handleProfileUpdate);
+  }, []);
 
   useLayoutEffect(() => {
     if (!localToken) return;
@@ -430,7 +438,7 @@ const FallbackAuthBridge: React.FC<{ children: React.ReactNode }> = ({ children 
   const sessionUser = useMemo(() => {
     const base = readStoredUserProfile(localEmail);
     return base ? { ...base, authProvider } : null;
-  }, [localEmail, authProvider]);
+  }, [localEmail, authProvider, profileTick]);
 
   const value: TesserakAuthContextValue = {
     isAuthenticated: Boolean(localEmail),
@@ -446,6 +454,7 @@ const FallbackAuthBridge: React.FC<{ children: React.ReactNode }> = ({ children 
       setAuthProvider(provider);
       setLocalToken(options?.token || null);
       setLocalEmail(email);
+      setProfileTick((t) => t + 1);
     },
     loginWithAuth0: async () => {
       throw new Error('AUTH0_NOT_CONFIGURED');

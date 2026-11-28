@@ -27,6 +27,7 @@ import {
   Google as GoogleIcon,
   Key as KeyIcon,
   Layers as LayersIcon,
+  MarkEmailRead as MarkEmailReadIcon,
   Person as PersonIcon,
   Security as SecurityIcon,
   Shield as ShieldIcon,
@@ -41,6 +42,24 @@ import type { AccountType } from '../../types/user';
 
 interface AuthPageProps {
   onLogin?: (email: string) => void;
+  onSuccessToast?: (message: string) => void;
+}
+
+interface PendingEmailVerification {
+  email: string;
+  accountType: AccountType;
+  organization: string;
+  deliveryMode: 'smtp' | 'dev-preview' | 'local-offline';
+  devOtp?: string;
+  message: string;
+  offlineProfile?: {
+    email: string;
+    password: string;
+    firstName: string;
+    lastName: string;
+    accountType: AccountType;
+    organization: string;
+  };
 }
 
 const AuthButton = styled(Button)({
@@ -84,7 +103,7 @@ const PillChip = ({ label, icon }: { label: string; icon: React.ReactNode }) => 
   </Box>
 );
 
-export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
+export const AuthPage: React.FC<AuthPageProps> = ({ onLogin, onSuccessToast }) => {
   const {
     isAuth0Configured,
     authError,
@@ -103,9 +122,26 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [pendingVerification, setPendingVerification] =
+    useState<PendingEmailVerification | null>(null);
+  const [otpCode, setOtpCode] = useState('');
   const [ssoDialogOpen, setSsoDialogOpen] = useState(false);
   const [ssoEmail, setSsoEmail] = useState('platform.lead@company.io');
   const [ssoProviderLabel, setSsoProviderLabel] = useState('Auth0 Enterprise SSO');
+
+  const resetAuthForm = () => {
+    setEmail('');
+    setPassword('');
+    setFirstName('');
+    setLastName('');
+    setOrganization('');
+    setShowPassword(false);
+    setOtpCode('');
+    setPendingVerification(null);
+    setError('');
+    setNotice('');
+  };
 
   const completeLocalLogin = (
     userEmail: string,
@@ -115,15 +151,22 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
       lastName?: string;
       accountType?: AccountType;
       organization?: string;
-    }
+    },
+    successMessage?: string
   ) => {
     loginWithLocal(userEmail, { token, profile });
-    onLogin?.(userEmail);
+    if (onLogin && onLogin !== loginWithLocal) {
+      onLogin(userEmail);
+    }
+    if (successMessage) {
+      onSuccessToast?.(successMessage);
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setNotice('');
     const trimmedEmail = email.trim().toLowerCase();
 
     if (!trimmedEmail || !password) {
@@ -159,30 +202,17 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
 
         if (res.ok) {
           const data = await res.json();
-          completeLocalLogin(data.user.email, data.token, data.user);
+          const orgLabel =
+            data.user.accountType === 'organization' && data.user.organization
+              ? ` · ${data.user.organization}`
+              : '';
+          completeLocalLogin(
+            data.user.email,
+            data.token,
+            data.user,
+            `Signed in as ${data.user.email}${orgLabel}.`
+          );
           return;
-        }
-
-        // Seamless migration for accounts created earlier in localStorage
-        const cached = users[trimmedEmail];
-        if (res.status === 401 && cached && cached.password === password) {
-          const regRes = await fetch('http://localhost:8000/api/auth/email/register', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              email: trimmedEmail,
-              password,
-              firstName: cached.firstName || trimmedEmail.split('@')[0],
-              lastName: cached.lastName || 'User',
-              accountType: cached.accountType || 'individual',
-              organization: cached.organization || 'Individual Workspace',
-            }),
-          });
-          if (regRes.ok) {
-            const regData = await regRes.json();
-            completeLocalLogin(regData.user.email, regData.token, regData.user);
-            return;
-          }
         }
 
         const errData = await res.json().catch(() => ({}));
@@ -209,7 +239,29 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
         setError(data.detail || 'Unable to create account.');
         return;
       }
-      completeLocalLogin(data.user.email, data.token, data.user);
+      if (data.verificationRequired) {
+        setPendingVerification({
+          email: data.email || trimmedEmail,
+          accountType: data.accountType || accountType,
+          organization: data.organization || resolvedOrg,
+          deliveryMode: data.deliveryMode || 'dev-preview',
+          devOtp: data.devOtp,
+          message:
+            data.message || `Verification code sent to ${trimmedEmail}. Enter the 6-digit OTP below.`,
+        });
+        setOtpCode('');
+        setNotice(
+          data.message || `Verification code generated for ${trimmedEmail}.`
+        );
+        return;
+      }
+      if (data.user) {
+        const createdMsg =
+          data.user.accountType === 'organization'
+            ? `Organization account created for ${data.user.organization}.`
+            : `Individual account created for ${data.user.email}.`;
+        completeLocalLogin(data.user.email, data.token, data.user, createdMsg);
+      }
     } catch {
       // Offline fallback when Auth0 is unconfigured and backend isn't reachable
       if (!isAuth0Configured) {
@@ -229,24 +281,138 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
             };
             localStorage.setItem('users', JSON.stringify(users));
           }
-          completeLocalLogin(trimmedEmail, undefined, users[trimmedEmail]);
+          completeLocalLogin(
+            trimmedEmail,
+            undefined,
+            users[trimmedEmail],
+            `Signed in as ${trimmedEmail}.`
+          );
           return;
         }
         const resolvedOrg =
           accountType === 'organization' ? organization.trim() : 'Individual Workspace';
-        users[trimmedEmail] = {
+        const localOtp = String(Math.floor(100000 + Math.random() * 900000));
+        setPendingVerification({
           email: trimmedEmail,
-          password,
-          firstName: firstName.trim(),
-          lastName: lastName.trim(),
           accountType,
           organization: resolvedOrg,
-        };
-        localStorage.setItem('users', JSON.stringify(users));
-        completeLocalLogin(trimmedEmail, undefined, users[trimmedEmail]);
+          deliveryMode: 'local-offline',
+          devOtp: localOtp,
+          message:
+            'Backend offline preview: enter the 6-digit verification code below to finish creating your account.',
+          offlineProfile: {
+            email: trimmedEmail,
+            password,
+            firstName: firstName.trim(),
+            lastName: lastName.trim(),
+            accountType,
+            organization: resolvedOrg,
+          },
+        });
+        setOtpCode('');
+        setNotice(`Verification code generated for ${trimmedEmail}.`);
         return;
       }
       setError('Unable to reach backend authentication service on localhost:8000.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleVerifyOtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!pendingVerification) return;
+    setError('');
+    setNotice('');
+    const cleanOtp = otpCode.replace(/\s+/g, '');
+    if (!/^\d{6}$/.test(cleanOtp)) {
+      setError('Enter the 6-digit verification code.');
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      if (
+        pendingVerification.deliveryMode === 'local-offline' &&
+        pendingVerification.offlineProfile
+      ) {
+        if (cleanOtp !== pendingVerification.devOtp) {
+          setError('Invalid verification code. Check the 6-digit code shown above.');
+          return;
+        }
+        const profile = pendingVerification.offlineProfile;
+        const users = JSON.parse(localStorage.getItem('users') || '{}');
+        users[profile.email] = profile;
+        localStorage.setItem('users', JSON.stringify(users));
+        const createdMsg =
+          profile.accountType === 'organization'
+            ? `Organization account verified and created for ${profile.organization}.`
+            : `Individual account verified and created for ${profile.email}.`;
+        completeLocalLogin(profile.email, undefined, profile, createdMsg);
+        return;
+      }
+
+      const res = await fetch('http://localhost:8000/api/auth/email/verify-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: pendingVerification.email, otp: cleanOtp }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.detail || 'Invalid or expired verification code.');
+        return;
+      }
+      const createdMsg =
+        data.message ||
+        (data.user?.accountType === 'organization'
+          ? `Organization account verified and created for ${data.user.organization}.`
+          : `Individual account verified and created for ${data.user?.email || pendingVerification.email}.`);
+      setNotice(createdMsg);
+      completeLocalLogin(data.user.email, data.token, data.user, createdMsg);
+    } catch {
+      setError('Unable to reach backend verification endpoint on localhost:8000.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleResendOtp = async () => {
+    if (!pendingVerification) return;
+    setError('');
+    setNotice('');
+    setSubmitting(true);
+    try {
+      if (pendingVerification.deliveryMode === 'local-offline') {
+        const nextOtp = String(Math.floor(100000 + Math.random() * 900000));
+        setPendingVerification({
+          ...pendingVerification,
+          devOtp: nextOtp,
+        });
+        setOtpCode('');
+        setNotice(`New verification code generated for ${pendingVerification.email}.`);
+        return;
+      }
+
+      const res = await fetch('http://localhost:8000/api/auth/email/resend-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: pendingVerification.email }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.detail || 'Unable to resend verification code.');
+        return;
+      }
+      setPendingVerification({
+        ...pendingVerification,
+        deliveryMode: data.deliveryMode || pendingVerification.deliveryMode,
+        devOtp: data.devOtp,
+        message: data.message || pendingVerification.message,
+      });
+      setOtpCode('');
+      setNotice(data.message || `New verification code issued for ${pendingVerification.email}.`);
+    } catch {
+      setError('Unable to reach backend resend OTP endpoint on localhost:8000.');
     } finally {
       setSubmitting(false);
     }
@@ -391,6 +557,11 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                   {error || authError}
                 </Alert>
               )}
+              {notice && (
+                <Alert severity="success" sx={{ mb: 2, borderRadius: 2 }}>
+                  {notice}
+                </Alert>
+              )}
 
               {/* Auth0 SSO Action Buttons */}
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.25, mb: 2.5 }}>
@@ -460,8 +631,10 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
               <Tabs
                 value={tab}
                 onChange={(_, v) => {
-                  setTab(v);
-                  setError('');
+                  if (v !== tab) {
+                    setTab(v);
+                    resetAuthForm();
+                  }
                 }}
                 variant="fullWidth"
                 sx={{ mb: 2.25 }}
@@ -470,7 +643,134 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                 <Tab label="Create Account" sx={{ fontWeight: 700, textTransform: 'none' }} />
               </Tabs>
 
-              <Box component="form" onSubmit={handleSubmit} sx={{ display: 'flex', flexDirection: 'column', gap: 1.75 }}>
+              {tab === 1 && pendingVerification ? (
+                <Box
+                  component="form"
+                  key="verify-otp-form"
+                  onSubmit={handleVerifyOtp}
+                  sx={{ display: 'flex', flexDirection: 'column', gap: 1.75 }}
+                >
+                  <Box
+                    sx={{
+                      p: 2,
+                      borderRadius: 2,
+                      bgcolor: '#f8fafc',
+                      border: '1px solid rgba(37, 99, 235, 0.22)',
+                    }}
+                  >
+                    <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1, flexWrap: 'wrap', mb: 0.75 }}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                        <MarkEmailReadIcon fontSize="small" sx={{ color: '#2563eb' }} />
+                        <Typography variant="subtitle2" sx={{ fontWeight: 800, color: '#09090b' }}>
+                          Verify Email Address
+                        </Typography>
+                      </Box>
+                      <Chip
+                        size="small"
+                        label={
+                          pendingVerification.accountType === 'organization'
+                            ? `Organization · ${pendingVerification.organization}`
+                            : 'Individual Account'
+                        }
+                        sx={{
+                          fontWeight: 700,
+                          bgcolor: '#eff6ff',
+                          color: '#1d4ed8',
+                          border: '1px solid #bfdbfe',
+                        }}
+                      />
+                    </Box>
+                    <Typography variant="caption" sx={{ color: '#475569', display: 'block' }}>
+                      Enter the 6-digit verification OTP for <strong>{pendingVerification.email}</strong>
+                    </Typography>
+                  </Box>
+
+                  {pendingVerification.deliveryMode !== 'smtp' && pendingVerification.devOtp && (
+                    <Alert
+                      severity="info"
+                      sx={{ borderRadius: 2, alignItems: 'center' }}
+                      action={
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          onClick={() => setOtpCode(pendingVerification.devOtp || '')}
+                          sx={{ fontWeight: 700, textTransform: 'none', whiteSpace: 'nowrap' }}
+                        >
+                          Use Code
+                        </Button>
+                      }
+                    >
+                      <Typography variant="caption" sx={{ display: 'block', color: '#0f172a' }}>
+                        Local dev preview OTP:{' '}
+                        <Box component="strong" sx={{ fontFamily: 'monospace', fontSize: '0.95rem', letterSpacing: 1 }}>
+                          {pendingVerification.devOtp}
+                        </Box>
+                      </Typography>
+                    </Alert>
+                  )}
+
+                  <TextField
+                    label="Verification Code (6-digit OTP)"
+                    placeholder="Enter 6-digit code"
+                    size="small"
+                    value={otpCode}
+                    onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                    inputProps={{ maxLength: 6, inputMode: 'numeric', pattern: '[0-9]*' }}
+                    autoComplete="one-time-code"
+                    required
+                    fullWidth
+                  />
+
+                  <Button
+                    type="submit"
+                    variant="contained"
+                    disabled={submitting}
+                    fullWidth
+                    sx={{
+                      mt: 0.5,
+                      py: 1.15,
+                      borderRadius: 2.5,
+                      fontWeight: 700,
+                      textTransform: 'none',
+                    }}
+                  >
+                    {submitting ? 'Verifying OTP...' : 'Verify Email & Create Account'}
+                  </Button>
+
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 1, flexWrap: 'wrap' }}>
+                    <Button
+                      type="button"
+                      size="small"
+                      disabled={submitting}
+                      onClick={handleResendOtp}
+                      sx={{ textTransform: 'none', fontWeight: 700 }}
+                    >
+                      Resend Code
+                    </Button>
+                    <Button
+                      type="button"
+                      size="small"
+                      disabled={submitting}
+                      onClick={() => {
+                        setPendingVerification(null);
+                        setOtpCode('');
+                        setError('');
+                        setNotice('');
+                      }}
+                      sx={{ textTransform: 'none', fontWeight: 600, color: '#475569' }}
+                    >
+                      Edit Registration Details
+                    </Button>
+                  </Box>
+                </Box>
+              ) : (
+              <Box
+                component="form"
+                key={tab === 0 ? 'signin-form' : 'signup-form'}
+                autoComplete="off"
+                onSubmit={handleSubmit}
+                sx={{ display: 'flex', flexDirection: 'column', gap: 1.75 }}
+              >
                 {tab === 1 && (
                   <>
                     <Box>
@@ -483,7 +783,12 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                         size="small"
                         value={accountType}
                         onChange={(_, val: AccountType | null) => {
-                          if (val) setAccountType(val);
+                          if (val && val !== accountType) {
+                            setAccountType(val);
+                            setOrganization('');
+                            setError('');
+                            setNotice('');
+                          }
                         }}
                         aria-label="Account type"
                         sx={{
@@ -520,6 +825,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                           size="small"
                           value={firstName}
                           onChange={(e) => setFirstName(e.target.value)}
+                          autoComplete="given-name"
                           required
                           fullWidth
                         />
@@ -530,6 +836,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                           size="small"
                           value={lastName}
                           onChange={(e) => setLastName(e.target.value)}
+                          autoComplete="family-name"
                           required
                           fullWidth
                         />
@@ -543,6 +850,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                         size="small"
                         value={organization}
                         onChange={(e) => setOrganization(e.target.value)}
+                        autoComplete="organization"
                         required
                         fullWidth
                       />
@@ -556,6 +864,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                   size="small"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
+                  autoComplete={tab === 0 ? 'username' : 'off'}
                   required
                   fullWidth
                 />
@@ -566,6 +875,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                   size="small"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
+                  autoComplete={tab === 0 ? 'current-password' : 'new-password'}
                   helperText={tab === 1 ? 'Minimum 6 characters' : undefined}
                   required
                   fullWidth
@@ -608,12 +918,13 @@ export const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                       ? 'Signing In...'
                       : 'Sign In with Email'
                     : submitting
-                    ? 'Creating Account...'
+                    ? 'Sending Verification OTP...'
                     : accountType === 'organization'
                     ? 'Create Organization Account'
                     : 'Create Individual Account'}
                 </Button>
               </Box>
+              )}
 
               {!isAuth0Configured && (
                 <Typography variant="caption" sx={{ display: 'block', mt: 2, color: '#64748b', textAlign: 'center' }}>

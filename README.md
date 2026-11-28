@@ -113,6 +113,7 @@ Key backend variables (`backend/.env`):
 - `TESSERAK_ENCRYPTION_KEY`: Optional custom Fernet key for encrypting stored AWS/integration secrets.
 - `TESSERAK_CATALOG_AWS_ACCESS_KEY_ID`, `TESSERAK_CATALOG_AWS_SECRET_ACCESS_KEY`, `TESSERAK_CATALOG_AWS_REGION`: Optional read-only IAM credentials used for global AWS catalog endpoints (`eks-versions`, `addon-versions`, `eks-ami`, `eks-instance-types`).
 - `AUTH0_DOMAIN`, `AUTH0_AUDIENCE`: Optional Auth0 API verification settings.
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_USE_TLS`: Optional SMTP settings for sending 6-digit email signup OTP codes (when `SMTP_HOST` is unset locally, the UI displays a preview OTP code for development).
 
 ### 2. Start the Backend (`http://localhost:8000`)
 

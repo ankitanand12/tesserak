@@ -26,7 +26,8 @@ This document captures the current architecture, design decisions, database sche
 | :--- | :--- |
 | `SettingRecord` | Platform key/value settings & encryption salt/key metadata |
 | `AwsCatalogCacheRecord` (`aws_catalog_cache`) | Persists JSON payloads keyed by `cache_key` (e.g., `ec2_instance_types:<region>`) with `updated_at` |
-| `UserRecord` | User accounts & roles |
+| `UserRecord` | Verified user accounts & roles |
+| `EmailVerificationRecord` (`email_verifications`) | Pending 6-digit email OTP verification challenges and hashed signup payloads |
 | `AwsConnectionRecord` | Multi-account AWS IAM connectors per user with encrypted credentials & STS account validation |
 | `ClusterStateRecord` | Tracked EKS cluster state snapshots, creator/account metadata, and soft-delete timestamps |
 | `IntegrationRecord` | Connected third-party developer tools / SCM / registry integrations |
@@ -90,7 +91,8 @@ This document captures the current architecture, design decisions, database sche
 - `Clusters/NodeDetailsDialog.tsx`: Node detail inspector with paginated pod list (`10` pods per page) and clickable pod rows.
 - `Clusters/NodeGroupDetailsDialog.tsx`: AWS EKS node group inspector modal (configuration summary banner + 8 tabs covering Details, Nodes, Health issues, Labels, Update config, Taints, Update history, and Tags) plus Public/Private subnet labeling.
 - `Clusters/PodDetailsDialog.tsx`: Kubernetes pod inspector (Structured/Raw view, expandable Containers/Init Containers, Conditions, auto-refreshing `5s` live Events via `GET /clusters/{cluster_name}/pods/{namespace}/{pod_name}/events`, Volumes, Labels, and confirmation-guarded Restart/Delete Pod actions via `POST/DELETE /clusters/{cluster_name}/pods/{namespace}/{pod_name}`).
-- `auth/AuthContext.tsx`: Preserves Auth0/Google SSO `picture` URLs across PostgreSQL profile hydration (`tesserak-profile-updated` event sync + DB backfill).
+- `auth/AuthContext.tsx`: Preserves Auth0/Google SSO `picture` URLs across PostgreSQL profile hydration (`tesserak-profile-updated` event sync + DB backfill) and manages signed `email` session tokens alongside `Auth0SdkBridge`.
+- `components/Auth/AuthPage.tsx`: Supports Auth0 SSO plus 6-digit OTP-verified Individual and Organization email registration (`verify_email_registration_otp`), tab-switch form reset, and post-auth `Snackbar` feedback.
 - `utils/`: `swrCache.ts` (stale-while-revalidate client caching), `dateUtils.ts`, `imageUtils.ts`, `regionMapping.ts`.
 - `types/`: `cluster.ts`, `platform.ts`, `user.ts`.
 

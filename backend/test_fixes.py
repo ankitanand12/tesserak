@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pipelines_service
 import resources_service
 import main as backend_main
+import auth as backend_auth
+from db import DatabaseManager, EmailVerificationRecord, UserRecord
 
 
 class RegressionFixesTest(unittest.TestCase):
@@ -915,6 +917,152 @@ class RegressionFixesTest(unittest.TestCase):
                 refresh=True,
             )
             self.assertEqual(call_counts["cmd"], 6)
+
+    def test_email_otp_registration_and_login_for_individual_and_organization(self):
+        import os
+        import tempfile
+        from fastapi import HTTPException
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = DatabaseManager(f"sqlite:///{tmpdir}/auth_test.db")
+            temp_db.init_schema()
+
+            with patch.dict(os.environ, {"SMTP_HOST": ""}, clear=False):
+                # 1. Organization validation requires organization name
+                with self.assertRaises(HTTPException) as org_missing:
+                    backend_auth.register_email_user(
+                        email="founder@acme.io",
+                        password="password123",
+                        first_name="Asha",
+                        last_name="Verma",
+                        account_type="organization",
+                        organization="   ",
+                        db=temp_db,
+                    )
+                self.assertEqual(org_missing.exception.status_code, 400)
+
+                # 2. Individual signup issues local preview OTP and keeps account unverified until OTP confirmation
+                challenge = backend_auth.register_email_user(
+                    email="Manoj.Kumar@example.com ",
+                    password="password123",
+                    first_name="Manoj",
+                    last_name="Kumar",
+                    account_type="individual",
+                    db=temp_db,
+                )
+                self.assertTrue(challenge["verificationRequired"])
+                self.assertEqual(challenge["email"], "manoj.kumar@example.com")
+                self.assertEqual(challenge["accountType"], "individual")
+                self.assertEqual(challenge["deliveryMode"], "dev-preview")
+                self.assertRegex(challenge["devOtp"], r"^\d{6}$")
+
+                # Login before OTP verification is blocked with 403
+                with self.assertRaises(HTTPException) as unverified_login:
+                    backend_auth.authenticate_email_user("manoj.kumar@example.com", "password123", db=temp_db)
+                self.assertEqual(unverified_login.exception.status_code, 403)
+
+                # Wrong OTP increments attempts atomically and returns remaining attempts
+                wrong_otp = "000000" if challenge["devOtp"] != "000000" else "111111"
+                with self.assertRaises(HTTPException) as bad_otp:
+                    backend_auth.verify_email_registration_otp("manoj.kumar@example.com", wrong_otp, db=temp_db)
+                self.assertEqual(bad_otp.exception.status_code, 400)
+                with temp_db.session_scope() as session:
+                    pending_row = session.get(EmailVerificationRecord, "manoj.kumar@example.com")
+                    self.assertIsNotNone(pending_row)
+                    self.assertEqual(pending_row.attempts, 1)
+
+                # Immediate resend hits cooldown; clearing cooldown issues fresh OTP
+                with self.assertRaises(HTTPException) as cooldown_err:
+                    backend_auth.resend_email_registration_otp("manoj.kumar@example.com", db=temp_db)
+                self.assertEqual(cooldown_err.exception.status_code, 429)
+
+                with temp_db.session_scope() as session:
+                    pending_row = session.get(EmailVerificationRecord, "manoj.kumar@example.com")
+                    pending_row.resend_available_at = 0
+
+                refreshed = backend_auth.resend_email_registration_otp("manoj.kumar@example.com", db=temp_db)
+                self.assertRegex(refreshed["devOtp"], r"^\d{6}$")
+
+                # Valid OTP creates UserRecord, clears EmailVerificationRecord, and issues verifiable token
+                verified = backend_auth.verify_email_registration_otp(
+                    "manoj.kumar@example.com", refreshed["devOtp"], db=temp_db
+                )
+                self.assertTrue(verified["verified"])
+                self.assertTrue(verified["token"].startswith("tesserak."))
+                self.assertEqual(verified["user"]["email"], "manoj.kumar@example.com")
+                self.assertEqual(verified["user"]["accountType"], "individual")
+                self.assertEqual(verified["user"]["organization"], "Individual Workspace")
+
+                claims = backend_auth.verify_email_session_token(verified["token"], db=temp_db)
+                self.assertEqual(claims["sub"], "manoj.kumar@example.com")
+
+                # Already verified email returns 409 on repeat register
+                with self.assertRaises(HTTPException) as dup_reg:
+                    backend_auth.register_email_user(
+                        email="manoj.kumar@example.com",
+                        password="password123",
+                        first_name="Manoj",
+                        last_name="Kumar",
+                        account_type="individual",
+                        db=temp_db,
+                    )
+                self.assertEqual(dup_reg.exception.status_code, 409)
+
+                # Sign in works with newly verified Individual account
+                signed_in = backend_auth.authenticate_email_user("manoj.kumar@example.com", "password123", db=temp_db)
+                self.assertEqual(signed_in["user"]["email"], "manoj.kumar@example.com")
+
+                # 3. Organization signup -> OTP verification -> Sign In preserves organization
+                org_challenge = backend_auth.register_email_user(
+                    email="lead@acme.io",
+                    password="orgpassword99",
+                    first_name="Priya",
+                    last_name="Nair",
+                    account_type="organization",
+                    organization="Acme Cloud Platform",
+                    db=temp_db,
+                )
+                self.assertEqual(org_challenge["accountType"], "organization")
+                self.assertEqual(org_challenge["organization"], "Acme Cloud Platform")
+
+                org_verified = backend_auth.verify_email_registration_otp(
+                    "lead@acme.io", org_challenge["devOtp"], db=temp_db
+                )
+                self.assertEqual(org_verified["user"]["accountType"], "organization")
+                self.assertEqual(org_verified["user"]["organization"], "Acme Cloud Platform")
+                org_login = backend_auth.authenticate_email_user("lead@acme.io", "orgpassword99", db=temp_db)
+                self.assertEqual(org_login["user"]["organization"], "Acme Cloud Platform")
+
+            # 4. When SMTP_HOST is configured, send email via SMTP and never expose devOtp in response
+            smtp_client = MagicMock()
+            smtp_cm = MagicMock()
+            smtp_cm.__enter__.return_value = smtp_client
+            smtp_cm.__exit__.return_value = False
+            with patch.dict(
+                os.environ,
+                {
+                    "SMTP_HOST": "smtp.example.com",
+                    "SMTP_PORT": "587",
+                    "SMTP_USER": "mailer@example.com",
+                    "SMTP_PASSWORD": "app-password",
+                    "SMTP_USE_TLS": "true",
+                },
+                clear=False,
+            ), patch.object(backend_auth.smtplib, "SMTP", return_value=smtp_cm):
+                smtp_res = backend_auth.register_email_user(
+                    email="smtp.user@acme.io",
+                    password="password123",
+                    first_name="Ravi",
+                    last_name="Shah",
+                    account_type="organization",
+                    organization="Acme SMTP Org",
+                    db=temp_db,
+                )
+                self.assertEqual(smtp_res["deliveryMode"], "smtp")
+                self.assertNotIn("devOtp", smtp_res)
+                smtp_client.starttls.assert_called_once()
+                smtp_client.login.assert_called_once_with("mailer@example.com", "app-password")
+                smtp_client.send_message.assert_called_once()
 
 
 if __name__ == "__main__":
