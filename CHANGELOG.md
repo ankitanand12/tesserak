@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [v1.1.0] - 2026-11-28
+
 ### Added
 - **2026-11-28** — 6-digit Email OTP verification workflow for Individual and Organization email registration (`EmailVerificationRecord` in `backend/db.py`, `register_email_user`, `verify_email_registration_otp`, `resend_email_registration_otp` in `backend/auth.py`, `POST /api/auth/email/verify-otp` and `POST /api/auth/email/resend-otp` in `backend/tesserak_router.py`, optional `SMTP_*` delivery with local `dev-preview` fallback in `backend/.env.example`, and inline OTP + post-auth `Snackbar` notifications in `AuthPage.tsx` and `App.tsx`).
 - **2026-11-27** — Clickable AWS EKS & Community/Helm Add-on Details modal (`AddOnDetailsDialog.tsx`) showing AWS add-on configuration/ARN/health/pods and live Helm release status, notes, execution logs, namespace pods & Kubernetes events, Services/Ingresses, Domain & Access guides (e.g. Argo CD / Ingress NGINX), custom `values.yaml` editor with presets, and confirmation-guarded Helm uninstall (`GET /clusters/{cluster_name}/community-addons/{addon_id}/details`, `DELETE /clusters/{cluster_name}/community-addons/{addon_id}`) (`frontend/src/components/Clusters/AddOnDetailsDialog.tsx`, `frontend/src/pages/ClusterDetails.tsx`, `backend/main.py`, `backend/state_management.py`, `README.md`).
