@@ -15,6 +15,9 @@ import main as backend_main
 
 
 class RegressionFixesTest(unittest.TestCase):
+    def setUp(self):
+        backend_main._EKS_META_CACHE.clear()
+
     def test_pipeline_stage5_waits_for_rollout_before_capturing_pods(self):
         calls = []
 
@@ -765,6 +768,153 @@ class RegressionFixesTest(unittest.TestCase):
             det_res = backend_main._fetch_community_addon_details_sync(fake_conn, "user@tesserak.dev", "tesserak", "argo-cd")
             self.assertIn("$ helm uninstall argocd -n argocd", det_res["logs"])
             self.assertIn('release "argocd" uninstalled', det_res["logs"])
+
+    def test_community_addon_details_filters_resources_and_strips_values_header(self):
+        fake_conn = SimpleNamespace(accessKey="AKIA1", secretKey="SEC1", region="us-east-1", accountId="111122223333")
+        fake_eks = MagicMock()
+        fake_eks.describe_cluster.return_value = {
+            "cluster": {
+                "name": "replit-eks",
+                "status": "ACTIVE",
+                "endpoint": "https://eks.example.com",
+                "certificateAuthority": {"data": "Q0E="},
+            }
+        }
+
+        k8s_items = {
+            "items": [
+                {
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": "aws-load-balancer-controller-76dcd88787-2xp2t",
+                        "namespace": "kube-system",
+                        "labels": {
+                            "app.kubernetes.io/name": "aws-load-balancer-controller",
+                            "app.kubernetes.io/instance": "aws-load-balancer-controller",
+                        },
+                    },
+                    "spec": {"nodeName": "ip-10-0-1-10", "containers": [{"name": "ctrl", "image": "lbc:v2.11.0"}]},
+                    "status": {"phase": "Running", "podIP": "10.42.1.10", "containerStatuses": [{"ready": True}]},
+                },
+                {
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": "aws-node-x123",
+                        "namespace": "kube-system",
+                        "labels": {"k8s-app": "aws-node"},
+                    },
+                    "spec": {"nodeName": "ip-10-0-1-10", "containers": [{"name": "aws-node", "image": "cni:latest"}]},
+                    "status": {"phase": "Running", "podIP": "10.42.1.11", "containerStatuses": [{"ready": True}]},
+                },
+                {
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": "coredns-5d9b55bc77-6562h",
+                        "namespace": "kube-system",
+                        "labels": {"k8s-app": "kube-dns"},
+                    },
+                    "spec": {"nodeName": "ip-10-0-1-10", "containers": [{"name": "coredns", "image": "coredns:latest"}]},
+                    "status": {"phase": "Running", "podIP": "10.42.1.12", "containerStatuses": [{"ready": True}]},
+                },
+                {
+                    "kind": "Service",
+                    "metadata": {
+                        "name": "aws-load-balancer-webhook-service",
+                        "namespace": "kube-system",
+                        "labels": {"app.kubernetes.io/instance": "aws-load-balancer-controller"},
+                    },
+                    "spec": {"type": "ClusterIP", "clusterIP": "172.20.138.52", "ports": [{"port": 443, "protocol": "TCP"}]},
+                },
+                {
+                    "kind": "Service",
+                    "metadata": {
+                        "name": "kube-dns",
+                        "namespace": "kube-system",
+                        "labels": {"k8s-app": "kube-dns"},
+                    },
+                    "spec": {"type": "ClusterIP", "clusterIP": "172.20.0.10", "ports": [{"port": 53, "protocol": "UDP"}]},
+                },
+                {
+                    "kind": "Event",
+                    "type": "Normal",
+                    "reason": "Started",
+                    "message": "Started container controller",
+                    "involvedObject": {"kind": "Pod", "name": "aws-load-balancer-controller-76dcd88787-2xp2t"},
+                    "lastTimestamp": "2026-11-28T10:00:00Z",
+                },
+                {
+                    "kind": "Event",
+                    "type": "Normal",
+                    "reason": "Pulled",
+                    "message": "Pulled kube-proxy image",
+                    "involvedObject": {"kind": "Pod", "name": "kube-proxy-x9q42"},
+                    "lastTimestamp": "2026-11-28T10:01:00Z",
+                },
+            ]
+        }
+
+        call_counts = {"cmd": 0}
+
+        def fake_run(cmd, capture_output=True, text=True, timeout=15, env=None, check=False):
+            call_counts["cmd"] += 1
+            if "status" in cmd:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"info": {"status": "deployed", "notes": "AWS Load Balancer Controller installed!"}}),
+                    stderr="",
+                )
+            if "values" in cmd:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="USER-SUPPLIED VALUES:\nclusterName: replit-eks\nregion: us-east-1\n",
+                    stderr="",
+                )
+            if "pods,svc,ingress,events" in cmd:
+                return SimpleNamespace(returncode=0, stdout=json.dumps(k8s_items), stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(backend_main.boto3, "client", return_value=fake_eks), patch.object(
+            backend_main, "_resolve_helm_binary", return_value="/opt/homebrew/bin/helm"
+        ), patch.object(backend_main.subprocess, "run", side_effect=fake_run), patch.object(
+            backend_main.state_manager, "get_cluster_state", return_value=None
+        ):
+            res = backend_main._fetch_community_addon_details_sync(
+                fake_conn,
+                "user@tesserak.dev",
+                "replit-eks",
+                "aws-load-balancer-controller",
+                namespace_override="kube-system",
+                release_override="aws-load-balancer-controller",
+            )
+            self.assertEqual([p["name"] for p in res["resources"]["pods"]], ["aws-load-balancer-controller-76dcd88787-2xp2t"])
+            self.assertEqual([s["name"] for s in res["resources"]["services"]], ["aws-load-balancer-webhook-service"])
+            self.assertEqual([e["reason"] for e in res["events"]], ["Started"])
+            self.assertEqual(res["valuesYaml"], "clusterName: replit-eks\nregion: us-east-1")
+            first_count = call_counts["cmd"]
+            self.assertEqual(first_count, 3)
+
+            # Cached repeat open skips extra subprocess calls unless refresh=True
+            res_cached = backend_main._fetch_community_addon_details_sync(
+                fake_conn,
+                "user@tesserak.dev",
+                "replit-eks",
+                "aws-load-balancer-controller",
+                namespace_override="kube-system",
+                release_override="aws-load-balancer-controller",
+            )
+            self.assertEqual(call_counts["cmd"], first_count)
+            self.assertEqual(res_cached["notes"], "AWS Load Balancer Controller installed!")
+
+            backend_main._fetch_community_addon_details_sync(
+                fake_conn,
+                "user@tesserak.dev",
+                "replit-eks",
+                "aws-load-balancer-controller",
+                namespace_override="kube-system",
+                release_override="aws-load-balancer-controller",
+                refresh=True,
+            )
+            self.assertEqual(call_counts["cmd"], 6)
 
 
 if __name__ == "__main__":

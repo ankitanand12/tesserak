@@ -897,4 +897,124 @@ describe('ClusterDetails page', () => {
     await screen.findByRole('dialog');
     expect(screen.queryByText('Uninstall Community Add-on?')).not.toBeInTheDocument();
   });
+
+  test('filters shared namespace pods to selected community add-on and caches live details', async () => {
+    let resolveDetails: ((val: Response) => void) | null = null;
+    let detailsFetchCount = 0;
+
+    const sharedNsDetail = {
+      ...sampleClusterDetail,
+      pods: [
+        {
+          name: 'aws-load-balancer-controller-76dcd88787-2xp2t',
+          namespace: 'kube-system',
+          status: 'Running',
+          ready: '1/1',
+          restarts: 0,
+          podIp: '10.42.1.10',
+          nodeName: 'ip-10-0-1-10.ec2.internal',
+          labels: {
+            'app.kubernetes.io/name': 'aws-load-balancer-controller',
+            'app.kubernetes.io/instance': 'aws-load-balancer-controller',
+          },
+        },
+        {
+          name: 'aws-node-12345',
+          namespace: 'kube-system',
+          status: 'Running',
+          ready: '2/2',
+          restarts: 0,
+          podIp: '10.42.1.11',
+          nodeName: 'ip-10-0-1-10.ec2.internal',
+          labels: { 'k8s-app': 'aws-node' },
+        },
+        {
+          name: 'coredns-5d9b55bc77-6562h',
+          namespace: 'kube-system',
+          status: 'Running',
+          ready: '1/1',
+          restarts: 0,
+          podIp: '10.42.1.12',
+          nodeName: 'ip-10-0-1-10.ec2.internal',
+          labels: { 'k8s-app': 'kube-dns' },
+        },
+      ],
+      communityAddons: [
+        {
+          id: 'aws-load-balancer-controller',
+          name: 'aws-load-balancer-controller',
+          releaseName: 'aws-load-balancer-controller',
+          namespace: 'kube-system',
+          chart: 'aws-load-balancer-controller-1.11.0',
+          version: 'v2.11.0',
+          status: 'DEPLOYED',
+          details: '2026-07-28 10:00:00',
+        },
+      ],
+    };
+
+    global.fetch = jest.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/community-addons/aws-load-balancer-controller/details')) {
+        detailsFetchCount += 1;
+        return new Promise<Response>((resolve) => {
+          resolveDetails = resolve;
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => sharedNsDetail,
+      } as Response);
+    }) as any;
+
+    render(<ClusterDetails />);
+    fireEvent.click(await screen.findByRole('tab', { name: /Compute & Add-ons/i }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'aws-load-balancer-controller' }));
+    const helmModal = await screen.findByRole('dialog');
+
+    // Before live details finish loading, Overview shows loading state & Pods tab filters ONLY add-on pods
+    expect(within(helmModal).getByText(/Loading live Services, Ingress endpoints/i)).toBeInTheDocument();
+    fireEvent.click(within(helmModal).getByRole('tab', { name: /Install Logs & Events/i }));
+    expect(within(helmModal).getByText('Add-on Pods (1)')).toBeInTheDocument();
+    expect(within(helmModal).getByText('aws-load-balancer-controller-76dcd88787-2xp2t')).toBeInTheDocument();
+    expect(within(helmModal).queryByText('aws-node-12345')).not.toBeInTheDocument();
+    expect(within(helmModal).queryByText('coredns-5d9b55bc77-6562h')).not.toBeInTheDocument();
+
+    resolveDetails!({
+      ok: true,
+      json: async () => ({
+        id: 'aws-load-balancer-controller',
+        releaseName: 'aws-load-balancer-controller',
+        namespace: 'kube-system',
+        helmStatus: { status: 'deployed' },
+        notes: 'AWS Load Balancer Controller installed!',
+        resources: {
+          pods: [sharedNsDetail.pods[0]],
+          services: [
+            {
+              name: 'aws-load-balancer-webhook-service',
+              type: 'ClusterIP',
+              clusterIP: '172.20.138.52',
+              ports: ['443/TCP'],
+            },
+          ],
+          ingresses: [],
+        },
+        events: [],
+      }),
+    } as Response);
+
+    fireEvent.click(within(helmModal).getByRole('tab', { name: /Overview & Access/i }));
+    expect(await within(helmModal).findByText('aws-load-balancer-webhook-service', {}, { timeout: 10000 })).toBeInTheDocument();
+    expect(detailsFetchCount).toBe(1);
+
+    // Reopening serves cached details immediately without duplicate backend fetch
+    fireEvent.click(within(helmModal).getByRole('button', { name: 'Close add-on details' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument(), { timeout: 10000 });
+    fireEvent.click(screen.getByRole('button', { name: 'aws-load-balancer-controller' }));
+    const reopened = await screen.findByRole('dialog');
+    expect(await within(reopened).findByText('aws-load-balancer-webhook-service')).toBeInTheDocument();
+    expect(detailsFetchCount).toBe(1);
+  });
 });

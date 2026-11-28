@@ -2066,6 +2066,7 @@ def _get_cluster_details_sync(connection: Any, x_user_email: str, cluster_name: 
             )
         )
 
+    _cache_cluster_endpoint_info(connection, region, cluster_name, cluster_info)
     aws_region = cluster_info["arn"].split(":")[3]
     vpc_cfg = cluster_info.get("resourcesVpcConfig", {})
     vpc_id = vpc_cfg.get("vpcId")
@@ -2684,16 +2685,9 @@ def _kubectl_pod_action_sync(
     force: bool = False,
 ) -> Dict[str, Any]:
     region = connection.region or "us-east-1"
-    eks = boto3.client(
-        "eks",
-        aws_access_key_id=connection.accessKey,
-        aws_secret_access_key=connection.secretKey,
-        region_name=region,
-        config=AWS_FAST_CFG,
-    )
-    cluster_info = eks.describe_cluster(name=cluster_name).get("cluster", {})
-    endpoint = cluster_info.get("endpoint")
-    ca_data = (cluster_info.get("certificateAuthority") or {}).get("data")
+    ep_info = _get_cluster_endpoint_info(connection, region, cluster_name)
+    endpoint = ep_info.get("endpoint")
+    ca_data = ep_info.get("ca_data")
     if not endpoint or not ca_data:
         raise HTTPException(status_code=400, detail=f"Cluster '{cluster_name}' endpoint is not available.")
 
@@ -3036,6 +3030,7 @@ async def install_cluster_community_addon(
         state_manager.save_cluster_state(x_user_email, cluster_name, updated)
 
     await asyncio.to_thread(_record_result)
+    _invalidate_addon_details_cache(user_email=x_user_email, cluster_name=cluster_name, addon_id=addon.id)
     if res.get("status") in ("failed", "unsupported"):
         raise HTTPException(status_code=400, detail=res.get("details") or f"Failed to install {addon.id}")
     return res
@@ -3065,10 +3060,153 @@ def _latest_addon_history_entry(state_dict: Dict[str, Any], addon_id: str) -> Di
     return {"logs": "", "details": "", "timestamp": ""}
 
 
+_ADDON_RESOURCE_ALIASES: Dict[str, List[str]] = {
+    "argo-cd": ["argocd", "argo-cd"],
+    "argo-workflow": ["argo-workflows", "argo-server", "workflow-controller"],
+    "argo-workflows": ["argo-workflows", "argo-server", "workflow-controller"],
+    "aws-load-balancer-controller": ["aws-load-balancer-controller", "aws-load-balancer-webhook"],
+    "grafana-stack": ["grafana-stack", "kube-prometheus-stack", "grafana", "prometheus", "alertmanager"],
+}
+
+
+def _cache_cluster_endpoint_info(
+    connection: Any,
+    region: str,
+    cluster_name: str,
+    cluster_info: Dict[str, Any],
+) -> None:
+    endpoint = cluster_info.get("endpoint")
+    ca_data = (cluster_info.get("certificateAuthority") or {}).get("data")
+    status = cluster_info.get("status")
+    if endpoint and ca_data and status == "ACTIVE":
+        acct = getattr(connection, "accountId", None) or "default"
+        cache_key = f"cluster_ep:{acct}:{region}:{cluster_name}"
+        _EKS_META_CACHE[cache_key] = (
+            time.monotonic() + 90.0,
+            {"endpoint": endpoint, "ca_data": ca_data, "status": status},
+        )
+
+
+def _get_cluster_endpoint_info(connection: Any, region: str, cluster_name: str) -> Dict[str, Any]:
+    acct = getattr(connection, "accountId", None) or "default"
+    cache_key = f"cluster_ep:{acct}:{region}:{cluster_name}"
+    cached = _EKS_META_CACHE.get(cache_key)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+    eks = boto3.client(
+        "eks",
+        aws_access_key_id=connection.accessKey,
+        aws_secret_access_key=connection.secretKey,
+        region_name=region,
+        config=AWS_FAST_CFG,
+    )
+    cluster_info = eks.describe_cluster(name=cluster_name).get("cluster", {})
+    _cache_cluster_endpoint_info(connection, region, cluster_name, cluster_info)
+    return {
+        "endpoint": cluster_info.get("endpoint"),
+        "ca_data": (cluster_info.get("certificateAuthority") or {}).get("data"),
+        "status": cluster_info.get("status"),
+    }
+
+
+def _invalidate_addon_details_cache(
+    user_email: str,
+    cluster_name: str,
+    addon_id: str,
+) -> None:
+    prefix = f"addon_details:{(user_email or '').strip().lower()}:{cluster_name}:{addon_id.lower()}:"
+    for key in list(_EKS_META_CACHE.keys()):
+        if key.startswith(prefix):
+            _EKS_META_CACHE.pop(key, None)
+
+
+def _build_addon_release_tokens(
+    addon_id: str,
+    release: str,
+    chart: Optional[str] = None,
+) -> Tuple[set, set]:
+    exact: set = set()
+    stems: set = set()
+    for raw in (addon_id, release, chart or ""):
+        val = str(raw or "").strip().lower()
+        if not val:
+            continue
+        exact.add(val)
+        chart_base = re.sub(r"-\d+\.\d+.*$", "", val)
+        if chart_base:
+            exact.add(chart_base)
+            stems.add(chart_base)
+    for key in list(exact):
+        for alias in _ADDON_RESOURCE_ALIASES.get(key, []):
+            exact.add(alias)
+            stems.add(alias)
+    if any(t.endswith("-controller") for t in exact):
+        for t in list(exact):
+            if t.endswith("-controller"):
+                stem = t[: -len("-controller")]
+                if len(stem) >= 4:
+                    stems.add(f"{stem}-webhook")
+    stems.update(exact)
+    return {t for t in exact if len(t) >= 2}, {t for t in stems if len(t) >= 2}
+
+
+def _matches_prefix_or_exact(candidate: str, tokens: set) -> bool:
+    c = (candidate or "").strip().lower()
+    if not c:
+        return False
+    return any(c == tok or c.startswith(f"{tok}-") for tok in tokens)
+
+
+def _k8s_item_matches_release(item: Dict[str, Any], exact_tokens: set, stem_tokens: set) -> bool:
+    meta = item.get("metadata") or {}
+    labels = {str(k).lower(): str(v).lower() for k, v in (meta.get("labels") or {}).items()}
+    annotations = {str(k).lower(): str(v).lower() for k, v in (meta.get("annotations") or {}).items()}
+    name = str(meta.get("name") or "").lower()
+    owners = [str(ref.get("name") or "").lower() for ref in (meta.get("ownerReferences") or []) if ref.get("name")]
+
+    helm_rel = annotations.get("meta.helm.sh/release-name", "").strip()
+    if helm_rel:
+        return helm_rel in exact_tokens
+
+    app_inst = labels.get("app.kubernetes.io/instance", "").strip()
+    if app_inst:
+        return app_inst in exact_tokens
+
+    lbl_rel = labels.get("release", "").strip()
+    if lbl_rel:
+        return lbl_rel in exact_tokens
+
+    helm_chart = labels.get("helm.sh/chart", "").strip()
+    if helm_chart:
+        chart_base = re.sub(r"-\d+\.\d+.*$", "", helm_chart)
+        return _matches_prefix_or_exact(chart_base, stem_tokens)
+
+    for lbl_key in ("app.kubernetes.io/name", "app.kubernetes.io/part-of", "app", "k8s-app"):
+        val = labels.get(lbl_key, "").strip()
+        if val and _matches_prefix_or_exact(val, stem_tokens):
+            return True
+
+    if _matches_prefix_or_exact(name, stem_tokens):
+        return True
+
+    return any(_matches_prefix_or_exact(owner, stem_tokens) for owner in owners)
+
+
+def _k8s_event_matches_release(ev: Dict[str, Any], stem_tokens: set, matched_names: set) -> bool:
+    involved = str(((ev.get("involvedObject") or {}).get("name")) or "").strip().lower()
+    if not involved:
+        return False
+    if involved in matched_names:
+        return True
+    return _matches_prefix_or_exact(involved, stem_tokens)
+
+
 def _resolve_community_addon_target(
     user_email: str,
     cluster_name: str,
     addon_id: str,
+    namespace_override: Optional[str] = None,
+    release_override: Optional[str] = None,
 ) -> Tuple[str, str, Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     cfg = _COMMUNITY_ADDON_REPOS.get(addon_id, {})
     preset = _COMMUNITY_ADDON_PRESETS.get(addon_id, {})
@@ -3088,6 +3226,10 @@ def _resolve_community_addon_target(
         release = str(tracked["releaseName"])
     if tracked.get("namespace"):
         namespace = str(tracked["namespace"])
+    if release_override:
+        release = str(release_override).strip()
+    if namespace_override:
+        namespace = str(namespace_override).strip()
     return release, namespace, cfg, preset, tracked, base_state
 
 
@@ -3096,22 +3238,27 @@ def _fetch_community_addon_details_sync(
     user_email: str,
     cluster_name: str,
     addon_id: str,
+    namespace_override: Optional[str] = None,
+    release_override: Optional[str] = None,
+    refresh: bool = False,
 ) -> Dict[str, Any]:
     region = connection.region or "us-east-1"
-    release, namespace, _cfg, preset, tracked, base_state = _resolve_community_addon_target(
-        user_email, cluster_name, addon_id
+    release, namespace, cfg, preset, tracked, base_state = _resolve_community_addon_target(
+        user_email,
+        cluster_name,
+        addon_id,
+        namespace_override=namespace_override,
+        release_override=release_override,
     )
+    details_cache_key = f"addon_details:{(user_email or '').strip().lower()}:{cluster_name}:{addon_id.lower()}:{namespace}:{release}"
+    if not refresh:
+        cached_details = _EKS_META_CACHE.get(details_cache_key)
+        if cached_details and cached_details[0] > time.monotonic():
+            return cached_details[1]
 
-    eks = boto3.client(
-        "eks",
-        aws_access_key_id=connection.accessKey,
-        aws_secret_access_key=connection.secretKey,
-        region_name=region,
-        config=AWS_FAST_CFG,
-    )
-    cluster_info = eks.describe_cluster(name=cluster_name).get("cluster", {})
-    endpoint = cluster_info.get("endpoint")
-    ca_data = (cluster_info.get("certificateAuthority") or {}).get("data")
+    ep_info = _get_cluster_endpoint_info(connection, region, cluster_name)
+    endpoint = ep_info.get("endpoint")
+    ca_data = ep_info.get("ca_data")
 
     helm_status: Optional[Dict[str, Any]] = None
     notes = tracked.get("notes") or ""
@@ -3121,109 +3268,158 @@ def _fetch_community_addon_details_sync(
     ingresses: List[Dict[str, Any]] = []
     events: List[Dict[str, Any]] = []
 
-    if endpoint and ca_data and cluster_info.get("status") == "ACTIVE":
+    exact_tokens, stem_tokens = _build_addon_release_tokens(
+        addon_id,
+        release,
+        chart=str(tracked.get("chart") or cfg.get("chart") or ""),
+    )
+
+    if endpoint and ca_data and ep_info.get("status") == "ACTIVE":
         tmpdir = tempfile.mkdtemp(prefix="tesserak_cad_")
         try:
             tmp_path = Path(tmpdir)
             kc_path = tmp_path / "kubeconfig"
             kc_path.write_text(build_eks_kubeconfig_yaml(cluster_name, endpoint, ca_data, region))
-            env = _isolated_helm_env(connection, kc_path, region, tmp_path)
             helm_bin = _resolve_helm_binary()
 
-            if helm_bin:
+            def _run_helm_status() -> Optional[Dict[str, Any]]:
+                if not helm_bin:
+                    return None
+                env_st = _isolated_helm_env(connection, kc_path, region, tmp_path / "st")
                 st_p = subprocess.run(
                     [helm_bin, "status", release, "-n", namespace, "-o", "json", "--kubeconfig", str(kc_path)],
                     capture_output=True,
                     text=True,
                     timeout=15,
-                    env=env,
+                    env=env_st,
                     check=False,
                 )
                 if st_p.returncode == 0 and st_p.stdout.strip():
-                    helm_status = json.loads(st_p.stdout)
-                    info_notes = ((helm_status or {}).get("info") or {}).get("notes")
-                    if info_notes and not notes:
-                        notes = info_notes
+                    return json.loads(st_p.stdout)
+                return None
+
+            def _run_helm_values() -> str:
+                if not helm_bin:
+                    return ""
+                env_val = _isolated_helm_env(connection, kc_path, region, tmp_path / "val")
                 val_p = subprocess.run(
-                    [helm_bin, "get", "values", release, "-n", namespace, "--kubeconfig", str(kc_path)],
+                    [helm_bin, "get", "values", release, "-n", namespace, "-o", "yaml", "--kubeconfig", str(kc_path)],
                     capture_output=True,
                     text=True,
                     timeout=15,
-                    env=env,
+                    env=env_val,
                     check=False,
                 )
-                if val_p.returncode == 0 and val_p.stdout.strip() and "null" not in val_p.stdout.strip().lower()[:6]:
-                    values_yaml = val_p.stdout.strip()
+                if val_p.returncode != 0:
+                    return ""
+                lines = [
+                    ln for ln in (val_p.stdout or "").splitlines()
+                    if ln.strip() != "USER-SUPPLIED VALUES:"
+                ]
+                cleaned = "\n".join(lines).strip()
+                if cleaned and cleaned.lower() not in ("null", "{}"):
+                    return cleaned
+                return ""
 
-            res_p = subprocess.run(
-                [
-                    "kubectl",
-                    "--kubeconfig",
-                    str(kc_path),
-                    "get",
-                    "pods,svc,ingress,events",
-                    "-n",
-                    namespace,
-                    "-o",
-                    "json",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                env=env,
-                check=False,
-            )
-            if res_p.returncode == 0 and res_p.stdout.strip():
-                items = (json.loads(res_p.stdout) or {}).get("items") or []
-                for it in items:
-                    kind = it.get("kind")
-                    if kind == "Pod":
-                        pods.append(_extract_pod_summary(it))
-                    elif kind == "Service":
-                        meta = it.get("metadata") or {}
-                        spec = it.get("spec") or {}
-                        status = it.get("status") or {}
-                        lb_ing = ((status.get("loadBalancer") or {}).get("ingress")) or []
-                        external_hosts = [
-                            x.get("hostname") or x.get("ip")
-                            for x in lb_ing
-                            if x.get("hostname") or x.get("ip")
-                        ]
-                        services.append({
-                            "name": meta.get("name"),
-                            "type": spec.get("type"),
-                            "clusterIP": spec.get("clusterIP"),
-                            "externalEndpoints": external_hosts,
-                            "ports": [
-                                f"{p.get('port')}/{p.get('protocol', 'TCP')}"
-                                + (f" -> {p.get('nodePort')}" if p.get("nodePort") else "")
-                                for p in (spec.get("ports") or [])
-                            ],
-                        })
-                    elif kind == "Ingress":
-                        meta = it.get("metadata") or {}
-                        spec = it.get("spec") or {}
-                        status = it.get("status") or {}
-                        hosts = [r.get("host") for r in (spec.get("rules") or []) if r.get("host")]
-                        lb_ing = ((status.get("loadBalancer") or {}).get("ingress")) or []
-                        addresses = [x.get("hostname") or x.get("ip") for x in lb_ing if x.get("hostname") or x.get("ip")]
-                        ingresses.append({
-                            "name": meta.get("name"),
-                            "className": spec.get("ingressClassName"),
-                            "hosts": hosts,
-                            "addresses": addresses,
-                            "tls": bool(spec.get("tls")),
-                        })
-                    elif kind == "Event":
-                        events.append(_format_k8s_event_item(it))
-                events.sort(key=lambda e: str(e.get("lastSeen") or ""), reverse=True)
+            def _run_kubectl_resources() -> List[Dict[str, Any]]:
+                env_k8s = _isolated_helm_env(connection, kc_path, region, tmp_path / "k8s")
+                res_p = subprocess.run(
+                    [
+                        "kubectl",
+                        "--kubeconfig",
+                        str(kc_path),
+                        "get",
+                        "pods,svc,ingress,events",
+                        "-n",
+                        namespace,
+                        "-o",
+                        "json",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    env=env_k8s,
+                    check=False,
+                )
+                if res_p.returncode == 0 and res_p.stdout.strip():
+                    return (json.loads(res_p.stdout) or {}).get("items") or []
+                return []
+
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                f_st = pool.submit(_run_helm_status)
+                f_val = pool.submit(_run_helm_values)
+                f_k8s = pool.submit(_run_kubectl_resources)
+
+                helm_status = f_st.result()
+                fetched_val = f_val.result()
+                items = f_k8s.result()
+
+            info_notes = ((helm_status or {}).get("info") or {}).get("notes")
+            if info_notes and not notes:
+                notes = info_notes
+            if fetched_val:
+                values_yaml = fetched_val
+
+            matched_obj_names: set = set()
+            raw_events: List[Dict[str, Any]] = []
+            for it in items:
+                kind = it.get("kind")
+                if kind == "Event":
+                    raw_events.append(it)
+                    continue
+                if not _k8s_item_matches_release(it, exact_tokens, stem_tokens):
+                    continue
+                meta = it.get("metadata") or {}
+                obj_name = str(meta.get("name") or "").lower()
+                if obj_name:
+                    matched_obj_names.add(obj_name)
+                if kind == "Pod":
+                    pods.append(_extract_pod_summary(it))
+                elif kind == "Service":
+                    spec = it.get("spec") or {}
+                    status = it.get("status") or {}
+                    lb_ing = ((status.get("loadBalancer") or {}).get("ingress")) or []
+                    external_hosts = [
+                        x.get("hostname") or x.get("ip")
+                        for x in lb_ing
+                        if x.get("hostname") or x.get("ip")
+                    ]
+                    services.append({
+                        "name": meta.get("name"),
+                        "type": spec.get("type"),
+                        "clusterIP": spec.get("clusterIP"),
+                        "externalEndpoints": external_hosts,
+                        "ports": [
+                            f"{p.get('port')}/{p.get('protocol', 'TCP')}"
+                            + (f" -> {p.get('nodePort')}" if p.get("nodePort") else "")
+                            for p in (spec.get("ports") or [])
+                        ],
+                    })
+                elif kind == "Ingress":
+                    spec = it.get("spec") or {}
+                    status = it.get("status") or {}
+                    hosts = [r.get("host") for r in (spec.get("rules") or []) if r.get("host")]
+                    lb_ing = ((status.get("loadBalancer") or {}).get("ingress")) or []
+                    addresses = [x.get("hostname") or x.get("ip") for x in lb_ing if x.get("hostname") or x.get("ip")]
+                    ingresses.append({
+                        "name": meta.get("name"),
+                        "className": spec.get("ingressClassName"),
+                        "hosts": hosts,
+                        "addresses": addresses,
+                        "tls": bool(spec.get("tls")),
+                    })
+
+            for ev_raw in raw_events:
+                if _k8s_event_matches_release(ev_raw, stem_tokens, matched_obj_names):
+                    events.append(_format_k8s_event_item(ev_raw))
+            events.sort(key=lambda e: str(e.get("lastSeen") or ""), reverse=True)
         except Exception as exc:
             logger.warning(f"Community addon live inspection warning for {addon_id}: {exc}")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     hist_entry = _latest_addon_history_entry(base_state, addon_id)
-    return {
+    payload = {
         "id": addon_id,
         "releaseName": release,
         "namespace": namespace,
@@ -3242,6 +3438,8 @@ def _fetch_community_addon_details_sync(
         },
         "events": events[:50],
     }
+    _EKS_META_CACHE[details_cache_key] = (time.monotonic() + 30.0, payload)
+    return payload
 
 
 @app.get("/clusters/{cluster_name}/community-addons/{addon_id}/details", dependencies=[Depends(require_auth_if_configured)])
@@ -3249,10 +3447,22 @@ async def get_cluster_community_addon_details(
     cluster_name: str,
     addon_id: str,
     account_id: Optional[str] = None,
+    namespace: Optional[str] = None,
+    release_name: Optional[str] = None,
+    refresh: bool = False,
     x_user_email: str = Header(...),
 ):
     connection = await _resolve_account_connection(x_user_email, account_id)
-    return await asyncio.to_thread(_fetch_community_addon_details_sync, connection, x_user_email, cluster_name, addon_id)
+    return await asyncio.to_thread(
+        _fetch_community_addon_details_sync,
+        connection,
+        x_user_email,
+        cluster_name,
+        addon_id,
+        namespace,
+        release_name,
+        refresh,
+    )
 
 
 def _uninstall_community_addon_sync(
@@ -3269,16 +3479,9 @@ def _uninstall_community_addon_sync(
     if not helm_bin:
         raise HTTPException(status_code=500, detail="Helm CLI is not installed on the backend host.")
 
-    eks = boto3.client(
-        "eks",
-        aws_access_key_id=connection.accessKey,
-        aws_secret_access_key=connection.secretKey,
-        region_name=region,
-        config=AWS_FAST_CFG,
-    )
-    cluster_info = eks.describe_cluster(name=cluster_name).get("cluster", {})
-    endpoint = cluster_info.get("endpoint")
-    ca_data = (cluster_info.get("certificateAuthority") or {}).get("data")
+    ep_info = _get_cluster_endpoint_info(connection, region, cluster_name)
+    endpoint = ep_info.get("endpoint")
+    ca_data = ep_info.get("ca_data")
     if not endpoint or not ca_data:
         raise HTTPException(status_code=400, detail=f"Cluster '{cluster_name}' endpoint is not available.")
 
@@ -3330,6 +3533,7 @@ def _uninstall_community_addon_sync(
             },
         )
         state_manager.save_cluster_state(user_email, cluster_name, updated)
+    _invalidate_addon_details_cache(user_email, cluster_name, addon_id)
 
     return {
         "status": "uninstalled",

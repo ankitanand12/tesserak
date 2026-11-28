@@ -12,6 +12,7 @@ import {
   Divider,
   Grid,
   IconButton,
+  LinearProgress,
   Paper,
   Tab,
   Table,
@@ -35,6 +36,7 @@ import {
 } from '@mui/icons-material';
 import { ClusterPod, formatClusterDateTime, getPodStatusChipColor } from './NodeDetailsDialog';
 import { ConfirmDeleteDialog } from '../ConfirmDeleteDialog';
+import { fetchWithSwr, invalidateSwrCache, readSwrCache } from '../../utils/swrCache';
 
 export interface AwsClusterAddon {
   addonName: string;
@@ -188,6 +190,96 @@ const AWS_ADDON_POD_HINTS: Record<string, string[]> = {
   'snapshot-controller': ['snapshot-controller'],
 };
 
+const COMMUNITY_ADDON_ALIASES: Record<string, string[]> = {
+  'argo-cd': ['argocd', 'argo-cd'],
+  'argo-workflow': ['argo-workflows', 'argo-server', 'workflow-controller'],
+  'argo-workflows': ['argo-workflows', 'argo-server', 'workflow-controller'],
+  'aws-load-balancer-controller': ['aws-load-balancer-controller', 'aws-load-balancer-webhook'],
+  'grafana-stack': ['grafana-stack', 'kube-prometheus-stack', 'grafana', 'prometheus', 'alertmanager'],
+};
+
+const buildCommunityReleaseTokens = (ca: CommunityClusterAddon): { exact: Set<string>; stems: Set<string> } => {
+  const exact = new Set<string>();
+  const stems = new Set<string>();
+  for (const raw of [ca.id, ca.releaseName, ca.chart]) {
+    const val = (raw || '').trim().toLowerCase();
+    if (!val) continue;
+    exact.add(val);
+    const base = val.replace(/-\d+\.\d+.*$/, '');
+    if (base) {
+      exact.add(base);
+      stems.add(base);
+    }
+  }
+  for (const key of Array.from(exact)) {
+    for (const alias of COMMUNITY_ADDON_ALIASES[key] || []) {
+      exact.add(alias);
+      stems.add(alias);
+    }
+  }
+  for (const t of Array.from(exact)) {
+    if (t.endsWith('-controller') && t.length > '-controller'.length + 4) {
+      stems.add(`${t.slice(0, -'-controller'.length)}-webhook`);
+    }
+  }
+  exact.forEach((t) => stems.add(t));
+  return { exact, stems };
+};
+
+const matchesPrefixOrExact = (candidate: string | undefined, tokens: Set<string>): boolean => {
+  const c = (candidate || '').trim().toLowerCase();
+  if (!c) return false;
+  for (const tok of Array.from(tokens)) {
+    if (tok.length >= 2 && (c === tok || c.startsWith(`${tok}-`))) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const matchesCommunityAddonPod = (
+  pod: ClusterPod,
+  ca: CommunityClusterAddon,
+  namespaceOverride?: string,
+  releaseOverride?: string
+): boolean => {
+  const targetNs = (namespaceOverride || ca.namespace || '').trim().toLowerCase();
+  if (targetNs && (pod.namespace || '').trim().toLowerCase() !== targetNs) {
+    return false;
+  }
+  const { exact, stems } = buildCommunityReleaseTokens(
+    releaseOverride ? { ...ca, releaseName: releaseOverride } : ca
+  );
+  const labels = Object.fromEntries(
+    Object.entries(pod.labels || {}).map(([k, v]) => [k.toLowerCase(), String(v || '').toLowerCase()])
+  );
+  const annotations = Object.fromEntries(
+    Object.entries(pod.annotations || {}).map(([k, v]) => [k.toLowerCase(), String(v || '').toLowerCase()])
+  );
+
+  const helmRel = (annotations['meta.helm.sh/release-name'] || '').trim();
+  if (helmRel) return exact.has(helmRel);
+
+  const appInst = (labels['app.kubernetes.io/instance'] || '').trim();
+  if (appInst) return exact.has(appInst);
+
+  const lblRel = (labels['release'] || '').trim();
+  if (lblRel) return exact.has(lblRel);
+
+  const helmChart = (labels['helm.sh/chart'] || '').trim();
+  if (helmChart) {
+    return matchesPrefixOrExact(helmChart.replace(/-\d+\.\d+.*$/, ''), stems);
+  }
+
+  for (const key of ['app.kubernetes.io/name', 'app.kubernetes.io/part-of', 'app', 'k8s-app']) {
+    if (matchesPrefixOrExact(labels[key], stems)) return true;
+  }
+
+  if (matchesPrefixOrExact(pod.name, stems)) return true;
+
+  return (pod.controlledBy || []).some((ref) => matchesPrefixOrExact(ref.name, stems));
+};
+
 export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
   clusterName,
   accountId,
@@ -219,6 +311,8 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
 
   const open = Boolean(awsAddon || communityAddon);
   const communityAddonId = communityAddon?.id || '';
+  const communityNs = communityAddon?.namespace || '';
+  const communityRelease = communityAddon?.releaseName || '';
   const awsAddonName = awsAddon?.addonName || '';
   const currentAddonKey = awsAddonName ? `aws:${awsAddonName}` : communityAddonId ? `comm:${communityAddonId}` : '';
   const currentAddonKeyRef = useRef(currentAddonKey);
@@ -226,24 +320,48 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
   const isUninstalling = Boolean(uninstallingProp || localUninstalling);
 
   const loadCommunityLiveDetails = useCallback(
-    async (explicitAddonId?: string) => {
+    async (explicitAddonId?: string, forceRefresh: boolean = false) => {
       const targetId = explicitAddonId || communityAddonId;
       if (!targetId || !clusterName) return;
       const expectedKey = `comm:${targetId}`;
+      const swrKey = `addon-details:${clusterName}:${targetId}`;
+      if (forceRefresh) {
+        invalidateSwrCache(userEmail, swrKey);
+      }
+      const cached = !forceRefresh ? readSwrCache<CommunityAddonLiveDetails>(userEmail, swrKey) : undefined;
+      if (cached) {
+        setLiveData(cached);
+        if (cached.valuesYaml) {
+          setCustomValues((prev) => (prev.trim() ? prev : cached.valuesYaml || ''));
+        }
+      }
       setLoadingLive(true);
       try {
-        const qs = accountId ? `?account_id=${encodeURIComponent(accountId)}` : '';
-        const res = await fetch(
-          `http://localhost:8000/clusters/${encodeURIComponent(clusterName)}/community-addons/${encodeURIComponent(targetId)}/details${qs}`,
-          { headers: { 'x-user-email': userEmail } }
+        const data = await fetchWithSwr(
+          userEmail,
+          swrKey,
+          async () => {
+            const params = new URLSearchParams();
+            if (accountId) params.set('account_id', accountId);
+            if (communityNs && targetId === communityAddonId) params.set('namespace', communityNs);
+            if (communityRelease && targetId === communityAddonId) params.set('release_name', communityRelease);
+            if (forceRefresh) params.set('refresh', 'true');
+            const qs = params.toString() ? `?${params.toString()}` : '';
+            const res = await fetch(
+              `http://localhost:8000/clusters/${encodeURIComponent(clusterName)}/community-addons/${encodeURIComponent(targetId)}/details${qs}`,
+              { headers: { 'x-user-email': userEmail } }
+            );
+            if (!res.ok) {
+              throw new Error('Failed to load add-on details');
+            }
+            return (await res.json()) as CommunityAddonLiveDetails;
+          },
+          { force: forceRefresh, dedupeWindowMs: 25000 }
         );
-        if (res.ok) {
-          const data: CommunityAddonLiveDetails = await res.json();
-          if (currentAddonKeyRef.current !== expectedKey) return;
-          setLiveData(data);
-          if (data.valuesYaml) {
-            setCustomValues((prev) => (prev.trim() ? prev : data.valuesYaml || ''));
-          }
+        if (currentAddonKeyRef.current !== expectedKey) return;
+        setLiveData(data);
+        if (data.valuesYaml) {
+          setCustomValues((prev) => (prev.trim() ? prev : data.valuesYaml || ''));
         }
       } catch {
         // Optional live telemetry helper
@@ -253,21 +371,26 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
         }
       }
     },
-    [communityAddonId, clusterName, accountId, userEmail]
+    [communityAddonId, communityNs, communityRelease, clusterName, accountId, userEmail]
   );
 
   useEffect(() => {
     setTab(0);
-    setLiveData(null);
     setConfirmUninstall(false);
     setLocalUninstalling(false);
     setUninstalledCompleted(false);
     setActionTraceLog('');
     setActionStatusBanner(null);
     if (open && communityAddonId) {
-      setCustomValues(communityAddon?.valuesYaml || '');
-      loadCommunityLiveDetails(communityAddonId);
+      const cached = readSwrCache<CommunityAddonLiveDetails>(
+        userEmail,
+        `addon-details:${clusterName}:${communityAddonId}`
+      );
+      setLiveData(cached ?? null);
+      setCustomValues(cached?.valuesYaml || communityAddon?.valuesYaml || '');
+      loadCommunityLiveDetails(communityAddonId, false);
     } else {
+      setLiveData(null);
       setCustomValues('');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -276,7 +399,7 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
   useEffect(() => {
     if (!open || !communityAddonId || (!installing && !isUninstalling)) return;
     const timer = setInterval(() => {
-      loadCommunityLiveDetails(communityAddonId);
+      loadCommunityLiveDetails(communityAddonId, true);
     }, 3000);
     return () => clearInterval(timer);
   }, [open, communityAddonId, installing, isUninstalling, loadCommunityLiveDetails]);
@@ -497,7 +620,9 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
   const notesText = liveData?.notes || ca.notes || '';
   const presetYaml = liveData?.presetValuesYaml || ca.presetValuesYaml || '';
   const accessHints = liveData?.accessHints || ca.accessHints || [];
-  const nsPods = liveData?.resources?.pods || pods.filter((p) => p.namespace === (liveData?.namespace || ca.namespace));
+  const nsPods =
+    liveData?.resources?.pods ??
+    pods.filter((p) => matchesCommunityAddonPod(p, ca, liveData?.namespace, liveData?.releaseName));
   const nsServices = liveData?.resources?.services || [];
   const nsIngresses = liveData?.resources?.ingresses || [];
   const nsEvents = liveData?.events || [];
@@ -549,7 +674,7 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
               variant="outlined"
               disabled={loadingLive}
               startIcon={loadingLive ? <CircularProgress size={14} color="inherit" /> : <RefreshIcon fontSize="small" />}
-              onClick={() => loadCommunityLiveDetails()}
+              onClick={() => loadCommunityLiveDetails(communityAddonId, true)}
               sx={{ color: '#ffffff', borderColor: 'rgba(255,255,255,0.35)' }}
             >
               Refresh
@@ -575,7 +700,7 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
                     customValues.trim() ? customValues : undefined
                   );
                   setActionTraceLog('');
-                  loadCommunityLiveDetails();
+                  loadCommunityLiveDetails(ca.id, true);
                 }}
               >
                 {installing ? 'Installing...' : isDeployed ? 'Upgrade / Apply' : 'Install via Helm'}
@@ -600,6 +725,7 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
             </IconButton>
           </Box>
         </DialogTitle>
+        {loadingLive && <LinearProgress sx={{ height: 3 }} />}
 
         <DialogContent sx={{ pt: 2.5, pb: 3 }}>
           {actionStatusBanner && (
@@ -692,8 +818,15 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
                       </TableBody>
                     </Table>
                   </TableContainer>
+                ) : loadingLive && !liveData ? (
+                  <Alert severity="info" icon={<CircularProgress size={16} />}>
+                    Loading live Services, Ingress endpoints &amp; Helm release notes...
+                  </Alert>
                 ) : (
-                  <Alert severity="info">No Kubernetes services found yet in namespace {liveData?.namespace || ca.namespace}.</Alert>
+                  <Alert severity="info">
+                    No Kubernetes services found for release {liveData?.releaseName || ca.releaseName || ca.id} in namespace{' '}
+                    {liveData?.namespace || ca.namespace}.
+                  </Alert>
                 )}
               </Box>
 
@@ -762,8 +895,12 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
               </Box>
 
               <Box>
-                <Typography variant="subtitle2" sx={{ fontWeight: 800, color: '#09090b', mb: 1 }}>
-                  Namespace Pods ({nsPods.length})
+                <Typography variant="subtitle2" sx={{ fontWeight: 800, color: '#09090b', mb: 0.25 }}>
+                  Add-on Pods ({nsPods.length})
+                </Typography>
+                <Typography variant="caption" sx={{ color: '#64748b', display: 'block', mb: 1 }}>
+                  Filtered to pods owned by release {liveData?.releaseName || ca.releaseName || ca.id} in namespace{' '}
+                  {liveData?.namespace || ca.namespace || 'kube-system'}.
                 </Typography>
                 {nsPods.length > 0 ? (
                   <TableContainer component={Paper} variant="outlined">
@@ -805,14 +942,20 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
                       </TableBody>
                     </Table>
                   </TableContainer>
+                ) : loadingLive && !liveData ? (
+                  <Alert severity="info" icon={<CircularProgress size={16} />}>
+                    Loading pods for {ca.name || ca.id}...
+                  </Alert>
                 ) : (
-                  <Alert severity="info">No pods running yet in namespace {liveData?.namespace || ca.namespace}.</Alert>
+                  <Alert severity="info">
+                    No running pods found for {ca.name || ca.id} in namespace {liveData?.namespace || ca.namespace}.
+                  </Alert>
                 )}
               </Box>
 
               <Box>
                 <Typography variant="subtitle2" sx={{ fontWeight: 800, color: '#09090b', mb: 1 }}>
-                  Namespace Kubernetes Events ({nsEvents.length})
+                  Add-on Kubernetes Events ({nsEvents.length})
                 </Typography>
                 {nsEvents.length > 0 ? (
                   <TableContainer component={Paper} variant="outlined" sx={{ maxHeight: 300 }}>
@@ -847,8 +990,12 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
                       </TableBody>
                     </Table>
                   </TableContainer>
+                ) : loadingLive && !liveData ? (
+                  <Alert severity="info" icon={<CircularProgress size={16} />}>
+                    Loading Kubernetes events for {ca.name || ca.id}...
+                  </Alert>
                 ) : (
-                  <Alert severity="info">No recent Kubernetes events reported in this namespace.</Alert>
+                  <Alert severity="info">No recent Kubernetes events reported for {ca.name || ca.id}.</Alert>
                 )}
               </Box>
             </Box>
@@ -906,7 +1053,7 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
                         customValues.trim() ? customValues : undefined
                       );
                       setActionTraceLog('');
-                      loadCommunityLiveDetails();
+                      loadCommunityLiveDetails(ca.id, true);
                     }}
                   >
                     {installing ? 'Applying Helm Release...' : isDeployed ? 'Upgrade with Custom Values' : 'Install with Custom Values'}
@@ -969,7 +1116,7 @@ export const AddOnDetailsDialog: React.FC<AddOnDetailsDialogProps> = ({
                 severity: 'success',
                 message: `Uninstalled community add-on "${targetName}" via Helm.`,
               });
-              loadCommunityLiveDetails(targetId);
+              loadCommunityLiveDetails(targetId, true);
             }
           } catch (err: any) {
             if (currentAddonKeyRef.current === `comm:${targetId}`) {

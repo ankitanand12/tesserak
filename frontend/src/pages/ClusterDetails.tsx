@@ -545,6 +545,7 @@ export const ClusterDetails: React.FC = () => {
       }
       setNotice(`Installed community add-on "${name}" via Helm in namespace "${data.namespace || 'kube-system'}".`);
       invalidateSwrCache(userEmail, cacheKey);
+      invalidateSwrCache(userEmail, `addon-details:${decodedName}:${addonId}`);
       await loadDetails(true);
     } catch (err: any) {
       const msg = err?.message || `Unable to install ${name}`;
@@ -588,6 +589,7 @@ export const ClusterDetails: React.FC = () => {
           : prev
       );
       invalidateSwrCache(userEmail, cacheKey);
+      invalidateSwrCache(userEmail, `addon-details:${decodedName}:${addonId}`);
       await loadDetails(true);
       return data;
     } catch (err: any) {
